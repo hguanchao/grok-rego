@@ -88,6 +88,28 @@ def _extract_error_text(resp: requests.Response, limit: int = 240) -> str:
     return text[:limit] if text else f"HTTP {resp.status_code}"
 
 
+def _parse_sse_complete(text: str) -> dict[str, Any] | None:
+    """解析 SSE 流：取最后一个 data: JSON 事件（G2A 导入以 complete 事件收尾）。
+
+    仅解析已到达的响应体，不额外等待，用于报告实际入库结果。
+    """
+    last: dict[str, Any] | None = None
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if not line.startswith("data:"):
+            continue
+        payload = line[len("data:"):].strip()
+        if not payload or payload == "[DONE]":
+            continue
+        try:
+            parsed = json.loads(payload)
+        except ValueError:
+            continue
+        if isinstance(parsed, dict):
+            last = parsed
+    return last
+
+
 def _client_headers(version: str = _CPA_CLIENT_VERSION) -> dict[str, str]:
     """grok-shell 客户端指纹头。"""
     ver = (version or _CPA_CLIENT_VERSION).strip()
@@ -240,8 +262,8 @@ def _import_web_credentials(
 ) -> tuple[bool, str, int]:
     """向 G2A Web 池推送一个账号文档，返回 (是否成功, 错误, HTTP 状态码)。
 
-    只以 HTTP 2xx 判定推送成功，不解析响应体内 SSE/JSON 的落库检测结果
-    （G2A 侧异步入池，推送成功即返回，无需等待其 complete 事件）。
+    HTTP 2xx 仅代表受理；G2A 以 SSE 流的 complete 事件汇报实际入库结果，
+    syncFailed>0 表示已受理但同步失败（未入池），按失败如实记录，不误报成功。
     """
     raw = json.dumps(
         {"accounts": [document]}, ensure_ascii=False, indent=2
@@ -270,11 +292,16 @@ def _import_web_credentials(
 
     if resp.status_code < 200 or resp.status_code >= 300:
         return False, f"Web 池导入失败：{_extract_error_text(resp)}", resp.status_code
+    # 响应体已随请求返回（SSE last event complete），同步失败未入池按失败记录
+    complete = _parse_sse_complete(resp.text or "") or {}
+    sync_failed = int(complete.get("syncFailed") or 0)
+    if sync_failed:
+        return False, f"G2A 已受理但同步失败（syncFailed={sync_failed}）", resp.status_code
     return True, "", resp.status_code
 
 
 def push_one_g2a(row: dict, *, base_url: str, access_token: str) -> dict[str, Any]:
-    """单账号推送到 G2A：仅推 Web 池，HTTP 2xx 即视为推送成功（不等落库检测）。"""
+    """单账号推送到 G2A：仅推 Web 池；HTTP 2xx 且同步成功才算推送成功。"""
     base = str(base_url or "").strip().rstrip("/")
     token = str(access_token or "").strip()
     email = str(row.get("email") or "").strip()
