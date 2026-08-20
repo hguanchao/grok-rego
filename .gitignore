@@ -1,0 +1,58 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+grok2build.egg-info/
+dist/
+build/
+wheels/
+.ruff_cache/
+.pytest_cache/
+.mypy_cache/
+.pyright/
+.coverage
+htmlcov/
+
+# Virtual environment
+.venv/
+
+# IDE / AI 编程工具
+.idea/
+.vscode/
+.zcode/
+.claude/
+.cursor/
+.windsurf/
+.trae/
+.zed/
+.continue/
+.codeium/
+.aider*
+.roo/
+.copilot/
+.amp/
+
+# Runtime data
+server/data/
+server/logs/
+*.bak
+*.db-journal
+*.db-wal
+*.db-shm
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Local config (keep config.example.json in git)
+server/config.json
+
+# Environment files (keep .env.example in git)
+.env
+.env.*
+!.env.example
+
+# Frontend
+web/node_modules/
+web/dist/

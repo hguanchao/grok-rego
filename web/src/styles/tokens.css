@@ -1,0 +1,144 @@
+/* ══════════════════════════════════════════════
+   Aperture Console — design tokens
+   ══════════════════════════════════════════════ */@theme inline {
+  --font-sans:
+    "Space Grotesk", "Segoe UI", system-ui, -apple-system, "PingFang SC",
+    "Hiragino Sans GB", "Microsoft YaHei UI", "Microsoft YaHei", sans-serif;
+  --font-mono:
+    "JetBrains Mono", ui-monospace, "SFMono-Regular", Menlo, Consolas,
+    "Liberation Mono", monospace;
+
+  --radius-sm: 4px;
+  --radius-md: 6px;
+  --radius-lg: 8px;
+  --radius-xl: 10px;
+
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-sidebar: var(--sidebar);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-ok: var(--ok);
+  --color-warn: var(--warn);
+  --color-surface: var(--surface);
+  --color-signal: var(--signal);
+}
+/* 暗色默认（Aperture） */:root, .dark, [data-theme="dark"] {
+  --radius: 6px;
+  --background: #07090d;
+  --foreground: #e8eef7;
+  --card: #0d1118;
+  --card-foreground: #e8eef7;
+  --popover: #141b26;
+  --popover-foreground: #e8eef7;
+  --primary: #2ee6a6;
+  --primary-foreground: #04120c;
+  --secondary: #141b26;
+  --secondary-foreground: #e8eef7;
+  --muted: #141b26;
+  --muted-foreground: #8b9bb0;
+  --accent: rgba(46, 230, 166, 0.12);
+  --accent-foreground: #2ee6a6;
+  --destructive: #ff5c7a;
+  --border: rgba(232, 238, 247, 0.08);
+  --input: rgba(232, 238, 247, 0.1);
+  --ring: #2ee6a6;
+  --sidebar: #0d1118;
+  --sidebar-foreground: #e8eef7;
+  --sidebar-border: rgba(232, 238, 247, 0.08);
+  --sidebar-accent: rgba(123, 108, 255, 0.14);
+  --sidebar-accent-foreground: #c4bfff;
+  --ok: #2ee6a6;
+  --warn: #f5c542;
+  --surface: #07090d;
+  --signal: #7b6cff;
+  --elevated: #141b26;
+  --grid-line: rgba(232, 238, 247, 0.035);
+  --terminal-bg: #05070a;
+  --terminal-fg: #b7c2d0;
+  --terminal-muted: #6b7a8d;
+  --terminal-faint: #4a5568;
+  --terminal-border: rgba(232, 238, 247, 0.06);
+  --terminal-hover: rgba(255, 255, 255, 0.03);
+  --header-bg: color-mix(in srgb, #07090d 88%, transparent);
+  --shadow-card: none;
+  /* 主工作区轻微 elevation，避免面板糊成一片 */
+  --shadow-panel: 0 1px 0 color-mix(in srgb, #e8eef7 4%, transparent);
+  --table-header: #141b26;
+  --table-cell: #0d1118;
+  --table-hover: #121820;
+  /* 必须不透明：sticky 操作列叠在横滚内容上，半透明会透出背面文字 */
+  --table-selected: #1a2030;
+  --table-border: rgba(232, 238, 247, 0.08);
+  --table-sticky-shadow: rgba(0, 0, 0, 0.45);
+  --border-strong: rgba(46, 230, 166, 0.28);
+  --top-h: 48px;
+  --rail-w: 380px;
+}
+
+/* 浅色：反相控制台 */:root:not(.dark):not([data-theme="dark"]), [data-theme="light"]:not(.dark) {
+  --background: #f4f6f9;
+  --foreground: #0c1220;
+  --card: #ffffff;
+  --card-foreground: #0c1220;
+  --popover: #ffffff;
+  --popover-foreground: #0c1220;
+  --primary: #0d9f6e;
+  --primary-foreground: #f4fffa;
+  --secondary: #eef1f6;
+  --secondary-foreground: #0c1220;
+  --muted: #eef1f6;
+  --muted-foreground: #5a6b80;
+  --accent: rgba(13, 159, 110, 0.1);
+  --accent-foreground: #0d9f6e;
+  --destructive: #e11d48;
+  --border: rgba(12, 18, 32, 0.1);
+  --input: rgba(12, 18, 32, 0.12);
+  --ring: #0d9f6e;
+  --sidebar: #ffffff;
+  --sidebar-foreground: #0c1220;
+  --sidebar-border: rgba(12, 18, 32, 0.1);
+  --sidebar-accent: rgba(91, 79, 214, 0.1);
+  --sidebar-accent-foreground: #5b4fd6;
+  --ok: #0d9f6e;
+  --warn: #c9920a;
+  --surface: #f4f6f9;
+  --signal: #5b4fd6;
+  --elevated: #eef1f6;
+  --grid-line: rgba(12, 18, 32, 0.04);
+  /* 浅色：终端跟面板，不再强制黑底 */
+  --terminal-bg: #f7f8fb;
+  --terminal-fg: #1a2333;
+  --terminal-muted: #5a6b80;
+  --terminal-faint: #94a0b0;
+  --terminal-border: rgba(12, 18, 32, 0.08);
+  --terminal-hover: rgba(12, 18, 32, 0.04);
+  --header-bg: color-mix(in srgb, #f4f6f9 88%, transparent);
+  --shadow-panel: 0 1px 0 rgba(12, 18, 32, 0.04), 0 8px 24px -20px rgba(12, 18, 32, 0.18);
+  --table-header: #eef1f6;
+  --table-cell: #ffffff;
+  --table-hover: #f0f3f8;
+  /* 不透明选中色（浅色） */
+  --table-selected: #e8eaf8;
+  --table-border: rgba(12, 18, 32, 0.1);
+  --table-sticky-shadow: rgba(12, 18, 32, 0.14);
+  --border-strong: rgba(13, 159, 110, 0.35);
+}

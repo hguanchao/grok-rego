@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="zh-CN" suppressHydrationWarning>
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#eef5ff" />
+    <title>Grok账号管理系统</title>
+    <script>
+      /* 首屏前同步主题，避免深色偏好闪浅色 */
+      (function () {
+        try {
+          var key = 'gr-theme'
+          var stored = localStorage.getItem(key)
+          var mode = stored === 'light' || stored === 'dark' || stored === 'system' ? stored : 'system'
+          var dark =
+            mode === 'dark' ||
+            (mode === 'system' && window.matchMedia('(prefers-color-scheme: dark)').matches)
+          var root = document.documentElement
+          root.classList.toggle('dark', dark)
+          root.setAttribute('data-theme', dark ? 'dark' : 'light')
+          root.style.colorScheme = dark ? 'dark' : 'light'
+          var meta = document.querySelector('meta[name="theme-color"]')
+          if (meta) meta.setAttribute('content', dark ? '#0b0f17' : '#eef5ff')
+        } catch (e) {}
+      })()
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

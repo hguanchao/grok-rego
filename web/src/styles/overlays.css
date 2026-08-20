@@ -1,0 +1,299 @@
+/* ══════════════════════════════════════════════
+   Sonner toast — 右上角，Aperture 样式
+   ══════════════════════════════════════════════ */[data-sonner-toaster] {
+  --width: 356px;
+  font-family: var(--font-sans) !important;
+  z-index: 100 !important;
+}[data-sonner-toaster][data-y-position="top"] {
+  top: 16px !important;
+}[data-sonner-toaster][data-x-position="right"] {
+  right: 16px !important;
+}[data-sonner-toast].ap-toast, [data-sonner-toast] {
+  --normal-bg: var(--card);
+  --normal-border: var(--border);
+  --normal-text: var(--foreground);
+  --success-bg: color-mix(in srgb, var(--ok) 12%, var(--card));
+  --success-border: color-mix(in srgb, var(--ok) 35%, transparent);
+  --success-text: var(--foreground);
+  --error-bg: color-mix(in srgb, var(--destructive) 12%, var(--card));
+  --error-border: color-mix(in srgb, var(--destructive) 35%, transparent);
+  --error-text: var(--foreground);
+  --warning-bg: color-mix(in srgb, var(--warn) 12%, var(--card));
+  --warning-border: color-mix(in srgb, var(--warn) 35%, transparent);
+  --warning-text: var(--foreground);
+  --info-bg: color-mix(in srgb, var(--signal) 12%, var(--card));
+  --info-border: color-mix(in srgb, var(--signal) 35%, transparent);
+  --info-text: var(--foreground);
+
+  width: var(--width) !important;
+  max-width: min(356px, calc(100vw - 32px)) !important;
+  padding: 12px 14px !important;
+  border-radius: var(--radius-lg) !important;
+  border: 1px solid var(--normal-border) !important;
+  background: var(--normal-bg) !important;
+  color: var(--normal-text) !important;
+  box-shadow:
+    0 0 0 1px color-mix(in srgb, var(--foreground) 4%, transparent),
+    0 12px 32px -16px rgba(0, 0, 0, 0.55) !important;
+  font-size: 13px !important;
+  line-height: 1.4 !important;
+  gap: 8px !important;
+  align-items: flex-start !important;
+}
+
+/* richColors 语义色 */[data-sonner-toast][data-type="success"], [data-sonner-toast].ap-toast-success {
+  background: var(--success-bg) !important;
+  border-color: var(--success-border) !important;
+  color: var(--success-text) !important;
+}[data-sonner-toast][data-type="error"], [data-sonner-toast].ap-toast-error {
+  background: var(--error-bg) !important;
+  border-color: var(--error-border) !important;
+  color: var(--error-text) !important;
+}[data-sonner-toast][data-type="warning"], [data-sonner-toast].ap-toast-warning {
+  background: var(--warning-bg) !important;
+  border-color: var(--warning-border) !important;
+  color: var(--warning-text) !important;
+}[data-sonner-toast][data-type="info"], [data-sonner-toast].ap-toast-info {
+  background: var(--info-bg) !important;
+  border-color: var(--info-border) !important;
+  color: var(--info-text) !important;
+}[data-sonner-toast] [data-title], .ap-toast-title {
+  font-weight: 550 !important;
+  font-size: 13px !important;
+  color: inherit !important;
+  line-height: 1.35 !important;
+}[data-sonner-toast] [data-description], .ap-toast-desc {
+  color: var(--muted-foreground) !important;
+  font-size: 12px !important;
+  line-height: 1.4 !important;
+  opacity: 1 !important;
+}[data-sonner-toast] [data-icon] {
+  margin-top: 1px;
+}[data-sonner-toast][data-type="success"] [data-icon] {
+  color: var(--ok) !important;
+}[data-sonner-toast][data-type="error"] [data-icon] {
+  color: var(--destructive) !important;
+}[data-sonner-toast][data-type="warning"] [data-icon] {
+  color: var(--warn) !important;
+}[data-sonner-toast][data-type="info"] [data-icon] {
+  color: var(--signal) !important;
+}
+
+/* 关闭按钮：避免默认绝对定位错位 / 半透明白底 */[data-sonner-toast] [data-close-button], .ap-toast-close {
+  position: absolute !important;
+  top: 8px !important;
+  right: 8px !important;
+  left: auto !important;
+  transform: none !important;
+  width: 22px !important;
+  height: 22px !important;
+  border-radius: 4px !important;
+  border: 1px solid var(--border) !important;
+  background: var(--elevated) !important;
+  color: var(--muted-foreground) !important;
+  opacity: 1 !important;
+  display: grid !important;
+  place-items: center !important;
+  transition: color 0.15s, background 0.15s, border-color 0.15s;
+}[data-sonner-toast] [data-close-button]:hover, .ap-toast-close:hover {
+  color: var(--foreground) !important;
+  background: var(--secondary) !important;
+  border-color: color-mix(in srgb, var(--foreground) 16%, transparent) !important;
+}[data-sonner-toast] [data-close-button] svg {
+  width: 12px !important;
+  height: 12px !important;
+}
+
+/* 有关闭按钮时给标题右侧留空 */[data-sonner-toast][data-styled="true"] [data-content] {
+  padding-right: 18px;
+}.ap-toast-action {
+  background: var(--primary) !important;
+  color: var(--primary-foreground) !important;
+  border-radius: var(--radius) !important;
+  font-size: 12px !important;
+  font-weight: 600 !important;
+}.ap-toast-cancel {
+  background: var(--elevated) !important;
+  color: var(--muted-foreground) !important;
+  border: 1px solid var(--border) !important;
+  border-radius: var(--radius) !important;
+  font-size: 12px !important;
+}
+
+/* 浅色投影更轻 */:root:not(.dark):not([data-theme="dark"]) [data-sonner-toast], [data-theme="light"]:not(.dark) [data-sonner-toast] {
+  box-shadow:
+    0 0 0 1px color-mix(in srgb, var(--foreground) 6%, transparent),
+    0 12px 28px -14px rgba(12, 18, 32, 0.28) !important;
+}
+
+/* 账号详情弹窗 */
+.account-detail-dialog {
+  gap: 16px !important;
+  padding-top: 20px !important;
+}
+.account-detail-dialog [data-slot="dialog-description"] {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  word-break: break-all;
+}
+.account-detail-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  margin: 0;
+}
+.account-detail-grid > div {
+  min-width: 0;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--elevated);
+}
+.account-detail-grid dt {
+  margin: 0 0 6px;
+  color: var(--muted-foreground);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+.account-detail-grid dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+  color: var(--foreground);
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.4;
+  white-space: pre-line;
+}
+.account-detail-grid .detail-reason {
+  grid-column: 1 / -1;
+}
+.account-detail-grid .detail-reason dd {
+  max-height: 6.5em;
+  overflow: auto;
+  color: var(--muted-foreground);
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+.detail-password {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  min-width: 0;
+}
+.detail-password > span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.detail-password [data-slot="button"] {
+  width: 28px !important;
+  height: 28px !important;
+  flex-shrink: 0;
+}
+@media (max-width: 520px) {
+  .account-detail-grid {
+    grid-template-columns: 1fr;
+  }
+  .account-detail-grid .detail-reason {
+    grid-column: 1;
+  }
+}
+
+/* empty / misc */.page-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  min-width: 0;
+}
+
+/* ══════════════════════════════════════════════
+   设置弹窗表单（邮箱设置 / 推送目标设置）
+   ══════════════════════════════════════════════ */.advanced-content {
+  display: grid;
+  gap: 14px;
+}.provider-block {
+  display: grid;
+  gap: 12px;
+}.provider-title {
+  font-family: var(--font-mono);
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  color: var(--muted-foreground);
+  text-transform: uppercase;
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 6px;
+}
+
+/* ══════════════════════════════════════════════
+   推送账号（G2A / CPA）
+   ══════════════════════════════════════════════ */.push-target-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}.push-target-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: color-mix(in srgb, var(--card) 96%, transparent);
+  cursor: pointer;
+  transition: border-color 0.15s ease;
+}.push-target-item:hover {
+  border-color: color-mix(in srgb, var(--primary) 45%, transparent);
+}.push-target-name {
+  font-weight: 600;
+  font-size: 13px;
+  font-family: var(--font-mono);
+}.push-target-desc {
+  margin-left: auto;
+  color: var(--muted-foreground);
+  font-size: 12px;
+}
+
+/* 账号认证授权卡片 */
+.auth-pending-card {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: color-mix(in srgb, var(--card) 96%, transparent);
+}.auth-pending-email {
+  font-size: 13px;
+  font-weight: 600;
+  font-family: var(--font-mono);
+  word-break: break-all;
+}.auth-pending-code {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--muted-foreground);
+}.auth-pending-code code {
+  font-family: var(--font-mono);
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  color: var(--foreground);
+  padding: 2px 8px;
+  border-radius: 6px;
+  background: var(--elevated);
+  border: 1px solid var(--border);
+}.auth-pending-link {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--primary);
+  word-break: break-all;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}

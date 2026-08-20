@@ -1,0 +1,509 @@
+/* Terminal / logs — 跟随主题，浅色不再黑底 */.terminal {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 360px;
+  background: var(--terminal-bg);
+  border-radius: 0 0 var(--radius-lg) var(--radius-lg);
+  color: var(--terminal-fg);
+}.term-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--terminal-border);
+}.term-bar-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--terminal-muted);
+}.term-tools {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}.log-console {
+  flex: 1;
+  overflow: auto;
+  padding: 8px 0 16px;
+  min-height: 280px;
+  max-height: calc(100svh - 320px);
+}
+
+/* ── 按线程折叠的日志分组 ── */.log-thread-list {
+  display: flex;
+  flex-direction: column;
+}.log-thread-item {
+  border-bottom: 1px solid var(--terminal-border);
+  border-radius: 0;
+  background: transparent;
+  overflow: hidden;
+}.log-thread-trigger {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 16px;
+  text-align: left;
+  color: var(--terminal-fg);
+  background: transparent;
+  border: 0;
+  cursor: pointer;
+  font-family: var(--font-sans);
+}.log-thread-trigger:hover {
+  background: var(--terminal-hover);
+}.log-thread-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: nowrap;
+  width: 100%;
+  min-width: 0;
+}.log-thread-title {
+  font-family: var(--font-mono);
+  font-weight: 500;
+  font-size: 12px;
+  white-space: nowrap;
+  min-width: 42px;
+  color: var(--terminal-fg);
+}.log-thread-meta {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--terminal-muted);
+}.log-thread-preview {
+  flex: 1 1 120px;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11px;
+  color: var(--terminal-muted);
+  font-family: var(--font-mono);
+}.log-thread-chevron {
+  flex-shrink: 0;
+  color: var(--terminal-faint);
+  transition: transform 0.15s;
+}.log-thread-item[data-state="open"] .log-thread-chevron {
+  transform: rotate(180deg);
+}.log-thread-body {
+  padding: 0 16px 12px 33px;
+}
+
+.log-status-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--terminal-faint);
+  flex-shrink: 0;
+}.log-status-dot.is-fail {
+  background: var(--destructive);
+}.log-status-dot.is-ok {
+  background: var(--ok);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--ok) 18%, transparent);
+}.log-status-dot.is-running {
+  background: var(--signal);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--signal) 18%, transparent);
+}.log-status-dot.is-idle {
+  background: var(--terminal-faint);
+}
+
+.log-line {
+  display: grid;
+  grid-template-columns: 64px 72px minmax(0, 1fr);
+  gap: 0;
+  align-items: baseline;
+  padding: 3px 0;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.5;
+  border-left: 2px solid transparent;
+  color: var(--terminal-fg);
+  word-break: break-word;
+}.log-line:hover {
+  background: var(--terminal-hover);
+}.log-time {
+  color: var(--terminal-faint);
+}.log-level {
+  color: var(--terminal-muted);
+  text-transform: uppercase;
+  font-size: 10px;
+}.log-level.is-info {
+  color: var(--signal);
+}.log-level.is-warn {
+  color: var(--warn);
+}.log-level.is-error {
+  color: var(--destructive);
+}.log-body {
+  color: var(--terminal-fg);
+  word-break: break-all;
+}
+
+.log-line.is-ok {
+  border-left-color: var(--ok);
+}.log-line.is-ok .log-body {
+  color: var(--ok);
+}.log-line.is-fail {
+  border-left-color: var(--destructive);
+}.log-line.is-fail .log-body {
+  color: var(--destructive);
+}.log-line.is-warn {
+  border-left-color: var(--warn);
+}.log-line.is-warn .log-body {
+  color: var(--warn);
+}
+
+:root:not(.dark):not([data-theme="dark"]) .log-line.is-mail,
+[data-theme="light"]:not(.dark) .log-line.is-mail {
+  color: #0f766e;
+}
+
+:root:not(.dark):not([data-theme="dark"]) .log-line.is-inbox,
+[data-theme="light"]:not(.dark) .log-line.is-inbox {
+  color: #0369a1;
+}
+
+:root:not(.dark):not([data-theme="dark"]) .log-line.is-human,
+[data-theme="light"]:not(.dark) .log-line.is-human {
+  color: #6d28d9;
+}
+
+:root:not(.dark):not([data-theme="dark"]) .log-line.is-signup,
+[data-theme="light"]:not(.dark) .log-line.is-signup {
+  color: #a21caf;
+}
+
+:root:not(.dark):not([data-theme="dark"]) .log-line.is-auth,
+[data-theme="light"]:not(.dark) .log-line.is-auth {
+  color: #0f766e;
+}
+
+/*
+ * 注册日志标签色：预检 teal · 任务 muted · 入池/出池 cyan
+ * 邮箱 cyan · 邮件 blue · 资料 amber · CF violet · 注册 fuchsia · SSO teal · 风控 indigo
+ */
+.log-console .log-line {
+  display: flex;
+  flex-wrap: nowrap;
+  align-items: baseline;
+  gap: 8px;
+  grid-template-columns: none;
+  min-width: 0;
+}
+.log-console .log-time {
+  flex: 0 0 8ch;
+  width: 8ch;
+  min-width: 8ch;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.log-console .log-level {
+  flex: 0 0 2.5em;
+  width: 2.5em;
+  min-width: 2.5em;
+  text-transform: none;
+  font-size: 11px;
+  white-space: nowrap;
+}
+.log-console .log-step {
+  flex: 0 0 auto;
+  font-size: 11px;
+  white-space: nowrap;
+}
+.log-console .log-body {
+  flex: 1 1 0;
+  min-width: 0;
+}
+.log-console .reg-log-tag-preflight { color: #14b8a6; }
+.log-console .reg-log-tag-task { color: var(--terminal-muted); }
+.log-console .reg-log-tag-inpool { color: #06b6d4; }
+.log-console .reg-log-tag-outpool { color: #0891b2; }
+.log-console .reg-log-tag-signup { color: #d946ef; }
+.log-console .reg-log-tag-mail { color: #14b8a6; }
+.log-console .reg-log-tag-inbox { color: #3b82f6; }
+.log-console .reg-log-tag-profile { color: #f59e0b; }
+.log-console .reg-log-tag-cf { color: #8b5cf6; }
+.log-console .reg-log-tag-sso { color: #0d9488; }
+.log-console .reg-log-tag-risk { color: #6366f1; }
+:root:not(.dark):not([data-theme="dark"]) .log-console .reg-log-tag-preflight,
+[data-theme="light"]:not(.dark) .log-console .reg-log-tag-preflight { color: #0d9488; }
+:root:not(.dark):not([data-theme="dark"]) .log-console .reg-log-tag-inpool,
+[data-theme="light"]:not(.dark) .log-console .reg-log-tag-inpool { color: #0e7490; }
+:root:not(.dark):not([data-theme="dark"]) .log-console .reg-log-tag-outpool,
+[data-theme="light"]:not(.dark) .log-console .reg-log-tag-outpool { color: #155e75; }
+:root:not(.dark):not([data-theme="dark"]) .log-console .reg-log-tag-signup,
+[data-theme="light"]:not(.dark) .log-console .reg-log-tag-signup { color: #a21caf; }
+:root:not(.dark):not([data-theme="dark"]) .log-console .reg-log-tag-mail,
+[data-theme="light"]:not(.dark) .log-console .reg-log-tag-mail { color: #0f766e; }
+:root:not(.dark):not([data-theme="dark"]) .log-console .reg-log-tag-inbox,
+[data-theme="light"]:not(.dark) .log-console .reg-log-tag-inbox { color: #2563eb; }
+:root:not(.dark):not([data-theme="dark"]) .log-console .reg-log-tag-profile,
+[data-theme="light"]:not(.dark) .log-console .reg-log-tag-profile { color: #b45309; }
+:root:not(.dark):not([data-theme="dark"]) .log-console .reg-log-tag-cf,
+[data-theme="light"]:not(.dark) .log-console .reg-log-tag-cf { color: #7c3aed; }
+:root:not(.dark):not([data-theme="dark"]) .log-console .reg-log-tag-sso,
+[data-theme="light"]:not(.dark) .log-console .reg-log-tag-sso { color: #0f766e; }
+:root:not(.dark):not([data-theme="dark"]) .log-console .reg-log-tag-risk,
+[data-theme="light"]:not(.dark) .log-console .reg-log-tag-risk { color: #4f46e5; }
+
+/* ── Ops Log 右侧抽屉 ──
+ * Edge 注意：全屏 backdrop-filter 会强制整页重绘（sticky 表 + 网格底），极卡。
+ * 遮罩只用实色半透明；抽屉只用 transform 合成层。
+ * 布局/样式参照 acorn 项目同款抽屉。
+ */
+.ops-drawer-backdrop {
+  position: fixed;
+  inset: 0;
+  /* 低于 Dialog(z-70)，高于页面；portal 到 body 后相对视口 */
+  z-index: 45;
+  background: rgba(0, 0, 0, 0.42);
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+  transition:
+    opacity 0.15s linear,
+    visibility 0.15s linear;
+}.ops-drawer-backdrop.is-open {
+  opacity: 1;
+  visibility: visible;
+  pointer-events: auto;
+}
+
+.ops-drawer {
+  position: fixed;
+  top: 0;
+  right: 0;
+  z-index: 46;
+  display: flex;
+  flex-direction: column;
+  width: min(520px, 100vw);
+  height: 100svh;
+  max-height: 100dvh;
+  border-left: 1px solid var(--border);
+  background: var(--card);
+  box-shadow: -4px 0 0 color-mix(in srgb, var(--foreground) 4%, transparent);
+  transform: translate3d(100%, 0, 0);
+  transition: transform 0.18s ease-out;
+  pointer-events: none;
+  visibility: hidden;
+  /* 勿 contain:paint — 会裁切/搞坏内部 flex 滚动 */
+  backface-visibility: hidden;
+}.ops-drawer.is-open {
+  transform: translate3d(0, 0, 0);
+  pointer-events: auto;
+  visibility: visible;
+}
+
+.ops-drawer-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-shrink: 0;
+  padding: 12px 12px 12px 14px;
+  border-bottom: 1px solid var(--border);
+  background: color-mix(in srgb, var(--card) 92%, var(--elevated));
+}.ops-drawer-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--muted-foreground);
+  white-space: nowrap;
+}.ops-drawer-kind {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0;
+  text-transform: none;
+  color: var(--foreground);
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: var(--elevated);
+  border: 1px solid var(--border);
+}.ops-drawer-tools {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+}
+
+/* 类型筛选条（业务扩展：全部 / 巡检 / 认证 / 重登 / 推送） */.ops-drawer-filter {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+  background: color-mix(in srgb, var(--card) 92%, var(--elevated));
+  overflow-x: auto;
+}.ops-drawer-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 22px;
+  padding: 0 8px;
+  border-radius: 999px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--muted-foreground);
+  font-size: 11px;
+  font-weight: 500;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: color 0.15s, background 0.15s, border-color 0.15s;
+}.ops-drawer-chip:hover {
+  color: var(--foreground);
+  background: var(--secondary);
+}.ops-drawer-chip.is-on {
+  color: var(--primary-foreground);
+  background: var(--primary);
+}.ops-drawer-chip-count {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  line-height: 1;
+  font-variant-numeric: tabular-nums;
+  opacity: 0.75;
+  min-width: 1ch;
+}
+
+.ops-drawer-latest {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+  padding: 8px 14px;
+  border-bottom: 1px solid var(--border);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--foreground);
+  background: var(--elevated);
+  min-width: 0;
+}
+
+.ops-drawer-body {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 10px 12px 16px;
+  background: var(--terminal-bg);
+  color: var(--terminal-fg);
+  /* 不用 contain:strict / content-visibility：会搞坏 scrollHeight 与 flex 滚动 */
+  overscroll-behavior: contain;
+  -webkit-overflow-scrolling: touch;
+}
+/* 抽屉内简化日志行：避免 :has() 与复杂 4 列 grid（Edge 选择器/布局更贵） */.ops-drawer-body .log-line {
+  display: flex;
+  flex-wrap: nowrap;
+  align-items: baseline;
+  gap: 6px 8px;
+  grid-template-columns: none;
+  margin-left: 0;
+  padding: 4px 0 4px 6px;
+  border-left-width: 2px;
+  overflow: hidden;
+}.ops-drawer-body .log-time {
+  flex: 0 0 8ch;
+  width: 8ch;
+  min-width: 8ch;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}.ops-drawer-body .log-step {
+  flex: 0 0 auto;
+  min-width: 3.5em;
+  font-size: 11px;
+  color: var(--terminal-faint);
+}.ops-drawer-body .log-level {
+  flex: 0 0 auto;
+}.ops-drawer-body .log-body {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+}
+/* 业务类型分色（巡检 teal / 认证 blue / 重登 amber / 推送 violet） */.ops-drawer-body .log-step.ops-log-step-inspect {
+  color: #14b8a6;
+}.ops-drawer-body .log-step.ops-log-step-auth {
+  color: #3b82f6;
+}.ops-drawer-body .log-step.ops-log-step-reauth {
+  color: #f59e0b;
+}.ops-drawer-body .log-step.ops-log-step-push {
+  color: #8b5cf6;
+}:root:not(.dark):not([data-theme="dark"]) .ops-drawer-body .log-step.ops-log-step-inspect, [data-theme="light"]:not(.dark) .ops-drawer-body .log-step.ops-log-step-inspect {
+  color: #0d9488;
+}:root:not(.dark):not([data-theme="dark"]) .ops-drawer-body .log-step.ops-log-step-auth, [data-theme="light"]:not(.dark) .ops-drawer-body .log-step.ops-log-step-auth {
+  color: #2563eb;
+}:root:not(.dark):not([data-theme="dark"]) .ops-drawer-body .log-step.ops-log-step-reauth, [data-theme="light"]:not(.dark) .ops-drawer-body .log-step.ops-log-step-reauth {
+  color: #b45309;
+}:root:not(.dark):not([data-theme="dark"]) .ops-drawer-body .log-step.ops-log-step-push, [data-theme="light"]:not(.dark) .ops-drawer-body .log-step.ops-log-step-push {
+  color: #7c3aed;
+}
+
+/* ── 日志按钮（触发） ── */.ops-log-trigger {
+  position: relative;
+}.ops-log-count {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  opacity: 0.75;
+  min-width: 1ch;
+}.ops-log-live-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--ok);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--ok) 18%, transparent);
+  animation: aperture-pulse 1.6s ease-in-out infinite;
+  flex-shrink: 0;
+}.ops-log-trigger.is-live {
+  border-color: color-mix(in srgb, var(--primary) 40%, var(--border)) !important;
+  animation: ops-trigger-breath 1.6s ease-in-out infinite;
+}
+
+@keyframes ops-trigger-breath {
+  0%,
+  100% {
+    box-shadow: 0 0 0 0 color-mix(in srgb, var(--primary) 0%, transparent);
+    border-color: color-mix(in srgb, var(--primary) 30%, var(--border));
+  }
+  50% {
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--primary) 22%, transparent);
+    border-color: color-mix(in srgb, var(--primary) 60%, var(--border));
+  }
+}
+
+@keyframes aperture-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.45;
+  }
+}
+
+@media (max-width: 520px) {
+  .ops-drawer {
+    width: 100vw;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ops-drawer,
+  .ops-drawer-backdrop {
+    transition: none !important;
+  }
+  .ops-log-trigger.is-live {
+    animation: none !important;
+  }
+}

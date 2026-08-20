@@ -1,0 +1,354 @@
+/* ══════════════════════════════════════════════
+   Register deck
+   ══════════════════════════════════════════════ */.deck-register {
+  display: grid;
+  grid-template-columns: var(--rail-w) minmax(0, 1fr);
+  gap: 16px;
+  min-height: calc(100svh - var(--top-h) - 60px);
+  align-items: stretch;
+}
+@media (max-width: 980px) {.deck-register {
+    grid-template-columns: 1fr;
+  }
+}.control-rail {
+  display: flex;
+  flex-direction: column;
+  padding: 16px;
+  min-height: 0;
+}.rail-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  margin-bottom: 4px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--border);
+}.rail-title {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--muted-foreground);
+}.rail-title em {
+  font-style: normal;
+  color: var(--primary);
+  margin-right: 6px;
+}.rail-meta {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: color-mix(in srgb, var(--muted-foreground) 70%, transparent);
+}.rail-meta.is-off {
+  color: var(--destructive);
+}.job-error {
+  margin: 0;
+  padding: 8px 16px;
+  border-bottom: 1px solid color-mix(in srgb, var(--destructive) 28%, var(--border));
+  background: color-mix(in srgb, var(--destructive) 10%, var(--card));
+  color: var(--destructive);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.45;
+}.rail-actions {
+  margin-top: auto;
+  padding-top: 16px;
+  display: grid;
+  gap: 8px;
+}.rail-actions-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}.email-service-control {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}.email-service-select {
+  flex: 1;
+  min-width: 0;
+}
+
+/* 并排字段（数量 / 线程） */.field-pair {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+  margin-bottom: 12px;
+  align-items: start;
+}.field-pair > .field-block {
+  margin-bottom: 0;
+  min-width: 0;
+}
+
+/* Stepper：固定高度，三列严格对齐 */.ap-stepper {
+  display: grid;
+  grid-template-columns: 32px minmax(0, 1fr) 32px;
+  align-items: stretch;
+  width: 100%;
+  height: 32px;
+  min-height: 32px;
+  max-height: 32px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+  background: var(--background);
+  box-sizing: border-box;
+}.ap-stepper button {
+  display: grid;
+  place-items: center;
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  padding: 0;
+  margin: 0;
+  color: var(--muted-foreground);
+  background: var(--elevated);
+  border: 0;
+  border-radius: 0;
+  line-height: 1;
+  cursor: pointer;
+  box-sizing: border-box;
+}.ap-stepper button:hover:not(:disabled) {
+  color: var(--foreground);
+}.ap-stepper button:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}.ap-stepper input {
+  width: 100%;
+  min-width: 0;
+  height: 100%;
+  min-height: 0;
+  max-height: 100%;
+  margin: 0;
+  padding: 0 4px;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  text-align: center;
+  font-family: var(--font-mono);
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+  line-height: 30px; /* 与 32px 外框 - 边框对齐，避免垂直漂移 */
+  color: var(--foreground);
+  outline: none;
+  box-sizing: border-box;
+}.ap-stepper input::-webkit-outer-spin-button, .ap-stepper input::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+  display: none;
+}.ap-stepper input[type="number"] {
+  -moz-appearance: textfield;
+  appearance: textfield;
+}
+
+/* mode toggle (segment) */.mode-toggle {
+  width: 100% !important;
+  display: grid !important;
+  grid-template-columns: 1fr 1fr;
+  gap: 3px !important;
+  padding: 3px !important;
+  border: 1px solid var(--border) !important;
+  border-radius: var(--radius) !important;
+  background: color-mix(in srgb, var(--muted) 55%, transparent) !important;
+}.mode-toggle-item {
+  height: 28px !important;
+  min-width: 0 !important;
+  border-radius: calc(var(--radius) - 2px) !important;
+  font-size: 12px !important;
+  font-weight: 500 !important;
+  gap: 6px !important;
+  box-shadow: none !important;
+  border: 0 !important;
+}.mode-toggle-item[data-state="on"] {
+  background: var(--primary) !important;
+  color: var(--primary-foreground) !important;
+  box-shadow: none !important;
+}.mode-toggle-item[data-state="on"]:hover {
+  background: var(--primary) !important;
+  color: var(--primary-foreground) !important;
+}.mode-toggle-item[data-state="off"]:hover {
+  background: color-mix(in srgb, var(--muted) 80%, transparent) !important;
+  color: var(--foreground) !important;
+}
+
+/* 顶栏主题切换：单按钮 cycle */
+.theme-toggle-btn {
+  width: 30px;
+  height: 30px;
+  color: var(--muted-foreground);
+  border: 1px solid var(--border);
+  background: color-mix(in srgb, var(--muted) 40%, transparent);
+}
+.theme-toggle-btn:hover {
+  color: var(--foreground);
+  border-color: color-mix(in srgb, var(--foreground) 16%, transparent);
+  background: var(--secondary);
+}
+
+/* 注册轨主 CTA */
+.rail-actions-primary {
+  display: grid;
+  gap: 8px;
+}
+.rail-actions-primary .rail-start-btn {
+  width: 100%;
+  height: 36px;
+  font-size: 13px;
+}
+.rail-actions-primary .rail-stop-btn {
+  width: 100%;
+  height: 36px;
+}
+.rail-more-trigger {
+  width: 100%;
+  justify-content: space-between;
+  color: var(--muted-foreground);
+  font-weight: 500;
+}
+.rail-more-trigger[data-state="open"] .rail-more-chevron {
+  transform: rotate(180deg);
+}
+.rail-more-chevron {
+  transition: transform var(--ap-dur-fast) ease;
+}
+.rail-more-body {
+  display: grid;
+  gap: 12px;
+  padding-top: 10px;
+}
+
+/* 进行中指标微呼吸（对齐顶栏 reg-status） */
+.metric-v.is-live.is-pulse {
+  animation: metric-live-pulse 1.6s var(--ap-ease-out) infinite;
+}
+@keyframes metric-live-pulse {
+  0%,
+  100% {
+    text-shadow: 0 0 0 transparent;
+  }
+  50% {
+    text-shadow: 0 0 14px color-mix(in srgb, var(--signal) 45%, transparent);
+  }
+}
+
+/* Telemetry */.telemetry {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+}.mission-strip {
+  display: grid;
+  grid-template-columns: minmax(140px, 1.3fr) repeat(4, minmax(0, 1fr));
+  gap: 1px;
+  border-bottom: 1px solid var(--border);
+  background: var(--border);
+  border-radius: var(--radius-lg) var(--radius-lg) 0 0;
+  overflow: hidden;
+}.mission-strip-pool {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  flex-shrink: 0;
+}
+@media (max-width: 900px) {.mission-strip {
+    grid-template-columns: 1fr 1fr;
+  }.mission-strip-pool {
+    grid-template-columns: 1fr 1fr;
+  }
+}.metric {
+  padding: 14px 16px;
+  background: var(--card);
+  min-width: 0;
+  text-align: left;
+}.metric-btn {
+  border: 0;
+  cursor: pointer;
+  font: inherit;
+  color: inherit;
+  position: relative;
+  transition:
+    background-color var(--ap-dur-fast, 140ms) ease,
+    color var(--ap-dur-fast, 140ms) ease,
+    transform var(--ap-dur-fast, 140ms) ease;
+}.metric-btn::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  background: transparent;
+  transition: background-color var(--ap-dur-fast, 140ms) ease;
+}.metric-btn:hover {
+  background: color-mix(in srgb, var(--elevated) 80%, var(--card));
+}.metric-btn:active {
+  transform: scale(0.99);
+}.metric-btn.is-on {
+  background: color-mix(in srgb, var(--primary) 12%, var(--card));
+}
+.metric-btn.is-on::before {
+  background: var(--primary);
+  width: 3px;
+}
+.metric-btn.is-on .metric-v {
+  transition: color var(--ap-dur-fast) ease;
+}.metric-k {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: color-mix(in srgb, var(--muted-foreground) 80%, transparent);
+  margin-bottom: 6px;
+}.metric-v {
+  font-family: var(--font-mono);
+  font-size: 22px;
+  font-weight: 500;
+  letter-spacing: -0.02em;
+  font-variant-numeric: tabular-nums;
+  color: var(--foreground);
+  line-height: 1.1;
+}.metric-v.is-ok {
+  color: var(--ok);
+}.metric-v.is-bad {
+  color: var(--destructive);
+}.metric-v.is-warn {
+  color: var(--warn);
+}.metric-v.is-live {
+  color: var(--signal);
+}.metric-sub {
+  margin-top: 4px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: color-mix(in srgb, var(--muted-foreground) 75%, transparent);
+}.metric-chip {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  border-radius: 5px;
+  background: color-mix(in srgb, var(--primary) 10%, transparent);
+  color: var(--primary);
+  flex-shrink: 0;
+}.metric-chip svg {
+  width: 11px;
+  height: 11px;
+}.metric-chip.is-signal {
+  background: color-mix(in srgb, var(--signal) 10%, transparent);
+  color: var(--signal);
+}.metric-chip.is-ok {
+  background: color-mix(in srgb, var(--ok) 12%, transparent);
+  color: var(--ok);
+}.metric-chip.is-warn {
+  background: color-mix(in srgb, var(--warn) 12%, transparent);
+  color: var(--warn);
+}.metric-chip.is-bad {
+  background: color-mix(in srgb, var(--destructive) 12%, transparent);
+  color: var(--destructive);
+}.mission-progress {
+  margin-top: 10px;
+  height: 3px;
+  border-radius: 2px;
+  background: var(--elevated);
+  overflow: hidden;
+}.mission-progress > i {
+  display: block;
+  height: 100%;
+  background: linear-gradient(90deg, var(--signal), var(--primary));
+  transition: width 0.25s ease;
+}

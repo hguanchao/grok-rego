@@ -1,0 +1,21 @@
+[project]
+name = "grok2build"
+version = "0.1.0"
+description = "xAI Grok Build 自动化工具：批量注册、Device Flow 授权、Token 交换"
+requires-python = ">=3.13"
+dependencies = [
+    "camoufox[geoip]>=0.5.4",
+    "playwright>=1.60.0",
+    "loguru>=0.7.0",
+    "curl-cffi>=0.16.0",
+]
+
+[tool.uv]
+package = false
+
+[tool.ruff.lint]
+# 以下规则为刻意取舍（浏览器自动化 / 网络容错设计，非疏漏）：
+# - BLE001：浏览器与网络层盲捕获后降级/继续轮询是注册自动化的核心容错策略
+# - S112 / S110：轮询循环中异常继续、元素缺失静默跳过
+# - TRY004：配置/模型校验异常统一抛 ValueError，调用方按此捕获（API 映射 400）
+ignore = ["BLE001", "S112", "S110", "TRY004"]

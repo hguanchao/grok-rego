@@ -1,0 +1,169 @@
+/* ══════════════════════════════════════════════
+   Motion — 轻量、合成层友好（opacity / transform）
+   ══════════════════════════════════════════════ */:root {
+  --ap-ease: cubic-bezier(0.22, 1, 0.36, 1);
+  --ap-ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+  --ap-dur-fast: 140ms;
+  --ap-dur: 220ms;
+  --ap-dur-slow: 320ms;
+}
+/* 仅 opacity：结束后不留 transform，避免困住子树里的 position:fixed */
+/* 弹窗：仅 opacity（Edge 上 scale/translate 大面板易卡；关闭也不留 transform） */
+
+/* 路由页切换 */.page-enter {
+  animation: ap-page-enter var(--ap-dur) var(--ap-ease-out) both;
+}
+
+/* 顶栏导航指示条出现 */.nav-tab[data-state="active"]::after {
+  animation: ap-indicator-in var(--ap-dur) var(--ap-ease-out) both;
+  transform-origin: center;
+}
+
+/* 进度条宽度 */.mission-progress > i {
+  transition: width var(--ap-dur-slow) var(--ap-ease);
+}
+
+/* Switch / Input / Select 焦点 */[data-slot="input"], [data-slot="select-trigger"] {
+  transition:
+    border-color var(--ap-dur-fast) ease,
+    box-shadow var(--ap-dur-fast) ease,
+    background-color var(--ap-dur-fast) ease;
+}
+
+/* 弹层必须高于 Dialog(z-70)，否则高级设置内下拉/问号被盖住 */[data-slot="select-content"], [data-slot="tooltip-content"] {
+  z-index: 80 !important;
+}
+
+/* Dialog / AlertDialog 居中 + 轻量淡入淡出 */.ap-dialog-overlay[data-state="open"] {
+  animation: ap-fade-in 120ms ease-out both;
+}.ap-dialog-overlay[data-state="closed"] {
+  animation: ap-fade-out 100ms ease-in both;
+}.ap-dialog-content {
+  /* 水平居中 + 垂直偏上（top 12vh）：超高内容顶部始终可达，不依赖 translate */
+  top: 12vh !important;
+  right: 0 !important;
+  bottom: auto !important;
+  left: 0 !important;
+  margin-inline: auto !important;
+  margin-block: 0 !important;
+  translate: none !important;
+  transform: none !important;
+  /* 合成层：减少背后大表重绘牵连 */
+  will-change: opacity;
+}.ap-dialog-content[data-state="open"] {
+  animation: ap-dialog-in 140ms ease-out both;
+}.ap-dialog-content[data-state="closed"] {
+  animation: ap-dialog-out 100ms ease-in both;
+}
+/* 关闭后卸 will-change */.ap-dialog-content:not([data-state="open"]):not([data-state="closed"]) {
+  will-change: auto;
+}
+
+/* 高级设置：取消内层再滚，交给弹窗单层 overflow */.advanced-dialog .advanced-content {
+  max-height: none;
+  overflow: visible;
+  padding-right: 0;
+}
+
+/* 抽屉头栏轻入场：只动 opacity，不在滚动容器上留 transform */
+
+/* 注册控制轨字段 */.control-rail .field-block, .control-rail .rail-section {
+  transition: opacity var(--ap-dur-fast) ease;
+}
+
+/* Badge 轻微 */[data-slot="badge"] {
+  transition:
+    background-color var(--ap-dur-fast) ease,
+    color var(--ap-dur-fast) ease,
+    border-color var(--ap-dur-fast) ease;
+}
+
+/* Toast 已由 sonner 自带动画；补一层容器不抢 */
+
+/* 加载/刷新旋转：全局定义，避免依赖 tailwind 默认 spin 未生成 */
+/* Lucide 默认是 inline SVG，强制可旋转 */
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation: none !important;
+    transition: none !important;
+    scroll-behavior: auto !important;
+  }
+  .page-enter,
+  .ap-dialog-overlay,
+  .ap-dialog-content,
+  .nav-tab[data-state="active"]::after,
+  .pool-skel,
+  .pool-progress.is-done .pool-progress-track > i,
+  .metric-v.is-pulse {
+    animation: none !important;
+    opacity: 1 !important;
+    filter: none !important;
+    text-shadow: none !important;
+  }
+  .page-enter,
+  .nav-tab[data-state="active"]::after {
+    transform: none !important;
+  }
+}
+
+/* ══════════════════════════════════════════════
+   Keyframes — 上述动画引用的帧定义
+   缺失会导致 Radix Presence 等待 animationend 永不触发，弹窗关闭后无法卸载
+   ══════════════════════════════════════════════ */
+/* 仅 opacity：结束后不留 transform，避免困住子树里的 position:fixed */
+@keyframes ap-page-enter {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes ap-indicator-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes ap-fade-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes ap-fade-out {
+  from {
+    opacity: 1;
+  }
+  to {
+    opacity: 0;
+  }
+}
+
+@keyframes ap-dialog-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes ap-dialog-out {
+  from {
+    opacity: 1;
+  }
+  to {
+    opacity: 0;
+  }
+}

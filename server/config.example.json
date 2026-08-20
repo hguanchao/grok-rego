@@ -1,0 +1,16 @@
+{
+  "cf_api_base": "",
+  "cf_domains": "",
+  "cf_api_key": "",
+  "cf_domain_mode": "random",
+  "mail_provider": "cf",
+  "yyds_api_base": "https://maliapi.215.im/v1",
+  "yyds_api_key": "",
+  "proxy": "http://127.0.0.1:7890",
+  "auth_enabled": true,
+  "g2a_base_url": "",
+  "g2a_username": "",
+  "g2a_password": "",
+  "cpa_base_url": "",
+  "cpa_management_key": ""
+}
