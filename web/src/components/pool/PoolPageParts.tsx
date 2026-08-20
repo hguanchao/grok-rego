@@ -113,8 +113,8 @@ export function riskTitle(
 
 // ─── 号池操作日志 ───────────────────────────────────────────
 
-/** 业务日志类型：巡检 / 认证 / 重登 / 推送 */
-export type PoolLogType = "inspect" | "auth" | "reauth" | "push";
+/** 业务日志类型：巡检 / 认证 / 重登 / 推送 / 自动续期 */
+export type PoolLogType = "inspect" | "auth" | "reauth" | "push" | "refresh";
 
 /** 日志级别（对齐 loguru 语义） */
 export type PoolLogLevel = "INFO" | "SUCCESS" | "WARNING" | "ERROR";
@@ -139,6 +139,7 @@ export const POOL_LOG_TYPES: readonly PoolLogType[] = [
   "auth",
   "reauth",
   "push",
+  "refresh",
 ];
 
 export const POOL_LOG_TYPE_LABEL: Record<PoolLogType, string> = {
@@ -146,6 +147,7 @@ export const POOL_LOG_TYPE_LABEL: Record<PoolLogType, string> = {
   auth: "认证",
   reauth: "重登",
   push: "推送",
+  refresh: "续期",
 };
 
 /** 当前时间 "YYYY-MM-DD HH:MM:SS" */

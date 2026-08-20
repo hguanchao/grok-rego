@@ -13,7 +13,9 @@ G2A / CPA 推送客户端。
 - sso_cookie 为字符串（sso 会话凭证原值；sso 与 sso-rw value 相同），推送时拼为 Cookie 串
 
 协议：
-- G2A: POST /api/admin/v1/auth/login → multipart /api/admin/v1/accounts/web/import（仅 Web 池）
+- G2A: POST /api/admin/v1/auth/login → multipart /api/admin/v1/accounts/import（Build 池，必推）
+  + /api/admin/v1/accounts/web/import（Web 池，有 SSO cookie 时一并推）
+  成功判定以 HTTP 2xx 为准；G2A 落库/同步属上游内部行为，syncFailed 与本项目无关，不解析不计失败
 - CPA: multipart POST /v0/management/auth-files（Bearer / X-Management-Key）
 """
 
@@ -88,28 +90,6 @@ def _extract_error_text(resp: requests.Response, limit: int = 240) -> str:
     return text[:limit] if text else f"HTTP {resp.status_code}"
 
 
-def _parse_sse_complete(text: str) -> dict[str, Any] | None:
-    """解析 SSE 流：取最后一个 data: JSON 事件（G2A 导入以 complete 事件收尾）。
-
-    仅解析已到达的响应体，不额外等待，用于报告实际入库结果。
-    """
-    last: dict[str, Any] | None = None
-    for line in (text or "").splitlines():
-        line = line.strip()
-        if not line.startswith("data:"):
-            continue
-        payload = line[len("data:"):].strip()
-        if not payload or payload == "[DONE]":
-            continue
-        try:
-            parsed = json.loads(payload)
-        except ValueError:
-            continue
-        if isinstance(parsed, dict):
-            last = parsed
-    return last
-
-
 def _client_headers(version: str = _CPA_CLIENT_VERSION) -> dict[str, str]:
     """grok-shell 客户端指纹头。"""
     ver = (version or _CPA_CLIENT_VERSION).strip()
@@ -146,11 +126,39 @@ def _expires_iso(token: str) -> str:
 # ─── 凭证构造（账号行 → 目标平台导入文档）──────────────────
 
 
+def build_g2a_build_entry(row: dict) -> dict[str, Any] | None:
+    """账号行 → G2A Build 池导入条目；无 OAuth 凭据返回 None。
+
+    provider 固定 grok_build，字段对齐 grok-build CLI 客户端凭据；
+    Build 池是 G2A 主池，凡已认证账号必推。
+    """
+    email = str(row.get("email") or "").strip()
+    token = str(row.get("access_token") or "").strip()
+    if not token:
+        return None
+    user_id = _jwt_user_id(token)
+    return {
+        "provider": "grok_build",
+        "name": email or user_id or f"account_{row.get('id')}",
+        "client_id": OAUTH2_CLIENT_ID,
+        "access_token": token,
+        "refresh_token": str(row.get("refresh_token") or ""),
+        "token_type": "Bearer",
+        "scope": _CPA_SCOPE,
+        "expires_at": _expires_iso(token),
+        "email": email,
+        "sub": user_id,
+        "user_id": user_id,
+        "principal_id": user_id,
+        "team_id": "",
+    }
+
+
 def build_g2a_web_entry(row: dict) -> dict[str, Any] | None:
     """账号行 → G2A Web 池导入条目；无 SSO cookie 返回 None。
 
-    当前仅推 Web 池。sso_cookie 为字符串（sso 会话凭证原值；
-    sso 与 sso-rw value 相同），拼为 sso=...; sso-rw=... 串。
+    sso_cookie 为字符串（sso 会话凭证原值；sso 与 sso-rw value 相同），
+    拼为 sso=...; sso-rw=... 串；Web 池可转换 Build/Console，有 SSO 时一并推送。
     """
     email = str(row.get("email") or "").strip()
     user_id = _jwt_user_id(str(row.get("access_token") or ""))
@@ -233,7 +241,7 @@ def g2a_login(*, base_url: str, username: str, password: str) -> tuple[str, str]
         return "", f"G2A 登录请求失败：{exc}"
     if resp.status_code != 200:
         err = _extract_error_text(resp)
-        logger.error(f"[推送] G2A 登录失败  · HTTP {resp.status_code}  {err}")
+        logger.error(f"[推送] G2A 登录失败 · HTTP {resp.status_code} {err}")
         return "", f"G2A 登录失败：{err}"
     try:
         body = resp.json()
@@ -254,16 +262,17 @@ def g2a_login(*, base_url: str, username: str, password: str) -> tuple[str, str]
     return access, ""
 
 
-def _import_web_credentials(
+def _import_credentials(
     sess: requests.Session,
     url: str,
     headers: dict[str, str],
     document: dict[str, Any],
+    label: str,
 ) -> tuple[bool, str, int]:
-    """向 G2A Web 池推送一个账号文档，返回 (是否成功, 错误, HTTP 状态码)。
+    """向 G2A 导入接口（Build / Web 共用）推送一个账号文档，返回 (是否成功, 错误, HTTP 状态码)。
 
-    HTTP 2xx 仅代表受理；G2A 以 SSE 流的 complete 事件汇报实际入库结果，
-    syncFailed>0 表示已受理但同步失败（未入池），按失败如实记录，不误报成功。
+    以 HTTP 2xx 判定成功；G2A 落库与同步属上游内部行为，其 syncFailed
+    与本项目无关，不解析 SSE complete 事件，也不计入失败。
     """
     raw = json.dumps(
         {"accounts": [document]}, ensure_ascii=False, indent=2
@@ -286,22 +295,21 @@ def _import_web_credentials(
             timeout=_IMPORT_TIMEOUT,
         )
     except requests.RequestsError as exc:
-        return False, f"Web 池导入请求失败：{exc}", 0
+        return False, f"{label} 池导入请求失败：{exc}", 0
     finally:
         mp.close()
 
     if resp.status_code < 200 or resp.status_code >= 300:
-        return False, f"Web 池导入失败：{_extract_error_text(resp)}", resp.status_code
-    # 响应体已随请求返回（SSE last event complete），同步失败未入池按失败记录
-    complete = _parse_sse_complete(resp.text or "") or {}
-    sync_failed = int(complete.get("syncFailed") or 0)
-    if sync_failed:
-        return False, f"G2A 已受理但同步失败（syncFailed={sync_failed}）", resp.status_code
+        return False, f"{label} 池导入失败：{_extract_error_text(resp)}", resp.status_code
     return True, "", resp.status_code
 
 
 def push_one_g2a(row: dict, *, base_url: str, access_token: str) -> dict[str, Any]:
-    """单账号推送到 G2A：仅推 Web 池；HTTP 2xx 且同步成功才算推送成功。"""
+    """单账号推送到 G2A：Build 池必推，Web 池视 SSO cookie 而定。
+
+    判定口径：各池 HTTP 2xx 即推送成功，不解析 G2A 落库/同步结果；
+    无 SSO cookie 仅跳过 Web 池（不报错，Build 池已推送）。
+    """
     base = str(base_url or "").strip().rstrip("/")
     token = str(access_token or "").strip()
     email = str(row.get("email") or "").strip()
@@ -312,36 +320,58 @@ def push_one_g2a(row: dict, *, base_url: str, access_token: str) -> dict[str, An
     if not str(row.get("access_token") or "").strip():
         return {"ok": False, "target": "g2a", "action": "", "message": "G2A 无 OAuth 凭据", "http_status": 0}
 
-    web_entry = build_g2a_web_entry(row)
-    if web_entry is None:
-        return {"ok": False, "target": "g2a", "action": "", "message": "G2A 无 SSO cookie，无法推送到 Web 池", "http_status": 0}
+    build_entry = build_g2a_build_entry(row)
+    assert build_entry is not None  # 上方已校验 access_token，必非空
+    web_entry = build_g2a_web_entry(row)  # 无 SSO cookie 时为 None，跳过 Web 池
 
-    logger.info(f"[推送] G2A {email}  开始推送到 Web 池")
-    web_url = urljoin(base + "/", "api/admin/v1/accounts/web/import")
+    logger.info(f"[推送] G2A {email} 开始推送 Build 池")
     headers = {
         "Authorization": f"Bearer {token}",
         "Accept": "text/event-stream, application/json",
     }
     with requests.Session(impersonate="chrome") as sess:
-        ok, err, http_status = _import_web_credentials(
-            sess, web_url, headers, web_entry
+        build_url = urljoin(base + "/", "api/admin/v1/accounts/import")
+        ok, err, http_status = _import_credentials(
+            sess, build_url, headers, build_entry, "Build"
         )
-    if not ok:
-        logger.error(f"[推送] G2A {email}  Web 池推送失败: {err}")
-        return {
-            "ok": False,
-            "target": "g2a",
-            "action": "",
-            "message": err,
-            "http_status": http_status,
-        }
-    logger.success(f"[推送] G2A {email}  Web 池推送成功")
+        if not ok:
+            logger.error(f"[推送] G2A {email} Build 池推送失败: {err}")
+            return {
+                "ok": False,
+                "target": "g2a",
+                "action": "",
+                "message": err,
+                "http_status": http_status,
+            }
+        # Web 池：仅当存在 SSO cookie 时推送，缺失不视为失败
+        web_ok = True
+        web_http = http_status
+        if web_entry is not None:
+            logger.info(f"[推送] G2A {email} 开始推送到 Web 池")
+            web_url = urljoin(base + "/", "api/admin/v1/accounts/web/import")
+            web_ok, web_err, web_http = _import_credentials(
+                sess, web_url, headers, web_entry, "Web"
+            )
+            if not web_ok:
+                logger.error(f"[推送] G2A {email} Web 池推送失败: {web_err}")
+                return {
+                    "ok": False,
+                    "target": "g2a",
+                    "action": "",
+                    "message": web_err,
+                    "http_status": web_http,
+                }
+        else:
+            logger.debug(f"[推送] G2A {email} 无 SSO cookie，跳过 Web 池")
+
+    pools = "Build" if web_entry is None else "Build、Web"
+    logger.success(f"[推送] G2A {email} {pools} 池推送成功")
     return {
         "ok": True,
         "target": "g2a",
         "action": "新增",
-        "message": "G2A Web 池推送成功",
-        "http_status": http_status,
+        "message": f"G2A {pools} 池推送成功",
+        "http_status": max(http_status, web_http),
     }
 
 
@@ -363,7 +393,7 @@ def push_batch_cpa(
 
     url = urljoin(base + "/", "v0/management/auth-files")
     headers = {"Authorization": f"Bearer {key}", "X-Management-Key": key}
-    logger.info(f"[推送] CPA 批量上传开始: {len(rows)} 个账号  · {url}")
+    logger.info(f"[推送] CPA 批量上传开始: {len(rows)} 个账号 · {url}")
     mp = CurlMime()
     try:
         for row in rows:
@@ -392,7 +422,7 @@ def push_batch_cpa(
     # 200/201 全成功；207 Multi-Status 常见于批量上传，需结合 failed 判断
     if resp.status_code not in (200, 201, 207):
         err = _extract_error_text(resp)
-        logger.error(f"[推送] CPA 批量上传失败  · HTTP {resp.status_code}  {err}")
+        logger.error(f"[推送] CPA 批量上传失败 · HTTP {resp.status_code} {err}")
         return {
             "ok": False,
             "target": "cpa",
@@ -424,9 +454,9 @@ def push_batch_cpa(
         else f"CPA 推送部分失败：成功 {uploaded}，失败 {failed}"
     )
     if ok_flag:
-        logger.success(f"[推送] CPA 批量上传成功: {uploaded} 个  · HTTP {resp.status_code}")
+        logger.success(f"[推送] CPA 批量上传成功: {uploaded} 个 · HTTP {resp.status_code}")
     else:
-        logger.warning(f"[推送] CPA 批量上传部分失败: 成功 {uploaded} 失败 {failed}  · HTTP {resp.status_code}")
+        logger.warning(f"[推送] CPA 批量上传部分失败: 成功 {uploaded} 失败 {failed} · HTTP {resp.status_code}")
     return {
         "ok": ok_flag,
         "target": "cpa",
@@ -465,9 +495,10 @@ _LOG_LIMIT = 500
 
 
 def _who(acc: dict[str, Any]) -> str:
+    """账号日志标识：邮箱优先，缺邮箱则回退 #id（统一不带双 id 后缀）。"""
     email = str(acc.get("email") or "").strip()
     aid = int(acc.get("id") or 0)
-    return f"{email}  #{aid}" if email else f"#{aid}"
+    return email if email else f"#{aid}"
 
 
 def _end_log(job: PushJob) -> None:
@@ -481,7 +512,7 @@ def _end_log(job: PushJob) -> None:
         level, action = "ERROR", "结束"
     job.append_log(
         level,
-        f"[任务] 推送{action}  成功 {job.pushed} 失败 {job.failed} 跳过 {skipped}",
+        f"[任务] 推送{action} 成功 {job.pushed} 失败 {job.failed} 跳过 {skipped}",
     )
 
 
@@ -662,7 +693,7 @@ class PushManager:
             self._execute(job)
         except Exception as exc:
             job.error = f"{type(exc).__name__}: {exc}"
-            job.append_log("ERROR", f"[任务] 推送异常  {job.error}")
+            job.append_log("ERROR", f"[任务] 推送异常 {job.error}")
             logger.error(f"[推送] 任务异常: {job.error}")
         finally:
             job.status = "cancelled" if job.cancel_event.is_set() else "done"
@@ -679,9 +710,9 @@ class PushManager:
         candidates = self._screen(job)
         job.append_log(
             "INFO",
-            f"[任务] 推送开始  目标 {label} / {job.count} 个 / 并发 {job.concurrency}",
+            f"[任务] 推送开始 目标 {label} / {job.count} 个 / 并发 {job.concurrency}",
         )
-        logger.info(f"[推送] 任务启动  目标 {label} / 候选 {job.count} 个 / 并发 {job.concurrency} / 任务 {job.id}")
+        logger.info(f"[推送] 任务启动 目标 {label} / 候选 {job.count} 个 / 并发 {job.concurrency} / 任务 {job.id}")
         if not candidates:
             return
 
@@ -722,8 +753,8 @@ class PushManager:
             aid = int(acc.get("id") or 0)
             if not str(acc.get("access_token") or "").strip():
                 job.skipped_list.append({"id": aid, "reason": "未认证"})
-                job.append_log("WARNING", f"[推送] {_who(acc)}  已跳过：未认证")
-                logger.debug(f"[推送] {_who(acc)}  已跳过：未认证")
+                job.append_log("WARNING", f"[推送] {_who(acc)} 已跳过：未认证")
+                logger.debug(f"[推送] {_who(acc)} 已跳过：未认证")
                 continue
             if int(acc.get("status") or 1) != STATUS_ACTIVE:
                 job.skipped_list.append(
@@ -731,9 +762,9 @@ class PushManager:
                 )
                 job.append_log(
                     "WARNING",
-                    f"[推送] {_who(acc)}  已跳过：状态非正常",
+                    f"[推送] {_who(acc)} 已跳过：状态非正常",
                 )
-                logger.debug(f"[推送] {_who(acc)}  已跳过：状态非正常(status={acc.get('status')})")
+                logger.debug(f"[推送] {_who(acc)} 已跳过：状态非正常(status={acc.get('status')})")
                 continue
             candidates.append(acc)
         job.count = len(candidates)
@@ -799,7 +830,7 @@ class PushManager:
         msg = str(result.get("message") or "CPA 推送失败")
         job.append_log(
             "SUCCESS" if result.get("ok") else "ERROR",
-            f"[推送] CPA  {msg}  · {elapsed_label(t0)}",
+            f"[推送] CPA {msg} · {elapsed_label(t0)}",
         )
 
     def _push_g2a_concurrent(
@@ -810,10 +841,7 @@ class PushManager:
             """单账号导入；取消信号下不发送请求。"""
             if job.cancel_event.is_set():
                 return None
-            t0 = time.monotonic()
             result = push_one_g2a(acc, base_url=config.G2A_BASE_URL, access_token=g2a_token)
-            if result is not None:
-                result = {**result, "cost": elapsed_label(t0)}
             # 随机间隔：降低批量高频导入触发上游风控的概率
             time.sleep(random.uniform(*_G2A_SLEEP_RANGE))
             return result
@@ -831,22 +859,21 @@ class PushManager:
                     job.done += 1
                     job.append_log(
                         "ERROR",
-                        f"[推送] {_who(acc)}  失败：{type(exc).__name__}: {exc}",
+                        f"[推送] {_who(acc)} 失败：{type(exc).__name__}: {exc}",
                     )
-                    logger.error(f"[推送] {_who(acc)}  G2A 导入异常: {type(exc).__name__}: {exc}")
+                    logger.error(f"[推送] {_who(acc)} G2A 导入异常: {type(exc).__name__}: {exc}")
                     continue
                 if result is None:
                     continue  # 已取消
                 job.done += 1
-                cost = result.get("cost")
-                suffix = f"  · {cost}" if cost else ""
+                label = str(acc.get("email") or "").strip() or f"#{acc.get('id')}"
                 body = str(result.get("message") or "")
                 if result.get("ok"):
                     job.pushed += 1
-                    job.append_log("SUCCESS", f"[推送] {_who(acc)}  {body}{suffix}")
+                    job.append_log("SUCCESS", f"{label}·推送成功")
                 else:
                     job.failed += 1
-                    job.append_log("ERROR", f"[推送] {_who(acc)}  {body}{suffix}")
+                    job.append_log("ERROR", f"{label}·{body}")
 
 
 # 进程内单例（模块级，对齐 api/jobs.manager 的用法）

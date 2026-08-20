@@ -1025,29 +1025,28 @@ def _run_attempt(
             add_to_auth_pool(email, "", 5, account_id)
             sso_t0 = sso_clock[0] if sso_clock else add_t0
             logger.success(
-                f"[SSO] {email}  #{account_id}  会话已落地，注册完成  · {elapsed_label(sso_t0)}"
+                f"[SSO] {email}  会话已落地，注册完成  · {elapsed_label(sso_t0)}"
             )
             logger.success(
-                f"[入池] {email}  #{account_id}  · {elapsed_label(add_t0)}"
+                f"[入池] {email}  · {elapsed_label(add_t0)}"
             )
 
             if config.IS_AUTH:  # 浏览器仍开着，顺带 grok.com 风控体检（已登录）
                 risk_t0 = time.monotonic()
                 risk = check_account_risk(page)
                 bfs, details = risk
-                aid = f"#{account_id}"
                 if bfs is None:
                     logger.warning(
-                        f"[风控] {email}  {aid}  未解析到风控字段，标记 unknown  · {elapsed_label(risk_t0)}"
+                        f"[风控] {email}  未解析到风控字段，标记 unknown  · {elapsed_label(risk_t0)}"
                     )
                 elif bfs in (1, 2):
                     extra = f"  details={details}" if details else ""
                     logger.warning(
-                        f"[风控] {email}  {aid}  被标记  bfs={bfs}{extra}  · {elapsed_label(risk_t0)}"
+                        f"[风控] {email}  被标记  bfs={bfs}{extra}  · {elapsed_label(risk_t0)}"
                     )
                 else:
                     logger.success(
-                        f"[风控] {email}  {aid}  正常  bfs={bfs}  · {elapsed_label(risk_t0)}"
+                        f"[风控] {email}  正常  bfs={bfs}  · {elapsed_label(risk_t0)}"
                     )
     except Exception as exc:
         if "TargetClosed" in type(exc).__name__ or "closed" in str(exc).lower():
@@ -1277,7 +1276,7 @@ def run_auth_pool(stop_when: Callable[[], bool] | None = None) -> int:
         account = get_account_by_email(email)
         aid = int(entry.get("account_id") or (account or {}).get("id") or 0)
         if account is None:
-            logger.warning(f"[出池] {email}  #{aid or '?'}  账号不存在，已移除")
+            logger.warning(f"[出池] {email}  账号不存在，已移除")
             remove_from_auth_pool(email)
             continue
         if not aid:
@@ -1298,13 +1297,13 @@ def run_auth_pool(stop_when: Callable[[], bool] | None = None) -> int:
             success_count += 1
             exp_txt = format_exp(decode_jwt_exp(token.get("access_token")))
             logger.success(
-                f"[出池] {email}  #{aid}  认证成功  Token 到期 {exp_txt}  · {elapsed_label(t0)}"
+                f"[出池] {email}  认证成功  Token 到期 {exp_txt}  · {elapsed_label(t0)}"
             )
         else:
             update_account_status(email, STATUS_REAUTH, f"0 {reason}")
             remove_from_auth_pool(email)
             logger.warning(
-                f"[出池] {email}  #{aid}  认证失败：{reason}  · {elapsed_label(t0)}"
+                f"[出池] {email}  认证失败：{reason}  · {elapsed_label(t0)}"
             )
         time.sleep(2.0)  # 账号间固定 2 秒间隔
     logger.info(f"[出池] 消化完成: 成功 {success_count}/{len(auth_entries)}")

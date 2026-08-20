@@ -316,10 +316,26 @@ export interface AutoRefreshStatus {
   last_run_at: string;
   last_result: string;
   skip_reason: string;
+  done: number;
+  total: number;
+  progress: number;
+  logs: PoolPushLog[];
+  last_log_id: number;
 }
 
-export async function fetchAutoRefreshStatus(): Promise<AutoRefreshStatus> {
-  return request<AutoRefreshStatus>("/api/pool/auto-refresh");
+export interface AuthPoolStatus {
+  running: boolean;
+  queue_size: number;
+}
+
+export async function fetchAuthPoolStatus(): Promise<AuthPoolStatus> {
+  return request<AuthPoolStatus>("/api/pool/auth/status");
+}
+
+export async function fetchAutoRefreshStatus(afterLogId: number): Promise<AutoRefreshStatus> {
+  return request<AutoRefreshStatus>(
+    `/api/pool/auto-refresh?after=${afterLogId}`,
+  );
 }
 
 export interface PoolAuthResultItem {

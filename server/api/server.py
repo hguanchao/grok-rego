@@ -23,7 +23,7 @@ from db import (
     soft_delete_accounts,
     update_account_status_by_ids,
 )
-from ops.pool_jobs import auto_refresher, kick_auth_pool, pool_job_manager
+from ops.pool_jobs import auth_pool_state, auto_refresher, kick_auth_pool, pool_job_manager
 from ops.push import push_manager
 from workflow.jobs import manager
 
@@ -392,8 +392,12 @@ def _handle_pool_maintenance_api(
         logger.info(f"[风控] 任务启动 账号 id={ids[0]} task={data.get('id')}")
         _send_json(handler, 200, {"ok": True, "data": data})
         return True
+    if method == "GET" and path == "/api/pool/auth/status":
+        _send_json(handler, 200, {"ok": True, "data": auth_pool_state()})
+        return True
     if method == "GET" and path == "/api/pool/auto-refresh":
-        _send_json(handler, 200, {"ok": True, "data": auto_refresher.state()})
+        after = _after_log_id(query)
+        _send_json(handler, 200, {"ok": True, "data": auto_refresher.state(after_log_id=after)})
         return True
     return False
 

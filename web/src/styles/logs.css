@@ -439,6 +439,8 @@
   color: #f59e0b;
 }.ops-drawer-body .log-step.ops-log-step-push {
   color: #8b5cf6;
+}.ops-drawer-body .log-step.ops-log-step-refresh {
+  color: #10b981;
 }:root:not(.dark):not([data-theme="dark"]) .ops-drawer-body .log-step.ops-log-step-inspect, [data-theme="light"]:not(.dark) .ops-drawer-body .log-step.ops-log-step-inspect {
   color: #0d9488;
 }:root:not(.dark):not([data-theme="dark"]) .ops-drawer-body .log-step.ops-log-step-auth, [data-theme="light"]:not(.dark) .ops-drawer-body .log-step.ops-log-step-auth {
@@ -447,6 +449,8 @@
   color: #b45309;
 }:root:not(.dark):not([data-theme="dark"]) .ops-drawer-body .log-step.ops-log-step-push, [data-theme="light"]:not(.dark) .ops-drawer-body .log-step.ops-log-step-push {
   color: #7c3aed;
+}:root:not(.dark):not([data-theme="dark"]) .ops-drawer-body .log-step.ops-log-step-refresh, [data-theme="light"]:not(.dark) .ops-drawer-body .log-step.ops-log-step-refresh {
+  color: #059669;
 }
 
 /* ── 日志按钮（触发） ── */.ops-log-trigger {
