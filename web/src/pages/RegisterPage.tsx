@@ -610,110 +610,91 @@ export function RegisterPage() {
               </ToggleGroup>
             </div>
 
-            <Collapsible className="field-block">
-              <CollapsibleTrigger asChild>
+            <div className="field-block">
+              <div className="field-label">
+                <b>SSO 授权</b>
+              </div>
+              <ToggleGroup
+                type="single"
+                className="mode-toggle"
+                value={authEnabled ? "auth" : "noauth"}
+                onValueChange={(value) => {
+                  if (value === "auth") setAuthEnabled(true);
+                  if (value === "noauth") setAuthEnabled(false);
+                }}
+                disabled={formDisabled}
+                aria-label="注册后自动进行 SSO 授权"
+              >
+                <ToggleGroupItem className="mode-toggle-item" value="auth" aria-label="自动 SSO 授权">
+                  <BadgeCheck className="size-3.5" strokeWidth={1.6} />
+                  开启
+                </ToggleGroupItem>
+                <ToggleGroupItem className="mode-toggle-item" value="noauth" aria-label="不自动 SSO 授权">
+                  <CircleX className="size-3.5" strokeWidth={1.6} />
+                  关闭
+                </ToggleGroupItem>
+              </ToggleGroup>
+            </div>
+
+            <div className="field-block rail-more-body">
+              <div className="field-block">
+                <div className="field-label">
+                  <b>本地代理</b>
+                </div>
+                <Input
+                  type="text"
+                  placeholder="http://127.0.0.1:7890"
+                  value={proxy}
+                  disabled={formDisabled}
+                  onChange={(event) => setProxy(event.target.value)}
+                />
+              </div>
+              <div className="rail-btn-row">
                 <Button
                   type="button"
-                  variant="ghost"
+                  variant="outline"
                   size="sm"
-                  className="rail-more-trigger"
+                  title="G2A / CPA 推送目标"
+                  disabled={formDisabled}
+                  onClick={() => setPushDialogOpen(true)}
                 >
-                  <span>更多选项</span>
-                  <ChevronDown className="rail-more-chevron size-3.5" strokeWidth={1.6} />
+                  <SlidersHorizontal className="size-3.5" strokeWidth={1.6} />
+                  推送目标设置
                 </Button>
-              </CollapsibleTrigger>
-              <CollapsibleContent>
-                <div className="rail-more-body">
-                  <div className="field-block">
-                    <div className="field-label">
-                      <b>本地代理</b>
-                    </div>
-                    <Input
-                      type="text"
-                      placeholder="http://127.0.0.1:7890"
-                      value={proxy}
-                      disabled={formDisabled}
-                      onChange={(event) => setProxy(event.target.value)}
-                    />
-                  </div>
-                  <div className="field-block">
-                    <div className="field-label">
-                      <b>SSO 授权</b>
-                    </div>
-                    <ToggleGroup
-                      type="single"
-                      className="mode-toggle"
-                      value={authEnabled ? "auth" : "noauth"}
-                      onValueChange={(value) => {
-                        if (value === "auth") setAuthEnabled(true);
-                        if (value === "noauth") setAuthEnabled(false);
-                      }}
-                      disabled={formDisabled}
-                      aria-label="注册后自动进行 SSO 授权"
-                    >
-                      <ToggleGroupItem className="mode-toggle-item" value="auth" aria-label="自动 SSO 授权">
-                        <BadgeCheck className="size-3.5" strokeWidth={1.6} />
-                        开启
-                      </ToggleGroupItem>
-                      <ToggleGroupItem className="mode-toggle-item" value="noauth" aria-label="不自动 SSO 授权">
-                        <CircleX className="size-3.5" strokeWidth={1.6} />
-                        关闭
-                      </ToggleGroupItem>
-                    </ToggleGroup>
-                  </div>
-                  <Button
-                    type="button"
-                    variant="outline"
-                    size="sm"
-                    className="w-full"
-                    title="G2A / CPA 推送目标"
-                    disabled={formDisabled}
-                    onClick={() => setPushDialogOpen(true)}
-                  >
-                    <SlidersHorizontal className="size-3.5" strokeWidth={1.6} />
-                    推送目标设置
-                  </Button>
-                </div>
-              </CollapsibleContent>
-            </Collapsible>
+                <Button
+                  type="button"
+                  variant="default"
+                  size="sm"
+                  disabled={formDisabled || saving}
+                  onClick={() => void handleSaveConfig()}
+                >
+                  <Save strokeWidth={1.6} />
+                  {saving ? "保存中…" : "保存配置"}
+                </Button>
+              </div>
+            </div>
           </div>
 
           <div className="rail-actions rail-actions-primary">
-            {busy ? (
-              <Button
-                type="button"
-                variant="destructive"
-                className="rail-stop-btn"
-                disabled={stopping}
-                onClick={() => void handleStop()}
-              >
-                <Square strokeWidth={1.6} />
-                {stopping || job.status === "stopping" ? "停止中…" : "停止注册"}
-              </Button>
-            ) : (
-              <Button
-                type="button"
-                className="rail-start-btn"
-                disabled={formDisabled || starting}
-                onClick={() => void handleStart()}
-              >
-                <Play strokeWidth={1.6} />
-                {starting ? "启动中…" : "开始注册"}
-              </Button>
-            )}
-            {!busy ? (
-              <Button
-                type="button"
-                variant="ghost"
-                size="sm"
-                className="w-full"
-                disabled={formDisabled || saving}
-                onClick={() => void handleSaveConfig()}
-              >
-                <Save strokeWidth={1.6} />
-                {saving ? "保存中…" : "保存配置"}
-              </Button>
-            ) : null}
+            <Button
+              type="button"
+              className="rail-start-btn"
+              disabled={formDisabled || starting || busy}
+              onClick={() => void handleStart()}
+            >
+              <Play strokeWidth={1.6} />
+              {starting ? "启动中…" : "开始注册"}
+            </Button>
+            <Button
+              type="button"
+              variant="destructive"
+              className="rail-stop-btn"
+              disabled={!busy || stopping}
+              onClick={() => void handleStop()}
+            >
+              <Square strokeWidth={1.6} />
+              {stopping || job.status === "stopping" ? "停止中…" : "停止注册"}
+            </Button>
           </div>
         </aside>
 

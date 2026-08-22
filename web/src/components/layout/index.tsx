@@ -14,13 +14,14 @@ import {
   useNavigate,
 } from "react-router-dom";
 import {
-  Button,
-  Tabs,
-  TabsList,
-  TabsTrigger,
   Tooltip,
   TooltipContent,
   TooltipTrigger,
+  Tabs,
+  TabsList,
+  TabsTrigger,
+  ToggleGroup,
+  ToggleGroupItem,
 } from "@/components/ui";
 import {
   fetchRegisterStatus,
@@ -36,60 +37,58 @@ const nav = [
 
 const themeMeta: Record<
   ThemeMode,
-  { icon: typeof Sun; label: string; nextHint: string }
+  { icon: typeof Sun; label: string }
 > = {
-  light: { icon: Sun, label: "浅色", nextHint: "切换深色" },
-  dark: { icon: Moon, label: "深色", nextHint: "切换跟随系统" },
-  system: { icon: Monitor, label: "跟随系统", nextHint: "切换浅色" },
+  light: { icon: Sun, label: "浅色" },
+  dark: { icon: Moon, label: "深色" },
+  system: { icon: Monitor, label: "跟随系统" },
 };
 
-/** 主题切换：单按钮 cycle，节省顶栏空间 */
+/** 主题切换：平铺三图标（浅色 / 深色 / 跟随系统），点击直接选中 */
 export function ThemeToggle({ className }: { className?: string }) {
-  const { theme, cycleTheme } = useTheme();
-  const meta = themeMeta[theme];
-  const Icon = meta.icon;
+  const { theme, setTheme } = useTheme();
 
   return (
-    <Tooltip>
-      <TooltipTrigger asChild>
-        <Button
-          type="button"
-          variant="ghost"
-          size="icon"
-          className={cn("theme-toggle-btn", className)}
-          aria-label={`主题：${meta.label}，${meta.nextHint}`}
-          onClick={cycleTheme}
-        >
-          <Icon className="size-3.5" strokeWidth={1.75} />
-        </Button>
-      </TooltipTrigger>
-      <TooltipContent side="bottom">
-        {meta.label} · 点击{meta.nextHint}
-      </TooltipContent>
-    </Tooltip>
+    <ToggleGroup
+      type="single"
+      value={theme}
+      onValueChange={(value) => {
+        if (value) setTheme(value as ThemeMode);
+      }}
+      size="sm"
+      className={cn("theme-toggle", className)}
+      aria-label="主题切换"
+    >
+      {(Object.keys(themeMeta) as ThemeMode[]).map((mode) => {
+        const meta = themeMeta[mode];
+        const Icon = meta.icon;
+        return (
+          // asChild 方向必须是 ToggleGroupItem 包 TooltipTrigger：
+          // Radix 两者都把 data-state 写在 props 展开之前，谁在外层谁的 data-state 被覆盖。
+          // 反过来写（TooltipTrigger asChild 包 Item）会让 tooltip 的 data-state="closed"
+          // 冲掉 Toggle 的 "on"，选中态样式全部失效。
+          <Tooltip key={mode}>
+            <ToggleGroupItem
+              asChild
+              value={mode}
+              className="theme-toggle-item"
+              aria-label={`主题：${meta.label}`}
+            >
+              <TooltipTrigger>
+                <Icon className="size-3.5" strokeWidth={1.75} />
+              </TooltipTrigger>
+            </ToggleGroupItem>
+            <TooltipContent side="bottom">{meta.label}</TooltipContent>
+          </Tooltip>
+        );
+      })}
+    </ToggleGroup>
   );
 }
 
-const statusLabel: Record<RegisterJobState["status"], string> = {
-  idle: "空闲",
-  pending: "排队中",
-  running: "运行中",
-  stopping: "停止中",
-  completed: "已完成",
-  cancelled: "已取消",
-  failed: "失败",
-};
-
-const activeStatuses: RegisterJobState["status"][] = [
-  "pending",
-  "running",
-  "stopping",
-];
-
-/** 顶栏呼吸注册状态：点击跳转注册页 */
-export function RegisterStatus({ className }: { className?: string }) {
-  const navigate = useNavigate();
-  const [status, setStatus] = useState<RegisterJobState["status"]>("idle");
+/** 顶栏注册呼吸灯：跨页轮询任务状态，运行中计数呼吸，点击回注册页 */
+function RegisterBreathStatus() {
+  const [job, setJob] = useState<RegisterJobState | null>(null);
 
   useEffect(() => {
     let alive = true;
@@ -97,7 +96,7 @@ export function RegisterStatus({ className }: { className?: string }) {
     const poll = async () => {
       try {
         const state = await fetchRegisterStatus();
-        if (alive) setStatus(state.status);
+        if (alive) setJob(state);
       } catch {
         // 管理 API 离线：保留上一次状态
       } finally {
@@ -111,26 +110,51 @@ export function RegisterStatus({ className }: { className?: string }) {
     };
   }, []);
 
-  const label = statusLabel[status];
-  const isLive = activeStatuses.includes(status);
-  const isBad = status === "failed";
+  const status = job?.status ?? "idle";
+  const live =
+    status === "pending" || status === "running" || status === "stopping";
+  const finished =
+    (job?.success ?? 0) + (job?.failed ?? 0) + (job?.denied ?? 0);
+  const total = job?.count ?? 0;
+
+  let value = "空闲";
+  if (status === "pending") value = "排队";
+  else if (status === "running")
+    value = total > 0 ? `${finished}/${total}` : "运行中";
+  else if (status === "stopping") value = "停止中";
+  else if (status === "completed") value = "完成";
+  else if (status === "failed") value = "失败";
+  else if (status === "cancelled") value = "已停";
+
+  const tone = live
+    ? "is-live"
+    : status === "completed"
+      ? "is-ok"
+      : status === "failed"
+        ? "is-bad"
+        : "is-idle";
+
+  const tip = live
+    ? `注册进行中 · ${value}`
+    : status !== "idle"
+      ? `最近注册 · ${value}`
+      : "暂无注册任务";
 
   return (
-    <button
-      type="button"
-      className={cn(
-        "reg-status",
-        isLive && "is-live",
-        isBad && "is-bad",
-        className,
-      )}
-      title={`注册状态：${label}（点击前往注册页）`}
-      aria-label={`注册状态：${label}，点击前往注册页`}
-      onClick={() => navigate("/register")}
-    >
-      <i className="reg-status-dot" aria-hidden />
-      <span>{label}</span>
-    </button>
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <NavLink
+          to="/register"
+          className={cn("register-breath", tone)}
+          aria-label={`注册状态 ${value}`}
+        >
+          <span className="register-breath-dot" aria-hidden />
+          <span className="register-breath-k">注册</span>
+          <span className="register-breath-v">{value}</span>
+        </NavLink>
+      </TooltipTrigger>
+      <TooltipContent side="bottom">{tip}</TooltipContent>
+    </Tooltip>
   );
 }
 
@@ -182,7 +206,7 @@ export function AppShell() {
         </Tabs>
 
         <div className="header-actions">
-          <RegisterStatus />
+          <RegisterBreathStatus />
           <ThemeToggle />
         </div>
       </header>

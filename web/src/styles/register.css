@@ -4,7 +4,7 @@
   display: grid;
   grid-template-columns: var(--rail-w) minmax(0, 1fr);
   gap: 16px;
-  min-height: calc(100svh - var(--top-h) - 60px);
+  min-height: calc(100svh - var(--top-h) - 90px);
   align-items: stretch;
 }
 @media (max-width: 980px) {.deck-register {
@@ -167,23 +167,39 @@
   color: var(--foreground) !important;
 }
 
-/* 顶栏主题切换：单按钮 cycle */
-.theme-toggle-btn {
-  width: 30px;
-  height: 30px;
-  color: var(--muted-foreground);
-  border: 1px solid var(--border);
-  background: color-mix(in srgb, var(--muted) 40%, transparent);
+/* 顶栏主题切换：平铺三图标（浅色 / 深色 / 跟随系统），样式见 ui ToggleGroup */
+/* 与注册状态胶囊同高：24 + 组 padding 4 + 边框 2 = 30px */
+.theme-toggle-item {
+  height: 24px !important;
+  min-height: 24px !important;
+  transition:
+    background-color 0.18s ease,
+    color 0.18s ease,
+    box-shadow 0.22s ease,
+    transform 0.12s ease;
 }
-.theme-toggle-btn:hover {
-  color: var(--foreground);
-  border-color: color-mix(in srgb, var(--foreground) 16%, transparent);
-  background: var(--secondary);
+/* 按压反馈：轻微收缩，强化“已切换”手感 */
+.theme-toggle-item:active {
+  transform: scale(0.92);
+}
+/* 选中样式：图标变主题绿（--primary），淡绿底衬辅助指示 */
+.theme-toggle-item[data-state="on"],
+.theme-toggle-item[data-state="on"]:hover,
+.theme-toggle-item[data-state="on"]:focus-visible {
+  background: color-mix(in srgb, var(--primary) 10%, transparent) !important;
+  color: var(--primary) !important;
+  box-shadow: inset 0 0 0 1px
+    color-mix(in srgb, var(--primary) 30%, transparent) !important;
+}
+/* Lucide 图标跟随 currentColor，显式声明确保描边为主题绿 */
+.theme-toggle-item[data-state="on"] svg {
+  color: var(--primary) !important;
 }
 
-/* 注册轨主 CTA */
+/* 注册轨主 CTA（开始 / 停止并排双列） */
 .rail-actions-primary {
   display: grid;
+  grid-template-columns: 1fr 1fr;
   gap: 8px;
 }
 .rail-actions-primary .rail-start-btn {
@@ -195,22 +211,15 @@
   width: 100%;
   height: 36px;
 }
-.rail-more-trigger {
-  width: 100%;
-  justify-content: space-between;
-  color: var(--muted-foreground);
-  font-weight: 500;
-}
-.rail-more-trigger[data-state="open"] .rail-more-chevron {
-  transform: rotate(180deg);
-}
-.rail-more-chevron {
-  transition: transform var(--ap-dur-fast) ease;
-}
 .rail-more-body {
   display: grid;
   gap: 12px;
   padding-top: 10px;
+}
+.rail-btn-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
 }
 
 /* 进行中指标微呼吸（对齐顶栏 reg-status） */
