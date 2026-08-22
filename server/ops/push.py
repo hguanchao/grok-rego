@@ -488,7 +488,7 @@ from db import STATUS_ACTIVE, get_all_accounts
 
 # 并发上限（与前端并发输入框 1-20 对齐）
 MAX_CONCURRENCY = 20
-# G2A 逐账号导入随机间隔（秒）：降低高频导入触发风控概率
+# G2A 逐账号导入间隔（秒）：降低高频导入触发风控概率
 _G2A_SLEEP_RANGE = (2.0, 2.0)  # 账号间固定 2 秒间隔，对齐推送/巡检/认证节奏
 # 任务日志内存环形保留条数
 _LOG_LIMIT = 500
@@ -842,7 +842,7 @@ class PushManager:
             if job.cancel_event.is_set():
                 return None
             result = push_one_g2a(acc, base_url=config.G2A_BASE_URL, access_token=g2a_token)
-            # 随机间隔：降低批量高频导入触发上游风控的概率
+            # 账号间间隔：降低批量高频导入触发上游风控的概率
             time.sleep(random.uniform(*_G2A_SLEEP_RANGE))
             return result
 

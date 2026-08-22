@@ -442,7 +442,7 @@ import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from core.util import elapsed_label, format_exp
+from core.util import format_exp
 from db import (
     STATUS_LIMITED,
     get_all_accounts,
@@ -451,7 +451,7 @@ from db import (
 
 # 并发上限（与前端并发输入框 1-20 对齐）
 MAX_CONCURRENCY = 20
-# 账号间固定 1 秒间隔：对齐推送/巡检/认证节奏，降低批量请求触发上游风控的概率
+# 账号间固定 2 秒间隔：对齐推送/巡检/认证节奏，降低批量请求触发上游风控的概率
 _INSPECT_SLEEP_RANGE = (2.0, 2.0)
 _REAUTH_SLEEP_RANGE = (2.0, 2.0)
 # 任务日志内存环形保留条数
@@ -970,7 +970,7 @@ class PoolJobManager:
 
         def wrapped(acc: dict[str, Any]) -> dict[str, Any] | None:
             result = work(acc)
-            # 随机间隔：降低批量真实请求触发上游风控的概率
+            # 账号间间隔：降低批量真实请求触发上游风控的概率
             time.sleep(random.uniform(*sleep_range))
             return result
 

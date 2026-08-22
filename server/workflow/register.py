@@ -1062,7 +1062,7 @@ def _run_attempt(
 # ---------------------------------------------------------------------------
 
 def _check_proxy() -> bool:
-    """检测代理是否可用：通过代理访问中立快速���点（gstatic generate_204）。"""
+    """检测代理是否可用：通过代理访问中立快速端点（gstatic generate_204）。"""
     proxy = config.PROXY
     t0 = time.monotonic()
     if not proxy:

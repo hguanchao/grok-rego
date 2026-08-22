@@ -153,12 +153,6 @@ Base URL: https://maliapi.215.im/v1，通过 X-API-Key 认证（AC- 前缀）。
 
 
 
-def _proxies() -> dict[str, str] | None:
-    """按当前配置返回代理；避免 from-import 快照过期。"""
-    proxy = config.PROXY
-    return {"http": proxy, "https": proxy} if proxy else None
-
-
 def _yyds_create_temp_email(local_part: str = "") -> tuple[str, str]:
     """创建临时邮箱（API key 默认域），返回 (address, temp_token)。"""
     if not (config.YYDS_API_KEY or "").strip():
@@ -260,15 +254,13 @@ def poll_for_code(
 ) -> str | None:
     """按 MAIL_PROVIDER 轮询验证码。
 
-    兼容两种调用：
+    兼容两种调用（凭据均取 token，缺省回退第一参）：
     - cf：poll_for_code(jwt) 或 poll_for_code(email, jwt)（第二参为 jwt）
-    - yyds：poll_for_code(email, token)
+    - yyds：poll_for_code(temp_token) 或 poll_for_code(email, temp_token)
     """
     provider_name = (config.MAIL_PROVIDER or "cf").strip().lower()
+    # 优先用 token（jwt / temp_token），否则 email_or_jwt 本身就是凭据
+    credential = (token or email_or_jwt or "").strip()
     if provider_name == "yyds":
-        return _yyds_poll_for_code(
-            email_or_jwt, token or "", timeout=timeout, interval=interval
-        )
-    # cf：优先用 token(jwt)，否则 email_or_jwt 本身就是 jwt
-    jwt = (token or email_or_jwt or "").strip()
-    return _cf_poll_for_code(jwt, timeout=timeout, interval=interval)
+        return _yyds_poll_for_code(credential, timeout=timeout, interval=interval)
+    return _cf_poll_for_code(credential, timeout=timeout, interval=interval)

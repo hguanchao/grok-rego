@@ -225,7 +225,7 @@ def _turnstile_widget(page: Any) -> Any | None:
 
 
 def _click_turnstile_checkbox(page: Any, widget: Any) -> bool:
-    """点 Turnstile 左侧勾选框（�� 28×28，相对 iframe 左上）。"""
+    """点 Turnstile 左侧勾选框（约 28×28，相对 iframe 左上）。"""
     try:
         widget.scroll_into_view_if_needed(timeout=2000)
     except Exception:
@@ -304,7 +304,7 @@ def handle_turnstile(page: Any, max_wait: int = 60) -> str:
             logger.debug("[Turnstile] 可见校验失败，需要刷新页面")
             return "refresh"
 
-        # 宽限期��只等自动通过，不点，避免打断 managed 模式
+        # 宽限期内只等自动通过，不点，避免打断 managed 模式
         if elapsed >= _TURNSTILE_AUTO_GRACE and elapsed - last_click >= 4.0:
             widget = _turnstile_widget(page)
             if widget is not None:
