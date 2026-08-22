@@ -255,11 +255,11 @@ export interface PoolOpTask {
   done: number;
   skipped: number;
   skipped_list: Array<{ id: number; reason: string }>;
+  /** 重登降级：已入认证池、等待后台 SSO 自动认证的账号（对齐后端 PoolJob.pending_list） */
   pending_list: Array<{
     id: number;
     email: string;
-    verification_uri: string;
-    user_code: string;
+    reason: string;
   }>;
   started_at: string | null;
   finished_at: string | null;
@@ -342,8 +342,6 @@ export interface PoolAuthResultItem {
   id: number;
   email?: string;
   status: "pending" | "skipped" | "failed";
-  verification_uri?: string;
-  user_code?: string;
   reason?: string;
 }
 

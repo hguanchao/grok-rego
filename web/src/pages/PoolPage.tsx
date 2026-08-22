@@ -124,11 +124,6 @@ export function PoolPage() {
   const [visiblePasswords, setVisiblePasswords] = useState<Set<number>>(new Set());
   const [deleteOpen, setDeleteOpen] = useState(false);
   const [pushDialogOpen, setPushDialogOpen] = useState(false);
-  const [authPending, setAuthPending] = useState<{
-    email: string;
-    verificationUri: string;
-    userCode: string;
-  } | null>(null);
   const [detailAccount, setDetailAccount] = useState<PoolAccount | null>(null);
   // 详情弹窗独立的密码可见性，避免与列表 visiblePasswords 共享导致联动
   const [detailPasswordVisible, setDetailPasswordVisible] = useState(false);
@@ -147,8 +142,6 @@ export function PoolPage() {
   const poolAfterRef = useRef(0);
   // 认证轮询：发起认证后短期轮询账号状态，确认 Token 是否交换成功
   const authPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  // 已弹过授权框的任务 id（重登降级只弹一次）
-  const poolAuthPromptedRef = useRef<string | null>(null);
   const keywordTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   // 列表请求序号：竞态保护（搜索/筛选/翻页快速切换时丢弃过期响应）
   const reqSeqRef = useRef(0);
@@ -485,7 +478,6 @@ export function PoolPage() {
             }
           }
           if (pending.size === 0) {
-            setAuthPending(null);
             finishAuth();
             return;
           }
@@ -533,20 +525,7 @@ export function PoolPage() {
               })),
             );
           }
-          // 重登降级：首个待授权账号弹浏览器授权框（同一任务只弹一次）
-          if (
-            kind === "reauth" &&
-            snap.pending_list.length > 0 &&
-            poolAuthPromptedRef.current !== taskId
-          ) {
-            poolAuthPromptedRef.current = taskId;
-            const first = snap.pending_list[0];
-            setAuthPending({
-              email: first.email || accountLabel(first.id),
-              verificationUri: first.verification_uri,
-              userCode: first.user_code ?? "",
-            });
-          }
+          // 重登降级账号已入认证池，后台 SSO 自动认证，进展由任务日志呈现
           setPoolTask(snap);
           if (snap.status === "done" || snap.status === "cancelled") {
             stopPoolPolling();
@@ -574,7 +553,7 @@ export function PoolPage() {
         }
       }, 3000);
     },
-    [accountLabel, appendLogs, load, settleTask, stopPoolPolling],
+    [appendLogs, load, settleTask, stopPoolPolling],
   );
 
   /** 取消巡检/重登/风控任务 */
@@ -845,22 +824,7 @@ export function PoolPage() {
         setInspecting(true);
         const res = await authPoolAccounts([id]);
         const r = res.results[0];
-        if (r && r.status === "pending" && r.verification_uri) {
-          setAuthPending({
-            email: r.email ?? label,
-            verificationUri: r.verification_uri,
-            userCode: r.user_code ?? "",
-          });
-          appendLogs([
-            {
-              type: "auth",
-              level: "INFO",
-              message: `[认证] ${label}  待授权，请在浏览器完成`,
-            },
-          ]);
-          startAuthPolling([id], { [id]: label });
-          authPollingStarted = true;
-        } else if (r && r.status === "pending") {
+        if (r && r.status === "pending") {
           appendLogs([
             {
               type: "auth",
@@ -887,7 +851,6 @@ export function PoolPage() {
         openLogDrawer();
         const task = await reauthPoolAccounts([id]);
         setPoolTask(task);
-        poolAuthPromptedRef.current = null;
         poolAfterRef.current = task.last_log_id;
         if (task.id) {
           startPoolPolling(task.id, "reauth");
@@ -896,7 +859,6 @@ export function PoolPage() {
         openLogDrawer();
         const task = await riskPoolAccount(id);
         setPoolTask(task);
-        poolAuthPromptedRef.current = null;
         poolAfterRef.current = task.last_log_id;
         if (task.id) {
           startPoolPolling(task.id, "risk");
@@ -978,7 +940,6 @@ export function PoolPage() {
         Number(concurrencyRef.current?.value) || undefined,
       );
       setPoolTask(task);
-      poolAuthPromptedRef.current = null;
       poolAfterRef.current = task.last_log_id;
       if (task.id) {
         startPoolPolling(task.id, "inspect");
@@ -1027,7 +988,6 @@ export function PoolPage() {
         Number(concurrencyRef.current?.value) || undefined,
       );
       setPoolTask(task);
-      poolAuthPromptedRef.current = null;
       poolAfterRef.current = task.last_log_id;
       if (task.id) {
         startPoolPolling(task.id, "reauth");
@@ -1080,13 +1040,6 @@ export function PoolPage() {
       const pending = results.filter((r) => r.status === "pending");
       const rows: PoolLogInput[] = results.map((r): PoolLogInput => {
         const label = accountLabel(r.id);
-        if (r.status === "pending" && r.verification_uri) {
-          return {
-            type: "auth",
-            level: "INFO",
-            message: `[认证] ${label}  待授权，请在浏览器完成`,
-          };
-        }
         if (r.status === "pending") {
           return {
             type: "auth",
@@ -1104,14 +1057,6 @@ export function PoolPage() {
         };
       });
       appendLogs(rows);
-      const first = pending.find((r) => r.verification_uri);
-      if (first?.verification_uri) {
-        setAuthPending({
-          email: first.email ?? accountLabel(first.id),
-          verificationUri: first.verification_uri,
-          userCode: first.user_code ?? "",
-        });
-      }
       if (pending.length > 0) {
         const labels: Record<number, string> = {};
         for (const r of pending) labels[r.id] = accountLabel(r.id);
@@ -1672,58 +1617,6 @@ export function PoolPage() {
               }}
             >
               关闭
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
-
-      <Dialog
-        open={authPending !== null}
-        onOpenChange={(open) => {
-          if (!open) setAuthPending(null);
-        }}
-      >
-        <DialogContent className="advanced-dialog sm:max-w-lg">
-          <DialogHeader>
-            <DialogTitle>账号认证授权</DialogTitle>
-            <DialogDescription>
-              请在浏览器中打开以下链接，登录并完成授权。授权完成后后台会自动交换 Token，
-              账号将变为「已认证」。
-            </DialogDescription>
-          </DialogHeader>
-          {authPending ? (
-            <div className="auth-pending-card">
-              <div className="auth-pending-email">{authPending.email}</div>
-              {authPending.userCode ? (
-                <div className="auth-pending-code">
-                  <span>授权码</span>
-                  <code>{authPending.userCode}</code>
-                </div>
-              ) : null}
-              <a
-                href={authPending.verificationUri}
-                target="_blank"
-                rel="noreferrer"
-                className="auth-pending-link"
-              >
-                {authPending.verificationUri}
-              </a>
-            </div>
-          ) : null}
-          <DialogFooter>
-            <Button
-              type="button"
-              variant="outline"
-              onClick={() => {
-                navigator.clipboard
-                  ?.writeText(authPending?.verificationUri ?? "")
-                  .catch(() => {});
-              }}
-            >
-              复制链接
-            </Button>
-            <Button type="button" onClick={() => setAuthPending(null)}>
-              我知道了
             </Button>
           </DialogFooter>
         </DialogContent>
