@@ -94,7 +94,7 @@ uv run python main.py --serve       # 启动管理 API（默认 8787）
 | `mail_provider` | 邮箱服务商：`cf`（Cloudflare）/ `yyds` |
 | `yyds_api_base` / `yyds_api_key` | Yyds 邮箱服务配置 |
 | `proxy` | 代理地址（默认 `http://127.0.0.1:7890`） |
-| `auth_enabled` | 管理 API 是否启用访问认证 |
+| `auth_enabled` | 注册完成后是否自动执行 SSO 授权与 grok.com 风控体检 |
 | `g2a_base_url` / `g2a_username` / `g2a_password` | G2A 管理端配置（登录后推送 Web 池） |
 | `cpa_base_url` / `cpa_management_key` | CPA 管理端配置（auth-files 批量上传） |
 
@@ -102,6 +102,7 @@ uv run python main.py --serve       # 启动管理 API（默认 8787）
 
 - `server/config.json`（含密钥 / Token）不在版本库内；提交代码前请确认仅保留 `config.example.json` 模板
 - 日志输出对敏感字段做脱敏处理
+- 管理 API **无访问认证**，默认仅监听 `127.0.0.1`；请勿暴露到公网或反代到外网
 
 ## License
 
