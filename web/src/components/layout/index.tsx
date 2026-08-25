@@ -1,10 +1,12 @@
 import { useEffect, useState, type ReactNode } from "react";
 import {
+  Activity,
   Bot,
   Boxes,
   LayoutGrid,
   Monitor,
   Moon,
+  Radio,
   Sun,
 } from "lucide-react";
 import {
@@ -33,6 +35,8 @@ import { cn } from "@/lib/utils";
 const nav = [
   { to: "/register", label: "账号注册", icon: LayoutGrid },
   { to: "/pool", label: "号池管理", icon: Boxes },
+  { to: "/usage", label: "用量统计", icon: Activity },
+  { to: "/gateway", label: "网关运维", icon: Radio },
 ] as const;
 
 const themeMeta: Record<
@@ -160,6 +164,8 @@ function RegisterBreathStatus() {
 
 function resolveTab(pathname: string): string {
   if (pathname.startsWith("/pool")) return "/pool";
+  if (pathname.startsWith("/gateway")) return "/gateway";
+  if (pathname.startsWith("/usage")) return "/usage";
   return "/register";
 }
 

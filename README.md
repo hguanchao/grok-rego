@@ -13,7 +13,8 @@ xAI Grok Build 账号自动化工具：**批量注册 → Device Flow 授权 →
 - **推送**：
   - **G2A**：仅推 Web 池（`/api/admin/v1/accounts/web/import`），HTTP 2xx 即视为推送成功，不等待落库同步
   - **CPA**：auth-files 批量上传（单请求合批）
-- **管理 API + Web UI**：账号注册、号池管理、推送任务与推送目标配置一体的可视化界面
+- **管理 API + Web UI**：账号注册、号池管理、推送、网关运维与用量统计一体的可视化界面
+- **OpenCode Zen 网关**：本机 `/v1` 透明反代 `https://opencode.ai/zen/v1`，固定请求头与 `public` 密钥，兼容 Chat Completions / Responses / Messages 与 SSE 流式
 
 ## 技术栈
 
@@ -28,16 +29,16 @@ xAI Grok Build 账号自动化工具：**批量注册 → Device Flow 授权 →
 ```
 grok-rego/
 ├── server/                    # 后端
-│   ├── api/                   # 管理 API 路由（默认端口 8787）
+│   ├── api/                   # 管理 API 路由、号池任务（pool_jobs）、推送（push）
 │   ├── core/                  # 配置 / 日志 / 工具（config、logger、util）
-│   ├── ops/                   # 推送（push：G2A·CPA）与池任务（pool_jobs）
+│   ├── gateway/               # 上游反代（opencode：OpenCode Zen · grok：号池 · ops：运维聚合）
 │   ├── workflow/              # 注册 / OAuth / 浏览器 / 任务编排 / 邮箱
 │   ├── db/                    # 数据库（init + 账号读写）
 │   ├── main.py                # CLI 批量注册 + --serve 启动管理 API
 │   ├── pyproject.toml         # uv 项目定义（Python ≥ 3.13）
 │   └── config.example.json    # 配置模板（复制为 config.json 使用）
 ├── web/                       # 前端
-│   ├── src/pages/             # RegisterPage（注册 / 推送目标设置）、PoolPage（号池 / 推送）
+│   ├── src/pages/             # RegisterPage、PoolPage、GatewayPage、UsagePage
 │   ├── src/components/        # 号池表格等 UI 组件
 │   └── src/styles/            # tokens / base / pool / register 样式体系
 ├── start.bat / start.ps1 / start.sh
@@ -97,6 +98,51 @@ uv run python main.py --serve       # 启动管理 API（默认 8787）
 | `auth_enabled` | 注册完成后是否自动执行 SSO 授权与 grok.com 风控体检 |
 | `g2a_base_url` / `g2a_username` / `g2a_password` | G2A 管理端配置（登录后推送 Web 池） |
 | `cpa_base_url` / `cpa_management_key` | CPA 管理端配置（auth-files 批量上传） |
+
+## OpenCode Zen 网关
+
+管理 API 同时暴露 OpenAI 兼容入口：
+
+| 项 | 值 |
+| --- | --- |
+| 客户端 Base URL | `http://127.0.0.1:8787/zen/v1` |
+| 鉴权 | 默认不鉴权；配置 `gateway_api_key` 后客户端必须携带 `Authorization: Bearer <key>` 或 `x-api-key`（Web「网关运维」页可随机生成） |
+| API Key | `public`（固定，客户端可带可不带，网关会覆盖） |
+| 上游 | `https://opencode.ai/zen/v1` |
+| 固定请求头 | `HTTP-Referer=https://opencode.ai` · `User-Agent=opencode/1.18.16` · `X-Title=opencode` |
+
+`GET /zen/v1/models` 固定返回 `server/gateway/zen-models.json` 中固化的免费模型清单（id 以 `-free` 结尾，以及 stealth 免费模型 `big-pickle`），并注入 Claude Code 可识别的别名模型；该端点不请求上游，清单文件热更新后自动生效。
+
+```bash
+curl http://127.0.0.1:8787/zen/v1/models
+
+curl http://127.0.0.1:8787/zen/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"big-pickle","messages":[{"role":"user","content":"hi"}]}'
+```
+
+Web UI「网关运维」页：接入点复制、鉴权密钥（随机生成 sk- 前缀）、号池账号运行态与 24h 分通道统计（单接口 `/api/gateway/ops` 聚合拉取，15s 自动刷新）。请求明细在「用量」页。出口代理走 `config.json` 的 `proxy`。
+
+
+## Grok 号池网关
+
+用号池已认证账号的 `access_token` 转发到 `https://cli-chat-proxy.grok.com/v1`。选号：请求头 `X-Account-Id` 或查询参数 `account_id`。
+
+| 项 | 值 |
+| --- | --- |
+| 客户端 Base URL | `http://127.0.0.1:8787/grok/v1` |
+| 选号 | `X-Account-Id: <账号 id>` |
+| 上游 | `https://cli-chat-proxy.grok.com/v1` |
+| 鉴权 | 号池账号 Bearer token（网关注入） |
+
+```bash
+curl http://127.0.0.1:8787/grok/v1/models -H "X-Account-Id: 1"
+
+curl http://127.0.0.1:8787/grok/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "X-Account-Id: 1" \
+  -d '{"model":"grok-4","messages":[{"role":"user","content":"hi"}]}'
+```
 
 ## 安全说明
 

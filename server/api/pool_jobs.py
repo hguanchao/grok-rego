@@ -62,15 +62,16 @@ class ProbeClient:
         result: dict[str, Any] = {"status_code": 0, "error": ""}
         use_proxy = str(proxy or config.PROXY or "").strip()
         email = str(account.get("email") or "").strip()
+        log_email = mask_email(email)
         if not use_proxy:
             result["error"] = "探活强制走代理，未配置 proxy"
-            logger.error(f"[探活] {email} 未配置代理，跳过探活")
+            logger.error(f"[探活] {log_email} 未配置代理，跳过探活")
             return result
         session = self._session(use_proxy)
 
         for attempt in range(2):
             try:
-                logger.debug(f"[探活] {email} 请求 GET /billing?format=credits · 尝试 {attempt + 1}/2")
+                logger.debug(f"[探活] {log_email} 请求 GET /billing?format=credits · 尝试 {attempt + 1}/2")
                 response = session.get(
                     f"{self.base_url}/billing?format=credits",
                     headers=self._headers(account),
@@ -79,24 +80,24 @@ class ProbeClient:
                 break
             except requests.RequestsError as exc:
                 if attempt == 0:
-                    logger.warning(f"[探活] {email} 请求异常（重试中）: {type(exc).__name__}: {exc}")
+                    logger.warning(f"[探活] {log_email} 请求异常（重试中）: {type(exc).__name__}: {exc}")
                     time.sleep(_PROBE_RETRY_DELAY)
                     continue
                 detail = str(exc)[:160]
                 if "timed out" in detail or "Timeout" in detail or "Connection" in detail:
                     detail = "网络无响应"
                 result["error"] = detail
-                logger.error(f"[探活] {email} 请求失败: {type(exc).__name__}: {detail}")
+                logger.error(f"[探活] {log_email} 请求失败: {type(exc).__name__}: {detail}")
                 return result
 
         result["status_code"] = int(response.status_code)
         if 200 <= response.status_code < 300:
             result["error"] = "探活通过"
-            logger.debug(f"[探活] {email} 探活通过 · HTTP {response.status_code}")
+            logger.debug(f"[探活] {log_email} 探活通过 · HTTP {response.status_code}")
         else:
             err = _simplify_error(response.status_code, response.text or "")
             result["error"] = err
-            logger.warning(f"[探活] {email} 探活失败 · HTTP {response.status_code} {err}")
+            logger.warning(f"[探活] {log_email} 探活失败 · HTTP {response.status_code} {err}")
         return result
 
 
@@ -136,16 +137,33 @@ import threading
 
 _auth_pool_lock = threading.Lock()
 _auth_pool_running = False
+_auth_pool_logs: list[dict[str, Any]] = []
+_auth_pool_last_log_id = 0
+_AUTH_LOG_LIMIT = 200
+
+
+def _append_auth_pool_log(level: str, message: str) -> None:
+    """追加认证池任务日志，供管理页按游标增量拉取。"""
+    global _auth_pool_last_log_id
+    with _auth_pool_lock:
+        _auth_pool_last_log_id += 1
+        _auth_pool_logs.append(
+            {"id": _auth_pool_last_log_id, "level": level, "message": message}
+        )
+        if len(_auth_pool_logs) > _AUTH_LOG_LIMIT:
+            del _auth_pool_logs[:-_AUTH_LOG_LIMIT]
 
 
 def kick_auth_pool() -> None:
-    """后台线程串行消化认证池（token 交换）；已有消化线程则跳过本轮。"""
+    """后台线程消化认证池（20 worker，每 worker 间隔 1s）；已有消化线程则跳过本轮。"""
     global _auth_pool_running
     with _auth_pool_lock:
         if _auth_pool_running:
             logger.debug("[认证池] 已有消化线程运行，跳过本轮触发")
             return
         _auth_pool_running = True
+        # 新一轮仅保留本轮日志，游标继续单调递增，避免前端 after 游标回退。
+        _auth_pool_logs.clear()
     logger.info("[认证池] 消化线程启动")
 
     def worker() -> None:
@@ -154,7 +172,12 @@ def kick_auth_pool() -> None:
             # 局部导入：register 模块带 Camoufox 重依赖，避免启动时加载
             from workflow.register import run_auth_pool
 
-            count = run_auth_pool()
+            def on_result(email: str, ok: bool, reason: str) -> None:
+                level = "SUCCESS" if ok else "ERROR"
+                action = "认证成功，Token 已入库" if ok else f"认证失败：{reason}"
+                _append_auth_pool_log(level, f"{email}·{action}")
+
+            count = run_auth_pool(on_result=on_result)
             logger.info(f"[认证池] 消化完成: 成功 {count} 个")
         except Exception as exc:
             logger.error(f"[认证池] 后台消化异常: {type(exc).__name__}: {exc}")
@@ -165,13 +188,20 @@ def kick_auth_pool() -> None:
     threading.Thread(target=worker, daemon=True, name="认证池消化").start()
 
 
-def auth_pool_state() -> dict[str, Any]:
+def auth_pool_state(after_log_id: int = 0) -> dict[str, Any]:
     """认证池当前状态（供 /api/pool/auth/status 展示，页面刷新后恢复认知）。"""
     from db import get_auth_pool
 
     with _auth_pool_lock:
         running = _auth_pool_running
-    return {"running": running, "queue_size": len(get_auth_pool())}
+        logs = [log for log in _auth_pool_logs if log["id"] > after_log_id]
+        last_log_id = _auth_pool_last_log_id
+    return {
+        "running": running,
+        "queue_size": len(get_auth_pool()),
+        "logs": logs,
+        "last_log_id": last_log_id,
+    }
 
 """
 临期账号自动续期 daemon。
@@ -179,7 +209,7 @@ def auth_pool_state() -> dict[str, Any]:
 借鉴 acorn 自动刷新思路（后台固定周期扫描临期账号并续期），按 grok-rego
 栈重写并定制：
 - 周期 30 分钟扫描，token 剩余 ≤10 分钟即续期（沿用参考参数）
-- 逐账号串行 OIDC 刷新（上游对并发交换按 IP 限流，串行最稳）
+- 临期账号 20 个 worker 并发刷新，每个 worker 做完一个号再隔 1 秒接下一个
 - 失败分级：网络瞬时失败跳过本轮不判死；刷新凭据被拒标记 REAUTH
 - 与手动号池任务 / 推送任务互斥：任一进行中则跳过本轮
 - 状态只读暴露（GET /api/pool/auto-refresh），日志走统一 loguru
@@ -188,20 +218,35 @@ def auth_pool_state() -> dict[str, Any]:
 import sqlite3
 import threading
 
-from core.util import decode_jwt_exp, elapsed_label, now_str
+from core.util import (
+    ACCOUNT_WORKER_GAP_SEC,
+    ACCOUNT_WORKERS,
+    decode_jwt_exp,
+    elapsed_label,
+    format_exp,
+    mask_email,
+    now_str,
+    run_account_workers,
+)
 from db import (
     STATUS_ACTIVE,
     STATUS_DISABLED,
+    STATUS_LIMITED,
     STATUS_REAUTH,
     connect,
+    get_all_accounts,
     update_account_status_by_ids,
     update_account_tokens,
+    update_risk,
 )
+from workflow.oauth import auth_with_sso
 from workflow.oauth import refresh_token as oauth_refresh
 
 # 固定参数：每 30 分钟检查一次，token 剩余 ≤10 分钟即续期
 INTERVAL_MIN = 30
 LEAD_MIN = 10
+# 续期并发：20 个 worker，每 worker 号间隔 1 秒
+REFRESH_CONCURRENCY = ACCOUNT_WORKERS
 # 轮询唤醒间隔（秒）
 _SCAN_WAKE_SEC = 30
 # 任务日志内存环形保留条数
@@ -209,7 +254,7 @@ _LOG_LIMIT = 200
 
 
 class AutoRefresher:
-    """后台 daemon 线程：按固定周期扫描临期账号并逐个续期。"""
+    """后台 daemon 线程：按固定周期扫描临期账号并并发续期。"""
 
     def __init__(self) -> None:
         self._stop = threading.Event()
@@ -245,6 +290,7 @@ class AutoRefresher:
                 "running": self._scanning,
                 "interval_min": INTERVAL_MIN,
                 "lead_min": LEAD_MIN,
+                "concurrency": REFRESH_CONCURRENCY,
                 "last_run_at": self._last_run_at,
                 "last_result": self._last_result,
                 "skip_reason": self._skip_reason,
@@ -299,7 +345,7 @@ class AutoRefresher:
 
     def _task_busy(self) -> bool:
         """手动号池任务 / 推送任务进行中则本轮跳过（避免并发刷同一批账号）。"""
-        from ops.push import push_manager
+        from api.push import push_manager
 
         job = pool_job_manager.status()
         if job.get("status") in ("pending", "running"):
@@ -330,7 +376,11 @@ class AutoRefresher:
             with self._lock:
                 self._done = 0
                 self._total = len(due)
-            self.append_log("INFO", f"[续期] 扫描开始 临期 {len(due)} 个")
+            self.append_log(
+                "INFO",
+                f"[续期] 扫描开始 临期 {len(due)} 个 / {REFRESH_CONCURRENCY} 线程 "
+                f"每线程间隔 {ACCOUNT_WORKER_GAP_SEC:.0f}s",
+            )
             refreshed, rejected, transient = self._refresh_all(due)
             summary = (
                 f"[续期] 扫描结束 续期 {refreshed} 刷新被拒 {rejected} "
@@ -358,7 +408,8 @@ class AutoRefresher:
                 "SELECT id, email, access_token, refresh_token FROM accounts "
                 "WHERE COALESCE(is_deleted, 0) = 0 AND access_token IS NOT NULL AND access_token != '' "
                 "AND refresh_token IS NOT NULL AND refresh_token != '' "
-                f"AND status NOT IN ({STATUS_REAUTH}, {STATUS_DISABLED})"
+                f"AND status NOT IN ({STATUS_REAUTH}, {STATUS_DISABLED}) "
+                "ORDER BY created_at DESC"
             ).fetchall()
         cutoff = time.time() + LEAD_MIN * 60
         due = []
@@ -368,8 +419,39 @@ class AutoRefresher:
                 due.append(dict(row))
         return due
 
+    def _refresh_one(self, row: dict[str, Any]) -> str:
+        """单账号 OIDC 刷新。返回 refreshed / rejected / transient。"""
+        account_id = int(row["id"])
+        email = str(row["email"] or "")
+        log_email = mask_email(email)
+        data, http_status = oauth_refresh(str(row["refresh_token"] or ""))
+        if data and data.get("access_token"):
+            update_account_tokens(
+                account_id,
+                str(data["access_token"]),
+                str(data.get("refresh_token") or "") or None,
+                int(data.get("expires_in") or 0) or None,
+                reason="自动续期成功",
+            )
+            update_account_status_by_ids([account_id], STATUS_ACTIVE, "自动续期成功")
+            self.append_log("SUCCESS", f"{log_email}·续期成功")
+            logger.info(f"[续期] 已续期 {log_email}")
+            return "refreshed"
+        if http_status == 0:
+            self.append_log("WARNING", f"{log_email}·网络失败，下轮再试")
+            logger.warning(f"[续期] 网络失败跳过 {log_email}（瞬时，下轮再试）")
+            return "transient"
+        update_account_status_by_ids(
+            [account_id],
+            STATUS_REAUTH,
+            f"自动续期失败：刷新被拒（HTTP {http_status}）",
+        )
+        self.append_log("ERROR", f"{log_email}·刷新被拒（HTTP {http_status}），标记需重登")
+        logger.warning(f"[续期] 刷新被拒 {log_email} http={http_status}，标记需重登")
+        return "rejected"
+
     def _refresh_all(self, due: list[dict[str, Any]]) -> tuple[int, int, int]:
-        """逐个串行续期（间隔 1-2s 防上游限流）。
+        """20 个 worker 并发续期，每个 worker 做完一个号再隔 1 秒接下一个。
 
         返回 (refreshed, rejected, transient)：
         - 刷新成功 → 回写 token，状态恢复 ACTIVE
@@ -377,40 +459,38 @@ class AutoRefresher:
         - 网络失败（http=0）→ 不动，下轮再试
         """
         refreshed = rejected = transient = 0
-        for row in due:
-            account_id = int(row["id"])
-            email = str(row["email"] or "")
-            data, http_status = oauth_refresh(str(row["refresh_token"] or ""))
-            if data and data.get("access_token"):
-                update_account_tokens(
-                    account_id,
-                    str(data["access_token"]),
-                    str(data.get("refresh_token") or "") or None,
-                    int(data.get("expires_in") or 0) or None,
-                    reason="自动续期成功",
+        def on_complete(_index: int, row: dict[str, Any], kind: Any) -> None:
+            nonlocal refreshed, rejected, transient
+            email = str(row.get("email") or "")
+            log_email = mask_email(email)
+            if isinstance(kind, Exception):
+                self.append_log(
+                    "WARNING",
+                    f"{log_email}·续期异常 {type(kind).__name__}，下轮再试",
                 )
-                update_account_status_by_ids([account_id], STATUS_ACTIVE, "自动续期成功")
-                refreshed += 1
-                self.append_log("SUCCESS", f"{email}·续期成功")
-                logger.info(f"[续期] 已续期 {email}")
-            elif http_status == 0:
-                transient += 1
-                self.append_log("WARNING", f"{email}·网络失败，下轮再试")
-                logger.warning(f"[续期] 网络失败跳过 {email}（瞬时，下轮再试）")
-            else:
-                rejected += 1
-                update_account_status_by_ids(
-                    [account_id],
-                    STATUS_REAUTH,
-                    f"自动续期失败：刷新被拒（HTTP {http_status}）",
-                )
-                self.append_log("ERROR", f"{email}·刷新被拒（HTTP {http_status}），标记需重登")
                 logger.warning(
-                    f"[续期] 刷新被拒 {email} http={http_status}，标记需重登"
+                    f"[续期] 异常跳过 {log_email}：{type(kind).__name__}: {kind}"
                 )
+                result_kind = "transient"
+            else:
+                result_kind = str(kind or "transient")
             with self._lock:
+                if result_kind == "refreshed":
+                    refreshed += 1
+                elif result_kind == "rejected":
+                    rejected += 1
+                else:
+                    transient += 1
                 self._done += 1
-            time.sleep(2.0)  # 账号间固定 2 秒间隔
+
+        run_account_workers(
+            due,
+            self._refresh_one,
+            workers=REFRESH_CONCURRENCY,
+            thread_name_prefix="续期",
+            should_stop=self._stop.is_set,
+            on_complete=on_complete,
+        )
         return refreshed, rejected, transient
 
 
@@ -437,23 +517,11 @@ kind=risk     风控体检：单账号无头浏览器开 grok.com，自动过 CF
               解析 botFlagSource / botFlagDetails 回写 risk / bfs
 """
 
-import random
 import threading
 import uuid
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from core.util import format_exp
-from db import (
-    STATUS_LIMITED,
-    get_all_accounts,
-    update_risk,
-)
-
-# 并发上限（与前端并发输入框 1-20 对齐）
-MAX_CONCURRENCY = 20
-# 账号间固定 2 秒间隔：对齐推送/巡检/认证节奏，降低批量请求触发上游风控的概率
-_INSPECT_SLEEP_RANGE = (2.0, 2.0)
-_REAUTH_SLEEP_RANGE = (2.0, 2.0)
+# 并发上限（与前端并发输入框 1-20 对齐；实际按 20 线程、每线程间隔 1s 跑号）
+MAX_CONCURRENCY = ACCOUNT_WORKERS
 # 任务日志内存环形保留条数
 _LOG_LIMIT = 500
 
@@ -474,10 +542,10 @@ def _clamp_concurrency(value: Any) -> int:
 
 
 def _who(acc: dict[str, Any]) -> str:
-    """账号日志标识：邮箱优先，缺邮箱则回退 #id（统一不带双 id 后缀）。"""
+    """账号日志标识：邮箱脱敏，缺邮箱则回退 #id。"""
     email = str(acc.get("email") or "").strip()
     aid = int(acc.get("id") or 0)
-    return email if email else f"#{aid}"
+    return mask_email(email) if email else f"#{aid}"
 
 
 def _end_log(job: PoolJob, title: str) -> None:
@@ -678,8 +746,11 @@ class PoolJobManager:
     ) -> list[dict[str, Any]]:
         """资格预筛：返回候选账号行；跳过账号写入 skipped_list。
 
-        require_token=True（巡检）：无 access_token 跳过；
-        require_token=False（重登）：全部处理（无 token 走重新授权）。
+        require_token=True（巡检）：无 access_token 或状态为需重登(2) 跳过；
+        require_token=False（重登）：指定 ids 时全部处理（无 token 走重新授权），
+        全量模式（未传 ids）仅处理需重登(2)状态的账号。
+        跳过明细只记入 skipped_list 与文件日志，任务日志聚合为一条摘要，
+        避免全量模式下逐账号刷屏、日志一次性倾泻。
         """
         by_id = {a["id"]: a for a in get_all_accounts()}
         accounts = (
@@ -687,18 +758,45 @@ class PoolJobManager:
             if job.account_ids
             else list(by_id.values())
         )
+        # 重登全量模式：仅需重登(2)状态的账号纳入候选
+        reauth_all_only_pending = job.kind == "reauth" and not job.account_ids
+        tag = "巡检" if job.kind == "inspect" else "重登"
         candidates: list[dict[str, Any]] = []
+        skip_summary: dict[str, int] = {}
         for acc in accounts:
             if job.cancel_event.is_set():
                 break
             aid = int(acc.get("id") or 0)
+            skip_reason = ""
             if require_token and not str(acc.get("access_token") or "").strip():
-                job.skipped_list.append({"id": aid, "reason": "未认证"})
-                tag = "巡检" if job.kind == "inspect" else "重登"
-                job.append_log("WARNING", f"[{tag}] {_who(acc)} 已跳过：未认证")
-                logger.debug(f"[{tag}] {_who(acc)} 已跳过：未认证")
+                skip_reason = "未认证"
+            elif require_token and int(acc.get("status") or 1) == 2:
+                # 巡检排除需重登状态（探活无意义，待重登闭环处理）
+                skip_reason = "需重登"
+            elif (
+                reauth_all_only_pending
+                and int(acc.get("status") or 1) != 2
+            ):
+                skip_reason = "状态无需重登"
+            if skip_reason:
+                job.skipped_list.append({"id": aid, "reason": skip_reason})
+                skip_summary[skip_reason] = skip_summary.get(skip_reason, 0) + 1
+                logger.debug(f"[{tag}] {_who(acc)} 已跳过：{skip_reason}")
                 continue
             candidates.append(acc)
+        if skip_summary:
+            detail = "、".join(
+                f"{reason} {n} 个"
+                for reason, n in sorted(skip_summary.items(), key=lambda kv: -kv[1])
+            )
+            job.append_log(
+                "INFO",
+                f"[{tag}] 预筛完成：候选 {len(candidates)} 个，跳过 {detail}",
+            )
+        # 按注册时间倒序执行（新注册的账号优先处理）
+        candidates.sort(
+            key=lambda a: str(a.get("created_at") or ""), reverse=True
+        )
         job.count = len(candidates)
         return candidates
 
@@ -707,8 +805,15 @@ class PoolJobManager:
     def _run_inspect(self, job: PoolJob) -> None:
         job.status = "running"
         candidates = self._screen(job, require_token=True)
-        job.append_log("INFO", f"[任务] 巡检开始 {job.count} 个 / 并发 {job.concurrency}")
-        logger.info(f"[号池任务] 巡检启动 候选 {job.count} 个 / 并发 {job.concurrency} / 任务 {job.id}")
+        job.append_log(
+            "INFO",
+            f"[任务] 巡检开始 {job.count} 个 / {ACCOUNT_WORKERS} 线程 "
+            f"每线程间隔 {ACCOUNT_WORKER_GAP_SEC:.0f}s",
+        )
+        logger.info(
+            f"[号池任务] 巡检启动 候选 {job.count} 个 / {ACCOUNT_WORKERS} 线程 "
+            f"每线程间隔 {ACCOUNT_WORKER_GAP_SEC:.0f}s / 任务 {job.id}"
+        )
         if not candidates:
             return
 
@@ -755,7 +860,7 @@ class PoolJobManager:
             update_account_status_by_ids([aid], None, f"探活失败：{detail}")
             return {"aid": aid, "ok": False, "message": f"{status or 'N/A'} {detail or '网络异常'}", "cost": elapsed_label(t0)}
 
-        self._run_concurrent(job, candidates, work, _INSPECT_SLEEP_RANGE)
+        self._run_concurrent(job, candidates, work)
 
     def _refresh_and_reprobe(self, job: PoolJob, acc: dict[str, Any]) -> str | None:
         """刷新 token 成功后用新 token 再探一次；成功返回新 access_token，失败返回 None。"""
@@ -802,8 +907,15 @@ class PoolJobManager:
     def _run_reauth(self, job: PoolJob) -> None:
         job.status = "running"
         candidates = self._screen(job, require_token=False)
-        job.append_log("INFO", f"[任务] 重登开始 {job.count} 个 / 并发 {job.concurrency}")
-        logger.info(f"[号池任务] 重登启动 候选 {job.count} 个 / 并发 {job.concurrency} / 任务 {job.id}")
+        job.append_log(
+            "INFO",
+            f"[任务] 重登开始 {job.count} 个 / {ACCOUNT_WORKERS} 线程 "
+            f"每线程间隔 {ACCOUNT_WORKER_GAP_SEC:.0f}s",
+        )
+        logger.info(
+            f"[号池任务] 重登启动 候选 {job.count} 个 / {ACCOUNT_WORKERS} 线程 "
+            f"每线程间隔 {ACCOUNT_WORKER_GAP_SEC:.0f}s / 任务 {job.id}"
+        )
         if not candidates:
             return
 
@@ -813,7 +925,6 @@ class PoolJobManager:
                 return None
             t0 = time.monotonic()
             aid = int(acc.get("id") or 0)
-            email = str(acc.get("email") or "")
             refresh_token = str(acc.get("refresh_token") or "").strip()
             logger.info(f"[重登] {_who(acc)} 开始重登")
 
@@ -844,6 +955,7 @@ class PoolJobManager:
                 logger.warning(f"[重登] {_who(acc)} 刷新被拒 http={http_status}，降级 SSO 重新认证")
 
             # 2. 降级：SSO 协议级重新认证（无刷新凭据 / 刷新被拒）
+            #    任务内直接执行，不入认证池（与巡检同款闭环，进度由本任务日志呈现）
             sso_cookie = str(acc.get("sso_cookie") or "").strip()
             if not sso_cookie:
                 logger.warning(f"[重登] {_who(acc)} 无刷新凭据且缺少 SSO cookie，无法重登")
@@ -853,27 +965,38 @@ class PoolJobManager:
                     "message": "无刷新凭据且缺少 SSO cookie",
                     "cost": elapsed_label(t0),
                 }
-            from db import add_to_auth_pool
-
-            add_to_auth_pool(email, "", 5, aid)
-            logger.info(f"[重登] {_who(acc)} 已入认证池，等待 SSO 自动认证")
-            entry = {"id": aid, "email": email, "reason": "SSO 自动重新认证中"}
-            with job._lock:
-                if not any(p["id"] == aid for p in job.pending_list):
-                    job.pending_list.append(entry)
+            token, reason = auth_with_sso(sso_cookie)
+            if token and token.get("access_token"):
+                update_account_tokens(
+                    aid,
+                    str(token["access_token"]),
+                    str(token.get("refresh_token") or "") or None,
+                    int(token.get("expires_in") or 0) or None,
+                    reason="重登 SSO 认证成功",
+                )
+                update_account_status_by_ids([aid], STATUS_ACTIVE, None)
+                logger.success(
+                    f"[重登] {_who(acc)} SSO 重新认证成功 · {elapsed_label(t0)}"
+                )
+                return {
+                    "aid": aid,
+                    "ok": True,
+                    "message": "SSO 重新认证成功",
+                    "cost": elapsed_label(t0),
+                }
+            # 失败保留需重登状态，reason 写入便于排查
+            update_account_status_by_ids([aid], STATUS_REAUTH, reason)
+            logger.warning(
+                f"[重登] {_who(acc)} SSO 重新认证失败：{reason} · {elapsed_label(t0)}"
+            )
             return {
                 "aid": aid,
                 "ok": False,
-                "pending": True,
-                "message": "已入认证池",
+                "message": f"SSO 重新认证失败：{reason}",
                 "cost": elapsed_label(t0),
             }
 
-        self._run_concurrent(job, candidates, work, _REAUTH_SLEEP_RANGE)
-
-        if job.pending > 0 and not job.cancel_event.is_set():
-            logger.info(f"[重登] {job.pending} 个账号待 SSO 认证，触发认证池消化")
-            kick_auth_pool()
+        self._run_concurrent(job, candidates, work)
 
     # ─── kind=risk：风控体检 ─────────────────────────────
 
@@ -964,48 +1087,46 @@ class PoolJobManager:
 
     # ─── 公共：并发执行与结果汇总 ─────────────────────────
 
-    def _run_concurrent(self, job: PoolJob, candidates, work, sleep_range) -> None:
-        """ThreadPool 并发执行 work(acc)，按返回汇总计数并写日志。"""
+    def _run_concurrent(self, job: PoolJob, candidates, work) -> None:
+        """20 个 worker 并发执行 work(acc)，每个 worker 做完一个号再隔 1 秒接下一个。"""
         label = "巡检" if job.kind == "inspect" else "重登" if job.kind == "reauth" else "风控"
 
-        def wrapped(acc: dict[str, Any]) -> dict[str, Any] | None:
-            result = work(acc)
-            # 账号间间隔：降低批量真实请求触发上游风控的概率
-            time.sleep(random.uniform(*sleep_range))
-            return result
-
-        with ThreadPoolExecutor(
-            max_workers=job.concurrency, thread_name_prefix="号池"
-        ) as executor:
-            futures = {executor.submit(wrapped, acc): acc for acc in candidates}
-            for future in as_completed(futures):
-                acc = futures[future]
-                try:
-                    result = future.result()
-                except Exception as exc:
+        def on_complete(_index: int, acc: dict[str, Any], result: Any) -> None:
+            level = "ERROR"
+            message = ""
+            with job._lock:
+                if isinstance(result, Exception):
                     job.failed += 1
                     job.done += 1
-                    job.append_log(
-                        "ERROR",
-                        f"[{label}] {_who(acc)} {label}失败：{type(exc).__name__}: {exc}",
-                    )
-                    logger.error(f"[{label}] {_who(acc)} {label}失败：{type(exc).__name__}: {exc}")
-                    continue
-                if result is None:
-                    continue  # 已取消
-                job.done += 1
-                cost = result.get("cost")
-                suffix = f" · {cost}" if cost else ""
-                body = str(result.get("message") or "")
-                if result.get("ok"):
-                    job.pushed += 1
-                    job.append_log("SUCCESS", f"[{label}] {_who(acc)} {body}{suffix}")
-                elif result.get("pending"):
-                    job.pending += 1
-                    job.append_log("INFO", f"[{label}] {_who(acc)} {body}{suffix}")
+                    message = f"[{label}] {_who(acc)} {label}失败：{type(result).__name__}: {result}"
+                elif result is None:
+                    return
                 else:
-                    job.failed += 1
-                    job.append_log("ERROR", f"[{label}] {_who(acc)} {body}{suffix}")
+                    job.done += 1
+                    cost = result.get("cost")
+                    suffix = f" · {cost}" if cost else ""
+                    body = str(result.get("message") or "")
+                    if result.get("ok"):
+                        job.pushed += 1
+                        level = "SUCCESS"
+                    elif result.get("pending"):
+                        job.pending += 1
+                        level = "INFO"
+                    else:
+                        job.failed += 1
+                    message = f"[{label}] {_who(acc)} {body}{suffix}"
+            job.append_log(level, message)
+            if isinstance(result, Exception):
+                logger.error(message)
+
+        run_account_workers(
+            candidates,
+            work,
+            workers=ACCOUNT_WORKERS,
+            thread_name_prefix="号池",
+            should_stop=job.cancel_event.is_set,
+            on_complete=on_complete,
+        )
 
 
 # 进程内单例（模块级，对齐 push.manager.push_manager 的用法）

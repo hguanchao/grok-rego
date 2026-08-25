@@ -56,6 +56,9 @@ import base64
 import json
 import re
 import time
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Any
 
 # 验证码正则：格式如 OE5-SDO
 _CODE_PATTERN = re.compile(r"\b([A-Z0-9]{3}-[A-Z0-9]{3})\b")
@@ -78,6 +81,58 @@ def extract_verification_code(subject: str, text: str) -> str | None:
 def elapsed_label(t0: float) -> str:
     """步骤耗时文案：1.2s（从 t0=time.monotonic() 起算）。"""
     return f"{max(0.0, time.monotonic() - t0):.1f}s"
+
+
+# 号池批量任务：20 个 worker 同时跑，每个 worker 做完一个号再隔 1 秒接下一个。
+ACCOUNT_WORKERS = 20
+ACCOUNT_WORKER_GAP_SEC = 1.0
+
+
+def run_account_workers(
+    items: list[Any],
+    work: Callable[[Any], Any],
+    *,
+    workers: int = ACCOUNT_WORKERS,
+    gap_sec: float = ACCOUNT_WORKER_GAP_SEC,
+    thread_name_prefix: str = "号池",
+    should_stop: Callable[[], bool] | None = None,
+    on_complete: Callable[[int, Any, Any], None] | None = None,
+) -> list[Any]:
+    """把账号列表切成最多 `workers` 条链，每条链串行处理，号与号之间固定间隔。
+
+    单个账号完成后立即调用 `on_complete(index, item, result)`；返回与 `items`
+    等长的结果列表，某条失败写入异常对象，取消未跑的写入 None。
+    """
+    if not items:
+        return []
+    n = len(items)
+    worker_n = max(1, min(int(workers), n))
+    results: list[Any] = [None] * n
+
+    def chain(start: int) -> None:
+        first = True
+        for index in range(start, n, worker_n):
+            if should_stop is not None and should_stop():
+                return
+            if not first and gap_sec > 0:
+                time.sleep(gap_sec)
+            first = False
+            try:
+                results[index] = work(items[index])
+            except Exception as exc:
+                results[index] = exc
+            if on_complete is not None:
+                try:
+                    on_complete(index, items[index], results[index])
+                except Exception:
+                    # 完成回调属于结果消费阶段；异常不能覆盖真实业务结果或中断后续账号。
+                    pass
+
+    with ThreadPoolExecutor(max_workers=worker_n, thread_name_prefix=thread_name_prefix) as pool:
+        futs = [pool.submit(chain, start) for start in range(worker_n)]
+        for fut in as_completed(futs):
+            fut.result()
+    return results
 
 
 def mask_email(value: str | None) -> str:

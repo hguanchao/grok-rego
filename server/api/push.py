@@ -313,6 +313,7 @@ def push_one_g2a(row: dict, *, base_url: str, access_token: str) -> dict[str, An
     base = str(base_url or "").strip().rstrip("/")
     token = str(access_token or "").strip()
     email = str(row.get("email") or "").strip()
+    log_email = mask_email(email)
     if not base:
         return {"ok": False, "target": "g2a", "action": "", "message": "G2A 未配置地址", "http_status": 0}
     if not token:
@@ -324,7 +325,7 @@ def push_one_g2a(row: dict, *, base_url: str, access_token: str) -> dict[str, An
     assert build_entry is not None  # 上方已校验 access_token，必非空
     web_entry = build_g2a_web_entry(row)  # 无 SSO cookie 时为 None，跳过 Web 池
 
-    logger.info(f"[推送] G2A {email} 开始推送 Build 池")
+    logger.info(f"[推送] G2A {log_email} 开始推送 Build 池")
     headers = {
         "Authorization": f"Bearer {token}",
         "Accept": "text/event-stream, application/json",
@@ -335,7 +336,7 @@ def push_one_g2a(row: dict, *, base_url: str, access_token: str) -> dict[str, An
             sess, build_url, headers, build_entry, "Build"
         )
         if not ok:
-            logger.error(f"[推送] G2A {email} Build 池推送失败: {err}")
+            logger.error(f"[推送] G2A {log_email} Build 池推送失败: {err}")
             return {
                 "ok": False,
                 "target": "g2a",
@@ -347,13 +348,13 @@ def push_one_g2a(row: dict, *, base_url: str, access_token: str) -> dict[str, An
         web_ok = True
         web_http = http_status
         if web_entry is not None:
-            logger.info(f"[推送] G2A {email} 开始推送到 Web 池")
+            logger.info(f"[推送] G2A {log_email} 开始推送到 Web 池")
             web_url = urljoin(base + "/", "api/admin/v1/accounts/web/import")
             web_ok, web_err, web_http = _import_credentials(
                 sess, web_url, headers, web_entry, "Web"
             )
             if not web_ok:
-                logger.error(f"[推送] G2A {email} Web 池推送失败: {web_err}")
+                logger.error(f"[推送] G2A {log_email} Web 池推送失败: {web_err}")
                 return {
                     "ok": False,
                     "target": "g2a",
@@ -362,10 +363,10 @@ def push_one_g2a(row: dict, *, base_url: str, access_token: str) -> dict[str, An
                     "http_status": web_http,
                 }
         else:
-            logger.debug(f"[推送] G2A {email} 无 SSO cookie，跳过 Web 池")
+            logger.debug(f"[推送] G2A {log_email} 无 SSO cookie，跳过 Web 池")
 
     pools = "Build" if web_entry is None else "Build、Web"
-    logger.success(f"[推送] G2A {email} {pools} 池推送成功")
+    logger.success(f"[推送] G2A {log_email} {pools} 池推送成功")
     return {
         "ok": True,
         "target": "g2a",
@@ -476,29 +477,32 @@ def push_batch_cpa(
 - 协作式取消：cancel 事件贯穿预登录 / 合批 / 逐账号循环
 """
 
-import random
 import threading
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from core import config
-from core.util import elapsed_label, now_str
+from core.util import (
+    ACCOUNT_WORKER_GAP_SEC,
+    ACCOUNT_WORKERS,
+    elapsed_label,
+    mask_email,
+    now_str,
+    run_account_workers,
+)
 from db import STATUS_ACTIVE, get_all_accounts
 
-# 并发上限（与前端并发输入框 1-20 对齐）
-MAX_CONCURRENCY = 20
-# G2A 逐账号导入间隔（秒）：降低高频导入触发风控概率
-_G2A_SLEEP_RANGE = (2.0, 2.0)  # 账号间固定 2 秒间隔，对齐推送/巡检/认证节奏
+# 并发上限（与前端并发输入框 1-20 对齐；实际 20 线程、每线程间隔 1s）
+MAX_CONCURRENCY = ACCOUNT_WORKERS
 # 任务日志内存环形保留条数
 _LOG_LIMIT = 500
 
 
 def _who(acc: dict[str, Any]) -> str:
-    """账号日志标识：邮箱优先，缺邮箱则回退 #id（统一不带双 id 后缀）。"""
+    """账号日志标识：邮箱脱敏，缺邮箱则回退 #id。"""
     email = str(acc.get("email") or "").strip()
     aid = int(acc.get("id") or 0)
-    return email if email else f"#{aid}"
+    return mask_email(email) if email else f"#{aid}"
 
 
 def _end_log(job: PushJob) -> None:
@@ -710,9 +714,13 @@ class PushManager:
         candidates = self._screen(job)
         job.append_log(
             "INFO",
-            f"[任务] 推送开始 目标 {label} / {job.count} 个 / 并发 {job.concurrency}",
+            f"[任务] 推送开始 目标 {label} / {job.count} 个 / {ACCOUNT_WORKERS} 线程 "
+            f"每线程间隔 {ACCOUNT_WORKER_GAP_SEC:.0f}s",
         )
-        logger.info(f"[推送] 任务启动 目标 {label} / 候选 {job.count} 个 / 并发 {job.concurrency} / 任务 {job.id}")
+        logger.info(
+            f"[推送] 任务启动 目标 {label} / 候选 {job.count} 个 / {ACCOUNT_WORKERS} 线程 "
+            f"每线程间隔 {ACCOUNT_WORKER_GAP_SEC:.0f}s / 任务 {job.id}"
+        )
         if not candidates:
             return
 
@@ -739,7 +747,11 @@ class PushManager:
             self._push_g2a_concurrent(job, candidates, g2a_token)
 
     def _screen(self, job: PushJob) -> list[dict[str, Any]]:
-        """资格预筛：返回候选账号行，并把跳过账号写入 skipped_list。"""
+        """资格预筛：返回候选账号行，跳过账号写入 skipped_list。
+
+        跳过明细只记入 skipped_list 与文件日志，任务日志聚合为一条摘要，
+        避免全量模式下逐账号刷屏、日志一次性倾泻。
+        """
         by_id = {a["id"]: a for a in get_all_accounts()}
         accounts = (
             [by_id[i] for i in job.account_ids if i in by_id]
@@ -747,26 +759,41 @@ class PushManager:
             else list(by_id.values())
         )
         candidates: list[dict[str, Any]] = []
+        skip_summary: dict[str, int] = {}
         for acc in accounts:
             if job.cancel_event.is_set():
                 break
             aid = int(acc.get("id") or 0)
+            skip_reason = ""
             if not str(acc.get("access_token") or "").strip():
-                job.skipped_list.append({"id": aid, "reason": "未认证"})
-                job.append_log("WARNING", f"[推送] {_who(acc)} 已跳过：未认证")
-                logger.debug(f"[推送] {_who(acc)} 已跳过：未认证")
-                continue
-            if int(acc.get("status") or 1) != STATUS_ACTIVE:
-                job.skipped_list.append(
-                    {"id": aid, "reason": f"状态非正常(status={acc.get('status')})"}
+                skip_reason = "未认证"
+            elif int(acc.get("status") or 1) != STATUS_ACTIVE:
+                skip_reason = f"状态非正常(status={acc.get('status')})"
+            if skip_reason:
+                job.skipped_list.append({"id": aid, "reason": skip_reason})
+                # 状态非正常按具体状态值归并，避免摘要碎片化
+                summary_key = (
+                    "状态非正常"
+                    if skip_reason.startswith("状态非正常")
+                    else skip_reason
                 )
-                job.append_log(
-                    "WARNING",
-                    f"[推送] {_who(acc)} 已跳过：状态非正常",
-                )
-                logger.debug(f"[推送] {_who(acc)} 已跳过：状态非正常(status={acc.get('status')})")
+                skip_summary[summary_key] = skip_summary.get(summary_key, 0) + 1
+                logger.debug(f"[推送] {_who(acc)} 已跳过：{skip_reason}")
                 continue
             candidates.append(acc)
+        if skip_summary:
+            detail = "、".join(
+                f"{reason} {n} 个"
+                for reason, n in sorted(skip_summary.items(), key=lambda kv: -kv[1])
+            )
+            job.append_log(
+                "INFO",
+                f"[推送] 预筛完成：候选 {len(candidates)} 个，跳过 {detail}",
+            )
+        # 按注册时间倒序执行（新注册的账号优先处理）
+        candidates.sort(
+            key=lambda a: str(a.get("created_at") or ""), reverse=True
+        )
         job.count = len(candidates)
         return candidates
 
@@ -836,44 +863,49 @@ class PushManager:
     def _push_g2a_concurrent(
         self, job: PushJob, candidates: list[dict[str, Any]], g2a_token: str
     ) -> None:
-        """G2A 逐账号并发导入（单账号失败不中断任务）。"""
+        """G2A：20 个 worker 并发导入，每个 worker 做完一个号再隔 1 秒接下一个。"""
+
         def work(acc: dict[str, Any]) -> dict[str, Any] | None:
             """单账号导入；取消信号下不发送请求。"""
             if job.cancel_event.is_set():
                 return None
-            result = push_one_g2a(acc, base_url=config.G2A_BASE_URL, access_token=g2a_token)
-            # 账号间间隔：降低批量高频导入触发上游风控的概率
-            time.sleep(random.uniform(*_G2A_SLEEP_RANGE))
-            return result
+            return push_one_g2a(acc, base_url=config.G2A_BASE_URL, access_token=g2a_token)
 
-        with ThreadPoolExecutor(
-            max_workers=job.concurrency, thread_name_prefix="推送"
-        ) as executor:
-            futures = {executor.submit(work, acc): acc for acc in candidates}
-            for future in as_completed(futures):
-                acc = futures[future]
-                try:
-                    result = future.result()
-                except Exception as exc:
+        def on_complete(_index: int, acc: dict[str, Any], result: Any) -> None:
+            level = "ERROR"
+            message = ""
+            with job._lock:
+                if isinstance(result, Exception):
                     job.failed += 1
                     job.done += 1
-                    job.append_log(
-                        "ERROR",
-                        f"[推送] {_who(acc)} 失败：{type(exc).__name__}: {exc}",
-                    )
-                    logger.error(f"[推送] {_who(acc)} G2A 导入异常: {type(exc).__name__}: {exc}")
-                    continue
-                if result is None:
-                    continue  # 已取消
-                job.done += 1
-                label = str(acc.get("email") or "").strip() or f"#{acc.get('id')}"
-                body = str(result.get("message") or "")
-                if result.get("ok"):
-                    job.pushed += 1
-                    job.append_log("SUCCESS", f"{label}·推送成功")
+                    message = f"[推送] {_who(acc)} 失败：{type(result).__name__}: {result}"
+                elif result is None:
+                    return
                 else:
-                    job.failed += 1
-                    job.append_log("ERROR", f"{label}·{body}")
+                    job.done += 1
+                    label = _who(acc)
+                    body = str(result.get("message") or "")
+                    if result.get("ok"):
+                        job.pushed += 1
+                        level = "SUCCESS"
+                        message = f"{label}·推送成功"
+                    else:
+                        job.failed += 1
+                        message = f"{label}·{body}"
+            job.append_log(level, message)
+            if isinstance(result, Exception):
+                logger.error(
+                    f"[推送] {_who(acc)} G2A 导入异常: {type(result).__name__}: {result}"
+                )
+
+        run_account_workers(
+            candidates,
+            work,
+            workers=ACCOUNT_WORKERS,
+            thread_name_prefix="推送",
+            should_stop=job.cancel_event.is_set,
+            on_complete=on_complete,
+        )
 
 
 # 进程内单例（模块级，对齐 api/jobs.manager 的用法）

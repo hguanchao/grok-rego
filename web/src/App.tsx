@@ -8,6 +8,12 @@ const RegisterPage = lazy(() =>
 const PoolPage = lazy(() =>
   import("@/pages/PoolPage").then((module) => ({ default: module.PoolPage })),
 );
+const GatewayPage = lazy(() =>
+  import("@/pages/GatewayPage").then((module) => ({ default: module.GatewayPage })),
+);
+const UsagePage = lazy(() =>
+  import("@/pages/UsagePage").then((module) => ({ default: module.UsagePage })),
+);
 
 export default function App() {
   return (
@@ -17,6 +23,8 @@ export default function App() {
           <Route index element={<Navigate to="/register" replace />} />
           <Route path="/register" element={<RegisterPage />} />
           <Route path="/pool" element={<PoolPage />} />
+          <Route path="/gateway" element={<GatewayPage />} />
+          <Route path="/usage" element={<UsagePage />} />
         </Route>
       </Routes>
     </Suspense>

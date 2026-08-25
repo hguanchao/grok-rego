@@ -74,7 +74,7 @@ def main() -> None:
     else:
         logger.error("[Main] 注册全部失败")
 
-    # 注册完成后，认证池按 LIFO 统一 SSO 协议级自动交换 Token（每账号 1s）
+    # 注册完成后，认证池 20 线程消化，每线程间隔 1s 换 Token
     run_auth_pool()
 
 

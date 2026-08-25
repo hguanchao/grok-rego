@@ -38,6 +38,9 @@ CPA_MANAGEMENT_KEY: str = ""
 # === 管理 API ===
 API_HOST: str = "127.0.0.1"
 API_PORT: int = 8787
+# 网关模型别名：客户端请求模型名 → 上游真实模型（如 claude-sonnet-4-5 → big-pickle）
+# Zen 网关鉴权密钥：非空时客户端必须携带（Authorization: Bearer <key> 或 x-api-key）
+GATEWAY_API_KEY: str = ""
 # 号池探活：GET /billing 上游
 UPSTREAM_BASE: str = "https://cli-chat-proxy.grok.com/v1"
 
@@ -82,6 +85,7 @@ _PUBLIC_CONFIG_KEYS = (
     "g2a_password",
     "cpa_base_url",
     "cpa_management_key",
+    "gateway_api_key",
 )
 
 
@@ -142,6 +146,7 @@ def _apply_config_data(data: dict[str, Any]) -> None:
     global CF_API_BASE, CF_DOMAINS, CF_API_KEY, CF_DOMAIN_MODE, PROXY, IS_AUTH
     global MAIL_PROVIDER, YYDS_API_BASE, YYDS_API_KEY
     global G2A_BASE_URL, G2A_USERNAME, G2A_PASSWORD, CPA_BASE_URL, CPA_MANAGEMENT_KEY
+    global GATEWAY_API_KEY
 
     if data.get("cf_api_base") is not None:
         CF_API_BASE = str(data["cf_api_base"]).strip().rstrip("/")
@@ -180,6 +185,8 @@ def _apply_config_data(data: dict[str, Any]) -> None:
         CPA_BASE_URL = str(data["cpa_base_url"]).strip().rstrip("/")
     if data.get("cpa_management_key") is not None:
         CPA_MANAGEMENT_KEY = str(data["cpa_management_key"])
+    if data.get("gateway_api_key") is not None:
+        GATEWAY_API_KEY = str(data["gateway_api_key"]).strip()
 
 
 def load_config() -> None:
@@ -209,6 +216,7 @@ def get_public_config() -> dict[str, Any]:
         "g2a_password": G2A_PASSWORD,
         "cpa_base_url": CPA_BASE_URL,
         "cpa_management_key": CPA_MANAGEMENT_KEY,
+        "gateway_api_key": GATEWAY_API_KEY,
     }
 
 

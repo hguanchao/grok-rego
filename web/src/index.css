@@ -13,5 +13,7 @@
 @import "./styles/register.css";
 @import "./styles/logs.css";
 @import "./styles/pool.css";
+@import "./styles/gateway.css";
+@import "./styles/usage.css";
 @import "./styles/overlays.css";
 @import "./styles/motion.css";

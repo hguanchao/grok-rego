@@ -1,0 +1,556 @@
+/* ==============================================
+   Gateway — 网关运维（对齐 acorn 参考项目 UI）
+   ============================================== */
+
+.gw-page {
+  min-width: 0;
+}
+
+/* 与 usage-workspace 同构：单 panel 内 toolbar + KPI + 内容 */
+.gw-workspace {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  overflow: hidden;
+}
+
+/* 内容区：左配置 · 右运行态（与 usage-grid 同 1px 缝） */
+.gw-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 1px;
+  background: var(--border);
+  min-width: 0;
+  flex: 1;
+  min-height: 0;
+}
+.gw-grid-split {
+  /* 配置略窄、运行态略宽，贴近 usage 图/表比例 */
+  grid-template-columns: minmax(0, 1.05fr) minmax(0, 1.2fr);
+}
+@media (max-width: 960px) {
+  .gw-grid,
+  .gw-grid-split {
+    grid-template-columns: 1fr;
+  }
+}
+
+.gw-panel {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  padding: 14px 16px 16px;
+  background: var(--card);
+}
+.gw-col {
+  overflow: auto;
+  max-height: min(72vh, 920px);
+}
+
+.gw-panel-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 10px;
+  color: var(--muted-foreground);
+}
+.gw-panel-head > svg {
+  flex-shrink: 0;
+  opacity: 0.75;
+}
+.gw-panel-title {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  color: var(--foreground);
+}
+.gw-panel-meta {
+  margin-left: auto;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--muted-foreground);
+  font-variant-numeric: tabular-nums;
+}
+.gw-panel-action {
+  margin-left: auto;
+}
+
+.gw-empty {
+  padding: 28px 12px;
+  font-size: 12px;
+  color: var(--muted-foreground);
+  text-align: center;
+}
+
+/* ── 配置表单 ── */
+.gw-section {
+  margin-bottom: 18px;
+}
+.gw-section:last-child {
+  margin-bottom: 0;
+}
+.gw-section-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 8px;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: color-mix(in srgb, var(--muted-foreground) 80%, transparent);
+}
+
+/* label 旁说明问号 */
+.gw-label-help {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  margin: 0;
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: color-mix(in srgb, var(--muted-foreground) 70%, transparent);
+  cursor: help;
+  border-radius: 999px;
+  line-height: 0;
+  transition:
+    color 140ms ease,
+    transform 140ms ease;
+}
+.gw-label-help:hover,
+.gw-label-help:focus-visible {
+  color: var(--foreground);
+  outline: none;
+}
+.gw-label-help:active {
+  transform: scale(0.92);
+}
+.gw-section-label .gw-label-help {
+  /* 与 uppercase 小标签对齐 */
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+/* Base URL 固定条 */
+.gw-baseurl {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background:
+    linear-gradient(
+      135deg,
+      color-mix(in srgb, var(--primary) 6%, transparent),
+      transparent 55%
+    ),
+    color-mix(in srgb, var(--muted) 22%, transparent);
+}
+.gw-baseurl-gap {
+  margin-top: 8px;
+}
+.gw-baseurl-tag {
+  flex-shrink: 0;
+  max-width: 88px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  color: var(--muted-foreground);
+}
+.gw-baseurl-value {
+  flex: 1;
+  min-width: 0;
+  font-family: var(--font-mono);
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  color: var(--primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  user-select: all;
+}
+.gw-baseurl-copy {
+  flex-shrink: 0;
+}
+
+/* 密钥 / 别名可编辑列表 */
+.gw-editor-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 4px;
+}
+.gw-editor-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--foreground);
+  letter-spacing: -0.01em;
+}
+.gw-editor-title > svg {
+  opacity: 0.7;
+  color: var(--muted-foreground);
+}
+.gw-editor-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  padding: 18px 12px;
+  border: 1px dashed var(--border);
+  border-radius: var(--radius-md);
+  font-size: 12px;
+  color: var(--muted-foreground);
+  background: color-mix(in srgb, var(--muted) 18%, transparent);
+}
+.gw-editor-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.gw-editor-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.gw-editor-row-head {
+  padding: 0 2px 2px;
+  gap: 8px;
+}
+.gw-editor-col-label {
+  flex: 1;
+  min-width: 0;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: color-mix(in srgb, var(--muted-foreground) 75%, transparent);
+}
+.gw-editor-input {
+  flex: 1;
+  min-width: 0;
+  height: 32px !important;
+  font-size: 12px !important;
+}
+.gw-editor-arrow {
+  flex-shrink: 0;
+  width: 16px;
+  text-align: center;
+  font-size: 12px;
+  color: var(--muted-foreground);
+  opacity: 0.55;
+  user-select: none;
+}
+.gw-editor-del {
+  flex-shrink: 0;
+  width: 30px !important;
+  height: 30px !important;
+  color: var(--muted-foreground);
+}
+.gw-editor-del:hover {
+  color: var(--destructive);
+}
+.gw-editor-del-spacer {
+  flex-shrink: 0;
+  width: 30px;
+}
+.gw-editor-row.is-alias .gw-editor-input {
+  flex: 1 1 0;
+}
+
+/* 别名通道选择框：固定窄宽，与输入框同高 */
+.gw-channel-select {
+  width: 92px;
+  flex-shrink: 0;
+  height: 32px;
+  font-size: 12px;
+}
+
+/* 小节内动作行（保存 / 探测） */
+.gw-section-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+/* ── 号池账号运行态列表 ── */
+.gw-pool-summary {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+  margin-bottom: 12px;
+}
+@media (max-width: 520px) {
+  .gw-pool-summary {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+.gw-pool-chip {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 10px 12px;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border);
+  background: color-mix(in srgb, var(--muted) 30%, transparent);
+  min-width: 0;
+}
+.gw-pool-chip em {
+  font-style: normal;
+  font-family: var(--font-mono);
+  font-size: 18px;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  font-variant-numeric: tabular-nums;
+  color: var(--foreground);
+  line-height: 1.1;
+}
+.gw-pool-chip span {
+  font-size: 11px;
+  color: var(--muted-foreground);
+}
+.gw-pool-chip.is-busy {
+  border-color: color-mix(in srgb, var(--signal) 35%, var(--border));
+  background: color-mix(in srgb, var(--signal) 10%, transparent);
+}
+.gw-pool-chip.is-busy em {
+  color: color-mix(in srgb, var(--signal) 90%, var(--foreground));
+}
+.gw-pool-chip.is-cool {
+  border-color: color-mix(in srgb, var(--warn) 35%, var(--border));
+  background: color-mix(in srgb, var(--warn) 10%, transparent);
+}
+.gw-pool-chip.is-cool em {
+  color: var(--warn);
+}
+.gw-pool-chip.is-sticky {
+  border-color: color-mix(in srgb, var(--primary) 35%, var(--border));
+  background: color-mix(in srgb, var(--primary) 8%, transparent);
+}
+.gw-pool-chip.is-sticky em {
+  color: var(--primary);
+}
+.gw-pool-chip.is-idle {
+  border-color: color-mix(in srgb, var(--ok) 30%, var(--border));
+}
+.gw-pool-chip.is-idle em {
+  color: var(--ok);
+}
+
+.gw-acct-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-height: 0;
+  overflow: auto;
+  flex: 1;
+}
+.gw-acct-card {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px 12px;
+  padding: 10px 12px;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border);
+  background: color-mix(in srgb, var(--muted) 22%, transparent);
+  transition:
+    border-color var(--ap-dur-fast, 140ms) ease,
+    background-color var(--ap-dur-fast, 140ms) ease;
+}
+.gw-acct-card.is-cooling {
+  border-color: color-mix(in srgb, var(--warn) 40%, var(--border));
+  background: color-mix(in srgb, var(--warn) 8%, transparent);
+}
+.gw-acct-card.is-strikes {
+  border-color: color-mix(in srgb, var(--destructive) 30%, var(--border));
+  background: color-mix(in srgb, var(--destructive) 6%, transparent);
+}
+.gw-acct-main {
+  min-width: 0;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.gw-acct-id {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+.gw-acct-badge {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--foreground);
+  font-variant-numeric: tabular-nums;
+}
+.gw-acct-state {
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  padding: 1px 6px;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+  color: var(--muted-foreground);
+}
+.gw-acct-state.is-cooling {
+  color: var(--warn);
+  border-color: color-mix(in srgb, var(--warn) 40%, var(--border));
+  background: color-mix(in srgb, var(--warn) 12%, transparent);
+}
+.gw-acct-state.is-strikes {
+  color: var(--destructive);
+  border-color: color-mix(in srgb, var(--destructive) 35%, var(--border));
+  background: color-mix(in srgb, var(--destructive) 10%, transparent);
+}
+.gw-acct-state.is-idle {
+  color: var(--ok);
+  border-color: color-mix(in srgb, var(--ok) 35%, var(--border));
+  background: color-mix(in srgb, var(--ok) 10%, transparent);
+}
+.gw-acct-email {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--muted-foreground);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 100%;
+}
+.gw-acct-meta {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  justify-content: flex-end;
+}
+.gw-acct-tag {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  padding: 2px 7px;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+  color: var(--muted-foreground);
+  font-variant-numeric: tabular-nums;
+}
+.gw-acct-tag.is-warn {
+  color: var(--warn);
+  border-color: color-mix(in srgb, var(--warn) 35%, var(--border));
+}
+.gw-acct-tag.is-sticky {
+  color: var(--primary);
+  border-color: color-mix(in srgb, var(--primary) 35%, var(--border));
+}
+
+.gw-empty-sub {
+  display: block;
+  margin-top: 6px;
+  font-size: 11px;
+  color: color-mix(in srgb, var(--muted-foreground) 80%, transparent);
+}
+
+/* 运行时长徽标（副标题内） */
+.gw-uptime {
+  display: inline-flex;
+  align-items: center;
+  margin-left: 10px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  padding: 1px 7px;
+  border-radius: 4px;
+  border: 1px solid color-mix(in srgb, var(--primary) 35%, var(--border));
+  color: var(--primary);
+  background: color-mix(in srgb, var(--primary) 8%, transparent);
+  font-variant-numeric: tabular-nums;
+}
+
+/* KPI 行：5 列 */
+.mission-strip-gw {
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  flex-shrink: 0;
+  border-radius: 0;
+}
+@media (max-width: 1100px) {
+  .mission-strip-gw {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+}
+@media (max-width: 640px) {
+  .mission-strip-gw {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+.gw-page .metric-k {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.gw-page .metric-ico {
+  width: 12px;
+  height: 12px;
+  opacity: 0.7;
+}
+
+/* 失败率配色 */
+.gw-fail-rate {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+.gw-fail-rate.is-ok {
+  color: var(--ok);
+}
+.gw-fail-rate.is-warn {
+  color: var(--warn);
+}
+.gw-fail-rate.is-bad {
+  color: var(--destructive);
+}
+
+/* 首载骨架屏 */
+.gw-skeleton {
+  height: 280px;
+  margin: 16px 18px 18px;
+  border-radius: var(--radius-md);
+  background: linear-gradient(
+    90deg,
+    color-mix(in srgb, var(--muted) 50%, transparent) 0%,
+    color-mix(in srgb, var(--muted) 80%, transparent) 50%,
+    color-mix(in srgb, var(--muted) 50%, transparent) 100%
+  );
+  background-size: 200% 100%;
+  animation: gw-shimmer 1.2s ease-in-out infinite;
+}
+@keyframes gw-shimmer {
+  0% {
+    background-position: 200% 0;
+  }
+  100% {
+    background-position: -200% 0;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .gw-skeleton {
+    animation: none;
+  }
+}

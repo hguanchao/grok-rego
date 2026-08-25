@@ -34,10 +34,11 @@ accounts 表数据访问模块。
 """
 
 import time
+from datetime import date, timedelta
 from typing import Any
 
 from core.logger import logger
-from core.util import decode_jwt_exp, mask_email, now_iso_tz
+from core.util import decode_jwt_exp, mask_email, now_dt, now_iso_tz
 
 # 兼容已有数据库：表已存在但缺少新字段时补加
 _ACCOUNT_MIGRATIONS = [
@@ -199,6 +200,17 @@ def get_account_by_email(email: str) -> dict[str, Any] | None:
         return _row_to_account(row)
     logger.warning(f"[数据库] 未找到账号: {mask_email(email)}")
     return None
+
+
+def get_account_by_id(account_id: int) -> dict[str, Any] | None:
+    """按主键取未删除账号；不存在返回 None。"""
+    with connect() as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT * FROM accounts WHERE id=? AND COALESCE(is_deleted, 0) = 0",
+            (int(account_id),),
+        ).fetchone()
+    return _row_to_account(row) if row else None
 
 
 def update_risk(
@@ -450,7 +462,7 @@ def query_accounts(
 
 
 def get_pool_stats() -> dict[str, int]:
-    """获取号池统计（排除已软删）。"""
+    """获取号池统计（排除已软删），含各任务全量模式的候选账号数。"""
     with connect() as conn:
         conn.row_factory = sqlite3.Row
         row = conn.execute(
@@ -459,7 +471,17 @@ def get_pool_stats() -> dict[str, int]:
                 COUNT(*) AS total,
                 SUM(CASE WHEN COALESCE(status, 1) = 1 THEN 1 ELSE 0 END) AS active,
                 SUM(CASE WHEN COALESCE(status, 1) IN (2, 3) THEN 1 ELSE 0 END) AS pending_action,
-                SUM(CASE WHEN COALESCE(status, 1) IN (4, 5) THEN 1 ELSE 0 END) AS abnormal
+                SUM(CASE WHEN COALESCE(status, 1) IN (4, 5) THEN 1 ELSE 0 END) AS abnormal,
+                SUM(
+                    CASE WHEN COALESCE(access_token, '') != ''
+                              AND COALESCE(status, 1) = 1 THEN 1 ELSE 0 END
+                ) AS push_count,
+                SUM(CASE WHEN COALESCE(access_token, '') = '' THEN 1 ELSE 0 END) AS auth_count,
+                SUM(CASE WHEN COALESCE(status, 1) = 2 THEN 1 ELSE 0 END) AS reauth_count,
+                SUM(
+                    CASE WHEN COALESCE(access_token, '') != ''
+                              AND COALESCE(status, 1) != 2 THEN 1 ELSE 0 END
+                ) AS inspect_count
             FROM accounts WHERE COALESCE(is_deleted, 0) = 0
             """
         ).fetchone()
@@ -468,6 +490,12 @@ def get_pool_stats() -> dict[str, int]:
         "active": row["active"] or 0,
         "pending_action": row["pending_action"] or 0,
         "abnormal": row["abnormal"] or 0,
+        "task_counts": {
+            "push": row["push_count"] or 0,
+            "auth": row["auth_count"] or 0,
+            "reauth": row["reauth_count"] or 0,
+            "inspect": row["inspect_count"] or 0,
+        },
     }
 
 
@@ -561,14 +589,531 @@ def remove_from_auth_pool(email: str) -> None:
 
 
 """
-数据库初始化入口。
+usages 用量记录。
 
-聚合 accounts / auth_pool 表的初始化。
+网关请求流水：客户端 → 请求 → 账号 → 结果 → token → 时间。
+时间字段与 accounts 一致：北京时间 ISO（YYYY-MM-DDTHH:MM:SS+08:00）。
+布尔/状态用 INTEGER；计数字段 NOT NULL DEFAULT 0，禁止 NULL。
 """
 
+_USAGES_COLUMNS = (
+    "id",
+    "ip",
+    "client_ua",
+    "endpoint",
+    "model",
+    "effort",
+    "stream",
+    "account_id",
+    "account_email",
+    "status",
+    "reason",
+    "prompt_tokens",
+    "completion_tokens",
+    "cache_tokens",
+    "reasoning_tokens",
+    "created_at",
+)
+_USAGES_TOKEN_COLUMNS = (
+    "prompt_tokens",
+    "completion_tokens",
+    "cache_tokens",
+    "reasoning_tokens",
+)
+# 声明类型（SQLite 亲和性仍按 INTEGER/TEXT；长度仅作规范约束）
+_USAGES_TYPES = {
+    "id": "INTEGER",
+    "ip": "VARCHAR(45)",
+    "client_ua": "VARCHAR(512)",
+    "endpoint": "VARCHAR(64)",
+    "model": "VARCHAR(64)",
+    "effort": "VARCHAR(32)",
+    "stream": "INTEGER",
+    "account_id": "INTEGER",
+    "account_email": "VARCHAR(255)",
+    "status": "INTEGER",
+    "reason": "VARCHAR(255)",
+    "prompt_tokens": "INTEGER",
+    "completion_tokens": "INTEGER",
+    "cache_tokens": "INTEGER",
+    "reasoning_tokens": "INTEGER",
+    "created_at": "TEXT",
+}
+
+_USAGES_SCHEMA = """
+    CREATE TABLE IF NOT EXISTS usages (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ip VARCHAR(45),
+        client_ua VARCHAR(512),
+        endpoint VARCHAR(64) NOT NULL DEFAULT '',
+        model VARCHAR(64) NOT NULL,
+        effort VARCHAR(32),
+        stream INTEGER NOT NULL DEFAULT 0,
+        account_id INTEGER,
+        account_email VARCHAR(255),
+        status INTEGER NOT NULL DEFAULT 0,
+        reason VARCHAR(255),
+        prompt_tokens INTEGER NOT NULL DEFAULT 0,
+        completion_tokens INTEGER NOT NULL DEFAULT 0,
+        cache_tokens INTEGER NOT NULL DEFAULT 0,
+        reasoning_tokens INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL
+    )
+"""
+
+
+def _usages_select_expr(name: str, old_types: dict[str, str]) -> str:
+    """旧列 → 新列表达式：毫秒时间戳转北京 ISO，token NULL 填 0。"""
+    declared = (old_types.get(name) or "").upper()
+    if name == "created_at" and "TEXT" not in declared and "CHAR" not in declared:
+        return (
+            "replace(datetime(created_at / 1000, 'unixepoch', '+8 hours'), ' ', 'T')"
+            " || '+08:00'"
+        )
+    if name in _USAGES_TOKEN_COLUMNS:
+        return f"COALESCE({name}, 0)"
+    return name
+
+
+def _usages_schema_ok(info_rows: list[sqlite3.Row] | list[tuple[Any, ...]]) -> bool:
+    """列名、顺序、声明类型均对齐才跳过重建。"""
+    if [row[1] for row in info_rows] != list(_USAGES_COLUMNS):
+        return False
+    for row in info_rows:
+        name = row[1]
+        declared = str(row[2] or "").upper().replace(" ", "")
+        expect = _USAGES_TYPES[name].upper().replace(" ", "")
+        if declared != expect:
+            return False
+    return True
+
+
+def init_usages_table() -> None:
+    """初始化 usages：无表则建；列序/类型不对则重建并迁数据。"""
+    with connect() as conn:
+        cursor = conn.cursor()
+        exists = cursor.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='usages'"
+        ).fetchone()
+        if exists:
+            info = cursor.execute("PRAGMA table_info(usages)").fetchall()
+            if _usages_schema_ok(info):
+                _ensure_usages_indexes(cursor)
+                conn.commit()
+                return
+            old_types = {row[1]: str(row[2] or "") for row in info}
+            old_cols = set(old_types)
+            cursor.execute("ALTER TABLE usages RENAME TO usages_old")
+            cursor.execute(_USAGES_SCHEMA)
+            copy_cols = [name for name in _USAGES_COLUMNS if name in old_cols]
+            col_sql = ", ".join(copy_cols)
+            select_sql = ", ".join(
+                _usages_select_expr(name, old_types) for name in copy_cols
+            )
+            cursor.execute(
+                f"INSERT INTO usages ({col_sql}) SELECT {select_sql} FROM usages_old"
+            )
+            cursor.execute("DROP TABLE usages_old")
+            logger.info("[数据库] usages 已重建（类型与列序对齐）")
+        else:
+            cursor.execute(_USAGES_SCHEMA)
+            logger.info("[数据库] usages 表初始化完成")
+        _ensure_usages_indexes(cursor)
+        conn.commit()
+
+
+def insert_usage(
+    *,
+    ip: str | None = None,
+    client_ua: str | None = None,
+    endpoint: str = "",
+    model: str = "",
+    effort: str | None = None,
+    stream: bool = False,
+    account_id: int | None = None,
+    account_email: str | None = None,
+    status: int = 0,
+    reason: str | None = None,
+    prompt_tokens: int = 0,
+    completion_tokens: int = 0,
+    cache_tokens: int = 0,
+    reasoning_tokens: int = 0,
+) -> None:
+    """写入一条网关用量记录（每次请求一行，幂等可重复调用）。
+
+    落库供前端用量统计（/api/usage）聚合展示；status=1 记成功，其余记失败。
+    token 各列均为尽力而为：无法从上游解析时记 0，绝不阻塞转发。
+    """
+    init_usages_table()
+    with connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO usages (
+                ip, client_ua, endpoint, model, effort, stream,
+                account_id, account_email, status, reason,
+                prompt_tokens, completion_tokens, cache_tokens, reasoning_tokens,
+                created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                ip, client_ua, endpoint, model, effort,
+                1 if stream else 0,
+                account_id, account_email, status, reason,
+                prompt_tokens, completion_tokens, cache_tokens, reasoning_tokens,
+                now_iso_tz(),
+            ),
+        )
+        conn.commit()
+
+
+def _ensure_usages_indexes(cursor: sqlite3.Cursor) -> None:
+    """用量查询索引：时间 / 模型 / 账号。"""
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_usages_created ON usages (created_at)"
+    )
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_usages_model ON usages (model)")
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_usages_account ON usages (account_email)"
+    )
+
+
+def _usages_int(row: sqlite3.Row | None, key: str) -> int:
+    if row is None:
+        return 0
+    try:
+        return int(row[key] or 0)
+    except (TypeError, ValueError, KeyError, IndexError):
+        return 0
+
+
+def _usage_rate(part: int, whole: int) -> float:
+    """占比百分比，分母为 0 时返回 0。"""
+    if whole <= 0:
+        return 0.0
+    return round(part * 100.0 / whole, 2)
+
+
+def _usage_window(days: int) -> tuple[int, str, str]:
+    """北京日历日闭区间 [from, to]。days=1 即今日，上限 90。"""
+    days = max(1, min(int(days), 90))
+    today = now_dt().date()
+    start = today - timedelta(days=days - 1)
+    return days, start.isoformat(), today.isoformat()
+
+
+def _usage_date_where(date_from: str, date_to: str) -> tuple[str, list[str]]:
+    """北京日历日闭区间。ISO 文本可直接比较，走 idx_usages_created。"""
+    end = (date.fromisoformat(date_to) + timedelta(days=1)).isoformat()
+    return "created_at >= ? AND created_at < ?", [date_from, end]
+
+
+def _fill_usage_days(
+    rows: list[sqlite3.Row], date_from: str, date_to: str
+) -> list[dict[str, Any]]:
+    """日桶补齐窗口内每一天，避免趋势图断档。"""
+    by_day = {str(row["day"]): row for row in rows}
+    start = date.fromisoformat(date_from)
+    end = date.fromisoformat(date_to)
+    out: list[dict[str, Any]] = []
+    cursor = start
+    while cursor <= end:
+        key = cursor.isoformat()
+        src = by_day.get(key)
+        out.append(
+            {
+                "day": key,
+                "requests": _usages_int(src, "requests"),
+                "success": _usages_int(src, "success"),
+                "total_tokens": _usages_int(src, "total_tokens"),
+            }
+        )
+        cursor += timedelta(days=1)
+    return out
+
+
+def _fill_usage_hours(rows: list[sqlite3.Row], day: str) -> list[dict[str, Any]]:
+    """今日 24 小时桶补齐（00–23）。"""
+    by_hour = {str(row["hour"]): row for row in rows}
+    out: list[dict[str, Any]] = []
+    for hour in range(24):
+        key = f"{day}T{hour:02d}"
+        src = by_hour.get(key)
+        out.append(
+            {
+                "hour": f"{day}T{hour:02d}:00:00+08:00",
+                "requests": _usages_int(src, "requests"),
+                "success": _usages_int(src, "success"),
+                "total_tokens": _usages_int(src, "total_tokens"),
+            }
+        )
+    return out
+
+
+_USAGE_BUCKET_SELECT = """
+    COUNT(*) AS requests,
+    SUM(CASE WHEN status = 1 THEN 1 ELSE 0 END) AS success,
+    SUM(prompt_tokens + completion_tokens) AS total_tokens
+"""
+
+
+def query_usage_summary(days: int = 1) -> dict[str, Any]:
+    """窗口内 KPI + 模型分布 + 日/小时趋势。今日补齐 24 小时桶，多日补齐日历日。"""
+    init_usages_table()
+    days, date_from, date_to = _usage_window(days)
+    where, params = _usage_date_where(date_from, date_to)
+    with connect() as conn:
+        conn.row_factory = sqlite3.Row
+        agg = conn.execute(
+            f"""
+            SELECT
+                COUNT(*) AS requests,
+                SUM(CASE WHEN status = 1 THEN 1 ELSE 0 END) AS success,
+                SUM(CASE WHEN status != 1 THEN 1 ELSE 0 END) AS failed,
+                SUM(CASE WHEN stream = 1 THEN 1 ELSE 0 END) AS stream_count,
+                SUM(prompt_tokens) AS prompt_tokens,
+                SUM(completion_tokens) AS completion_tokens,
+                SUM(cache_tokens) AS cache_tokens,
+                SUM(reasoning_tokens) AS reasoning_tokens
+            FROM usages WHERE {where}
+            """,
+            params,
+        ).fetchone()
+        by_model_rows = conn.execute(
+            f"""
+            SELECT model,
+                   COUNT(*) AS requests,
+                   SUM(CASE WHEN status = 1 THEN 1 ELSE 0 END) AS success,
+                   SUM(prompt_tokens) AS prompt_tokens,
+                   SUM(completion_tokens) AS completion_tokens,
+                   SUM(cache_tokens) AS cache_tokens,
+                   SUM(reasoning_tokens) AS reasoning_tokens
+            FROM usages WHERE {where}
+            GROUP BY model
+            ORDER BY requests DESC, model
+            """,
+            params,
+        ).fetchall()
+        by_day_rows = conn.execute(
+            f"""
+            SELECT substr(created_at, 1, 10) AS day, {_USAGE_BUCKET_SELECT}
+            FROM usages WHERE {where}
+            GROUP BY day
+            ORDER BY day
+            """,
+            params,
+        ).fetchall()
+        by_hour_rows: list[sqlite3.Row] = []
+        if days == 1:
+            by_hour_rows = conn.execute(
+                f"""
+                SELECT substr(created_at, 1, 13) AS hour, {_USAGE_BUCKET_SELECT}
+                FROM usages WHERE {where}
+                GROUP BY hour
+                ORDER BY hour
+                """,
+                params,
+            ).fetchall()
+
+    requests = _usages_int(agg, "requests")
+    success = _usages_int(agg, "success")
+    failed = _usages_int(agg, "failed")
+    prompt = _usages_int(agg, "prompt_tokens")
+    completion = _usages_int(agg, "completion_tokens")
+    cache = _usages_int(agg, "cache_tokens")
+    reasoning = _usages_int(agg, "reasoning_tokens")
+    total_tokens = prompt + completion
+    by_model: list[dict[str, Any]] = []
+    for row in by_model_rows:
+        p = _usages_int(row, "prompt_tokens")
+        c = _usages_int(row, "completion_tokens")
+        by_model.append(
+            {
+                "model": row["model"] or "",
+                "requests": _usages_int(row, "requests"),
+                "success": _usages_int(row, "success"),
+                "prompt_tokens": p,
+                "completion_tokens": c,
+                "cache_tokens": _usages_int(row, "cache_tokens"),
+                "reasoning_tokens": _usages_int(row, "reasoning_tokens"),
+                "total_tokens": p + c,
+            }
+        )
+    return {
+        "days": days,
+        "from": date_from,
+        "to": date_to,
+        "summary": {
+            "requests": requests,
+            "success": success,
+            "failed": failed,
+            "stream_count": _usages_int(agg, "stream_count"),
+            "prompt_tokens": prompt,
+            "completion_tokens": completion,
+            "cache_tokens": cache,
+            "reasoning_tokens": reasoning,
+            "total_tokens": total_tokens,
+            "success_rate": _usage_rate(success, requests),
+            "cache_hit_rate": _usage_rate(cache, prompt),
+            "reasoning_share": _usage_rate(reasoning, total_tokens),
+        },
+        "by_model": by_model,
+        "by_day": _fill_usage_days(by_day_rows, date_from, date_to),
+        "by_hour": _fill_usage_hours(by_hour_rows, date_from) if days == 1 else [],
+    }
+
+
+def query_usage_recent(*, offset: int = 0, limit: int = 20) -> dict[str, Any]:
+    """最近用量明细分页，与统计窗口无关。"""
+    init_usages_table()
+    offset = max(0, int(offset))
+    limit = max(1, min(int(limit), 100))
+    with connect() as conn:
+        conn.row_factory = sqlite3.Row
+        total = conn.execute("SELECT COUNT(*) FROM usages").fetchone()[0]
+        items = conn.execute(
+            "SELECT * FROM usages ORDER BY id DESC LIMIT ? OFFSET ?",
+            (limit, offset),
+        ).fetchall()
+    return {
+        "items": [dict(row) for row in items],
+        "total": int(total or 0),
+        "offset": offset,
+        "limit": limit,
+    }
+
+
+_GROUPED_KEY = {
+    "account": "COALESCE(NULLIF(account_email, ''), '未知')",
+    "model": "COALESCE(NULLIF(model, ''), '未知')",
+}
+
+
+def query_usage_grouped(*, dimension: str) -> dict[str, Any]:
+    """按维度聚合用量：account（账号）/ model（模型）。
+
+    返回每个维度的请求数、成功/失败、token 汇总与最近一次时间。
+    dimension 非法时抛 ValueError（API 映射 400）。
+    """
+    if dimension not in _GROUPED_KEY:
+        raise ValueError(f"dimension 仅支持 {'/'.join(_GROUPED_KEY)}")
+    init_usages_table()
+    key_expr = _GROUPED_KEY[dimension]
+    with connect() as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            f"""
+            SELECT {key_expr} AS key,
+                   COUNT(*) AS requests,
+                   SUM(CASE WHEN status = 1 THEN 1 ELSE 0 END) AS success,
+                   SUM(CASE WHEN status != 1 THEN 1 ELSE 0 END) AS failed,
+                   SUM(prompt_tokens) AS prompt_tokens,
+                   SUM(completion_tokens) AS completion_tokens,
+                   SUM(cache_tokens) AS cache_tokens,
+                   SUM(reasoning_tokens) AS reasoning_tokens,
+                   SUM(CASE WHEN stream = 1 THEN 1 ELSE 0 END) AS stream_count,
+                   MAX(created_at) AS last_at
+            FROM usages
+            GROUP BY key
+            ORDER BY requests DESC, key
+            """
+        ).fetchall()
+    items: list[dict[str, Any]] = []
+    for row in rows:
+        p = _usages_int(row, "prompt_tokens")
+        c = _usages_int(row, "completion_tokens")
+        items.append(
+            {
+                "key": str(row["key"] or ""),
+                "requests": _usages_int(row, "requests"),
+                "success": _usages_int(row, "success"),
+                "failed": _usages_int(row, "failed"),
+                "prompt_tokens": p,
+                "completion_tokens": c,
+                "cache_tokens": _usages_int(row, "cache_tokens"),
+                "reasoning_tokens": _usages_int(row, "reasoning_tokens"),
+                "total_tokens": p + c,
+                "stream_count": _usages_int(row, "stream_count"),
+                "last_at": str(row["last_at"] or ""),
+            }
+        )
+    return {"dimension": dimension, "items": items}
+
+
+# ─── 网关运维聚合查询 ─────────────────────────────────────
+
+
+def _usages_since(hours: int) -> tuple[str, list[str]]:
+    """构造近 N 小时的时间过滤条件（与 now_iso_tz 同钟：北京时间 ISO 字符串比较）。"""
+    threshold = (now_dt() - timedelta(hours=hours)).isoformat(timespec="seconds")
+    return "created_at >= ?", [threshold]
+
+
+def query_channel_usage_24h() -> dict[str, dict[str, int]]:
+    """近 24h 各网关通道请求统计（按 endpoint 前缀 /zen/v1、/grok/v1 归组）。
+
+    返回形如 {"zen": {"requests", "failed", "tokens"}, "grok": {...}}；
+    无记录的通道值为全零，不缺键。
+    """
+    init_usages_table()
+    where, params = _usages_since(24)
+    with connect() as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            f"""
+            SELECT CASE
+                       WHEN endpoint LIKE '/zen/v1%' THEN 'zen'
+                       WHEN endpoint LIKE '/grok/v1%' THEN 'grok'
+                       ELSE 'other'
+                   END AS channel,
+                   COUNT(*) AS requests,
+                   SUM(CASE WHEN status != 1 THEN 1 ELSE 0 END) AS failed,
+                   SUM(prompt_tokens + completion_tokens) AS tokens
+            FROM usages WHERE {where}
+            GROUP BY channel
+            """,
+            params,
+        ).fetchall()
+    out: dict[str, dict[str, int]] = {
+        ch: {"requests": 0, "failed": 0, "tokens": 0} for ch in ("zen", "grok")
+    }
+    for row in rows:
+        channel = str(row["channel"] or "other")
+        if channel in out:
+            out[channel] = {
+                "requests": _usages_int(row, "requests"),
+                "failed": _usages_int(row, "failed"),
+                "tokens": _usages_int(row, "tokens"),
+            }
+    return out
+
+
+def query_account_usage_24h() -> dict[int, int]:
+    """近 24h Grok 通道各账号请求数（account_id 分组，供号池运行态展示）。"""
+    init_usages_table()
+    where, params = _usages_since(24)
+    with connect() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT account_id, COUNT(*) AS requests
+            FROM usages
+            WHERE {where} AND account_id IS NOT NULL AND account_id > 0
+            GROUP BY account_id
+            """,
+            params,
+        ).fetchall()
+    return {int(row["account_id"]): _usages_int(row, "requests") for row in rows}
+
+
+
+"""
+数据库初始化入口。
+
+聚合 accounts / auth_pool / usages 表的初始化。
+"""
 
 
 def init_db() -> None:
     """初始化全部数据库表结构。"""
     init_accounts_table()
     init_auth_pool_table()
+    init_usages_table()

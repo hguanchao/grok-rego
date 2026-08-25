@@ -3,7 +3,7 @@
 
 浏览器阶段：注册页 → 邮箱（创建临时邮箱）→ 验证码 → 资料表单 → 等 sso cookie 落地
             → 入库（status=REAUTH）→ 入认证池 → grok.com 风控体检。
-认证池阶段：run_auth_pool 串行用 sso cookie 走 device flow 协议级 approve 交换 Token。
+认证池阶段：run_auth_pool 用 20 个 worker 消化队列，每个 worker 做完一个号再隔 1 秒接下一个。
 
 重试策略：邮箱/验证码/资料阶段失败关闭浏览器重启重试（邮箱与资料复用，最多 MAX_ATTEMPTS 次）；
          仅 SSO 阶段失败在当前浏览器内刷新页面重试（POST_EMAIL_RETRIES 次，不重启浏览器）。
@@ -24,7 +24,16 @@ from curl_cffi import requests
 
 from core import config
 from core.logger import logger
-from core.util import decode_jwt_exp, elapsed_label, format_exp, now_str
+from core.util import (
+    ACCOUNT_WORKER_GAP_SEC,
+    ACCOUNT_WORKERS,
+    decode_jwt_exp,
+    elapsed_label,
+    format_exp,
+    mask_email,
+    now_str,
+    run_account_workers,
+)
 from db import (
     STATUS_ACTIVE,
     STATUS_REAUTH,
@@ -577,9 +586,7 @@ def _ensure_email(
         if not email:
             logger.error(f"[邮箱] 邮箱创建失败  · {elapsed_label(create_t0)}")
             return None
-        logger.debug(
-            f"[邮箱] 已创建 {email} ({first_name} {last_name})  · {elapsed_label(create_t0)}"
-        )
+        logger.debug(f"[邮箱] 已创建 {mask_email(email)}  · {elapsed_label(create_t0)}")
     if not first_name or not last_name:
         first_name, last_name = _generate_profile_name()
     return email, jwt, first_name, last_name
@@ -601,17 +608,18 @@ def _submit_email(page: Any, email: str) -> tuple[str, bool]:
     允许重启浏览器复用邮箱重试；失败阶段 'post'：已越过邮箱填写阶段。
     """
     t0 = time.monotonic()
+    log_email = mask_email(email)
     if not fill(page, email, ["input[type='email']", "input"]):
-        logger.warning(f"[邮箱] 未找到输入框  {email}  · {elapsed_label(t0)}")
+        logger.warning(f"[邮箱] 未找到输入框  {log_email}  · {elapsed_label(t0)}")
         return "email", False
     if not click(page, "Sign up"):
-        logger.warning(f"[邮箱] 未找到 Sign up 按钮  {email}  · {elapsed_label(t0)}")
+        logger.warning(f"[邮箱] 未找到 Sign up 按钮  {log_email}  · {elapsed_label(t0)}")
         return "email", False
     page.wait_for_timeout(1500)
     if _has_risk_prompt(page):
-        logger.warning(f"[邮箱] 提交后触发风控  {email}  · {elapsed_label(t0)}")
+        logger.warning(f"[邮箱] 提交后触发风控  {log_email}  · {elapsed_label(t0)}")
         return "email", False
-    logger.success(f"[邮箱] 已填写并提交 {email}  · {elapsed_label(t0)}")
+    logger.success(f"[邮箱] 已填写并提交 {log_email}  · {elapsed_label(t0)}")
     return "post", True
 
 
@@ -687,7 +695,9 @@ def _wait_form_ready(page: Any, timeout: int = FORM_READY_TIMEOUT) -> bool:
 def _form_ready_skip(page: Any, email: str, t0: float) -> bool:
     """页面已直接到达资料表单（验证码阶段可跳过）时返回 True。"""
     if _on_form_page(page):
-        logger.success(f"[邮件] 已在资料表单，跳过验证码  {email}  · {elapsed_label(t0)}")
+        logger.success(
+            f"[邮件] 已在资料表单，跳过验证码  {mask_email(email)}  · {elapsed_label(t0)}"
+        )
         return True
     return False
 
@@ -695,30 +705,31 @@ def _form_ready_skip(page: Any, email: str, t0: float) -> bool:
 def _verify_email(page: Any, email: str, jwt: str) -> bool:
     """验证码阶段：等验证码页 → 取码 → 填码 → 等到资料表单。表单未出现视为失败。"""
     t0 = time.monotonic()
+    log_email = mask_email(email)
     if _form_ready_skip(page, email, t0):
         return True
     if not wait_until(page, ["verify your email", "one-time code"], OTP_PAGE_WAIT_SECS, check_for_errors=True):
         if _form_ready_skip(page, email, t0):
             return True
-        logger.warning(f"[邮件] 验证码页未就绪  {email}  · {elapsed_label(t0)}")
+        logger.warning(f"[邮件] 验证码页未就绪  {log_email}  · {elapsed_label(t0)}")
         _dump_page(page, "otp-page-missing")
         return False
     code = poll_for_code(jwt, timeout=OTP_MAIL_TIMEOUT, interval=OTP_MAIL_INTERVAL)
     if not code:
         if _form_ready_skip(page, email, t0):
             return True
-        logger.error(f"[邮件] 等待验证码超时  {email}  · {elapsed_label(t0)}")
+        logger.error(f"[邮件] 等待验证码超时  {log_email}  · {elapsed_label(t0)}")
         return False
     fill_t0 = time.monotonic()
     if not _fill_otp(page, code):
         if _form_ready_skip(page, email, t0):
             return True
-        logger.error(f"[邮件] 未找到验证码框  {email}  · {elapsed_label(fill_t0)}")
+        logger.error(f"[邮件] 未找到验证码框  {log_email}  · {elapsed_label(fill_t0)}")
         _dump_page(page, "otp-input-missing")
         return False
-    logger.success(f"[邮件] 已填入验证码 {code}  · {elapsed_label(fill_t0)}")
+    logger.success(f"[邮件] 已填入验证码  · {elapsed_label(fill_t0)}")
     if not _wait_form_ready(page, timeout=FORM_READY_TIMEOUT):
-        logger.warning(f"[资料] 填码后资料表单未就绪  {email}  · {elapsed_label(t0)}")
+        logger.warning(f"[资料] 填码后资料表单未就绪  {log_email}  · {elapsed_label(t0)}")
         _dump_page(page, "after-otp-no-form")
         return False
     return True
@@ -1169,9 +1180,10 @@ def run_signup(headless: bool = False) -> tuple[bool, str | None, int | None]:
             logger.warning("[注册] 已取消，中止当前账号")
             break
         if attempt > 1:
+            log_email = mask_email(email)
             logger.debug(
                 f"[注册] 第 {attempt}/{MAX_ATTEMPTS} 次尝试"
-                f"{f'  {email}' if email else ''}"
+                f"{f'  {log_email}' if log_email else ''}"
             )
         risk, account_id, email, jwt, first_name, last_name, stage = _run_attempt(
             email, jwt, first_name, last_name, password, headless=headless
@@ -1182,22 +1194,24 @@ def run_signup(headless: bool = False) -> tuple[bool, str | None, int | None]:
             break
         if stage == "post":
             logger.debug(
-                f"[注册] 第 {attempt} 次尝试在 SSO 阶段失败，不再重启浏览器，放弃: {email}"
+                f"[注册] 第 {attempt} 次尝试在 SSO 阶段失败，不再重启浏览器，"
+                f"放弃: {mask_email(email)}"
             )
             break
         label = {"email": "邮箱", "otp": "验证码", "form": "资料"}.get(stage, stage)
+        log_email = mask_email(email)
         logger.debug(
             f"[注册] {label}阶段失败，重启浏览器"
-            f"{f'  {email}' if email else ''}"
+            f"{f'  {log_email}' if log_email else ''}"
         )
 
     if account_id and email:
-        logger.debug(f"[SSO] 账号已入库，待认证池交换 Token: {email}")
+        logger.debug(f"[SSO] 账号已入库，待认证池交换 Token: {mask_email(email)}")
         if config.IS_AUTH and risk[0] is not None:
             update_risk(email, risk[0], risk[1] or None, now_str())
         return True, email, risk[0]
 
-    logger.error(f"[注册] 全部尝试失败，放弃: {email}")
+    logger.error(f"[注册] 全部尝试失败，放弃: {mask_email(email)}")
     return False, email, risk[0]
 
 
@@ -1251,41 +1265,49 @@ def run_signups(
     return success_count
 
 
-def run_auth_pool(stop_when: Callable[[], bool] | None = None) -> int:
-    """串行消化认证池：用 SSO cookie 协议级自动交换 Token，每账号固定 1 秒间隔。
+def run_auth_pool(
+    stop_when: Callable[[], bool] | None = None,
+    on_result: Callable[[str, bool, str], None] | None = None,
+) -> int:
+    """消化认证池：20 个 worker 并发，每个 worker 做完一个号再隔 1 秒接下一个。
 
     全自动认证：从账号记录取 sso_cookie，走 device flow 协议级 approve
     （verify + approve 模拟用户授权），再轮询 token 端点。
     成功补写 accounts 并出池；失败出池并标记需重登（保留 sso 可重试）。
     stop_when: 可选，返回 True 时提前结束（用于任务取消）。
+    on_result: 可选，单账号完成后立即回调脱敏邮箱、结果和原因。
     """
-    # 局部导入：oauth 仅在认证池消化时需要
     from workflow.oauth import auth_with_sso
 
     auth_entries = get_auth_pool()
     if not auth_entries:
         logger.info("[出池] 队列为空，无需消化")
         return 0
-    logger.info(f"[出池] 开始消化 {len(auth_entries)} 个")
-    success_count = 0
-    for entry in auth_entries:
+    logger.info(
+        f"[出池] 开始消化 {len(auth_entries)} 个 / {ACCOUNT_WORKERS} 线程 "
+        f"每线程间隔 {ACCOUNT_WORKER_GAP_SEC:.0f}s"
+    )
+
+    def work(entry: dict[str, Any]) -> bool:
         if stop_when is not None and stop_when():
-            logger.warning("[出池] 收到停止信号，中止后续认证")
-            break
+            return False
         email = entry["email"]
+        log_email = mask_email(email)
         account = get_account_by_email(email)
-        aid = int(entry.get("account_id") or (account or {}).get("id") or 0)
         if account is None:
-            logger.warning(f"[出池] {email}  账号不存在，已移除")
+            logger.warning(f"[出池] {log_email}  账号不存在，已移除")
             remove_from_auth_pool(email)
-            continue
-        if not aid:
-            aid = int(account.get("id") or 0)
+            if on_result is not None:
+                on_result(log_email, False, "账号不存在")
+            return False
         t0 = time.monotonic()
         token, reason = auth_with_sso(account.get("sso_cookie"))
         if token:
             save_account(
-                account["email"], account["password"], account["first_name"], account["last_name"],
+                account["email"],
+                account["password"],
+                account["first_name"],
+                account["last_name"],
                 account.get("sso_cookie"),
                 access_token=token.get("access_token"),
                 refresh_token=token.get("refresh_token"),
@@ -1294,17 +1316,43 @@ def run_auth_pool(stop_when: Callable[[], bool] | None = None) -> int:
                 reason=reason,
             )
             remove_from_auth_pool(email)
-            success_count += 1
             exp_txt = format_exp(decode_jwt_exp(token.get("access_token")))
             logger.success(
-                f"[出池] {email}  认证成功  Token 到期 {exp_txt}  · {elapsed_label(t0)}"
+                f"[出池] {log_email}  认证成功  Token 到期 {exp_txt}  · {elapsed_label(t0)}"
             )
-        else:
-            update_account_status(email, STATUS_REAUTH, f"0 {reason}")
-            remove_from_auth_pool(email)
-            logger.warning(
-                f"[出池] {email}  认证失败：{reason}  · {elapsed_label(t0)}"
-            )
-        time.sleep(2.0)  # 账号间固定 2 秒间隔
+            if on_result is not None:
+                on_result(log_email, True, "Token 已入库")
+            return True
+        update_account_status(email, STATUS_REAUTH, f"0 {reason}")
+        remove_from_auth_pool(email)
+        logger.warning(f"[出池] {log_email}  认证失败：{reason}  · {elapsed_label(t0)}")
+        if on_result is not None:
+            on_result(log_email, False, reason)
+        return False
+
+    success_count = 0
+    success_lock = threading.Lock()
+
+    def complete(_index: int, entry: dict[str, Any], result: Any) -> None:
+        nonlocal success_count
+        if result is True:
+            with success_lock:
+                success_count += 1
+            return
+        if isinstance(result, Exception):
+            email = mask_email(str(entry.get("email") or ""))
+            reason = f"{type(result).__name__}: {result}"
+            logger.warning(f"[出池] {email}  认证异常：{reason}")
+            if on_result is not None:
+                on_result(email, False, reason)
+
+    run_account_workers(
+        auth_entries,
+        work,
+        workers=ACCOUNT_WORKERS,
+        thread_name_prefix="认证",
+        should_stop=stop_when,
+        on_complete=complete,
+    )
     logger.info(f"[出池] 消化完成: 成功 {success_count}/{len(auth_entries)}")
     return success_count

@@ -20,6 +20,7 @@ export interface AppConfig {
   g2a_password: string;
   cpa_base_url: string;
   cpa_management_key: string;
+  gateway_api_key: string;
 }
 
 export interface LogEntry {
@@ -207,6 +208,13 @@ export interface PoolStats {
   active: number;
   pending_action: number;
   abnormal: number;
+  /** 各任务全量模式的候选账号数（服务端全库统计） */
+  task_counts: {
+    push: number;
+    auth: number;
+    reauth: number;
+    inspect: number;
+  };
 }
 
 export interface PoolQuery {
@@ -293,7 +301,7 @@ export async function cancelPoolOpTask(): Promise<PoolOpTask> {
 }
 
 export async function reauthPoolAccounts(
-  ids: number[],
+  ids?: number[],
   concurrency?: number,
 ): Promise<PoolOpTask> {
   return request<PoolOpTask>("/api/pool/reauth", {
@@ -313,6 +321,7 @@ export interface AutoRefreshStatus {
   running: boolean;
   interval_min: number;
   lead_min: number;
+  concurrency: number;
   last_run_at: string;
   last_result: string;
   skip_reason: string;
@@ -326,10 +335,12 @@ export interface AutoRefreshStatus {
 export interface AuthPoolStatus {
   running: boolean;
   queue_size: number;
+  logs: PoolPushLog[];
+  last_log_id: number;
 }
 
-export async function fetchAuthPoolStatus(): Promise<AuthPoolStatus> {
-  return request<AuthPoolStatus>("/api/pool/auth/status");
+export async function fetchAuthPoolStatus(afterLogId = 0): Promise<AuthPoolStatus> {
+  return request<AuthPoolStatus>(`/api/pool/auth/status?after=${Math.max(0, afterLogId)}`);
 }
 
 export async function fetchAutoRefreshStatus(afterLogId: number): Promise<AutoRefreshStatus> {
@@ -345,7 +356,9 @@ export interface PoolAuthResultItem {
   reason?: string;
 }
 
-export async function authPoolAccounts(ids: number[]): Promise<{ results: PoolAuthResultItem[] }> {
+export async function authPoolAccounts(
+  ids?: number[],
+): Promise<{ results: PoolAuthResultItem[] }> {
   return request<{ results: PoolAuthResultItem[] }>("/api/pool/auth", {
     method: "POST",
     body: JSON.stringify({ ids }),
@@ -422,4 +435,189 @@ export async function fetchPushTaskStatus(
 
 export async function cancelPushTask(): Promise<PoolPushTask> {
   return request<PoolPushTask>("/api/pool/push/cancel", { method: "POST" });
+}
+
+// ─── 网关运维（聚合快照）──────────────────────────────────────
+
+export interface GatewayChannel {
+  id: string;
+  title: string;
+  base_path: string;
+  client_base: string;
+  upstream: string;
+  key?: string;
+  select?: string;
+}
+
+export interface GatewayChannelStats {
+  requests: number;
+  failed: number;
+  tokens: number;
+}
+
+export interface GatewayAccountRow {
+  id: number;
+  email: string;
+  authed: boolean;
+  disabled: boolean;
+  requests_24h: number;
+}
+
+export interface GatewayOpsData {
+  uptime_sec: number;
+  generated_at: string;
+  channels: GatewayChannel[];
+  stats_24h: Record<string, GatewayChannelStats>;
+  account_pool: {
+    total: number;
+    authed: number;
+    disabled: number;
+    requests_24h: number;
+    accounts: GatewayAccountRow[];
+  };
+  config: {
+    proxy: string;
+    free_models: string[];
+    api_key: string;
+    auth_enabled: boolean;
+  };
+}
+
+export async function fetchGatewayOps(): Promise<GatewayOpsData> {
+  return request<GatewayOpsData>("/api/gateway/ops");
+}
+
+export interface GatewayProbe {
+  ok: boolean;
+  status: number;
+  ms: number;
+  models: number;
+  error: string;
+}
+
+export async function probeGateway(): Promise<GatewayProbe> {
+  return request<GatewayProbe>("/api/gateway/probe", {
+    method: "POST",
+    body: JSON.stringify({}),
+  });
+}
+
+// ─── 用量统计 ─────────────────────────────────────────────
+
+export interface UsageRow {
+  id: number;
+  ip: string | null;
+  client_ua: string | null;
+  endpoint: string;
+  model: string;
+  effort: string | null;
+  stream: number;
+  account_id: number | null;
+  account_email: string | null;
+  status: number;
+  reason: string | null;
+  prompt_tokens: number;
+  completion_tokens: number;
+  cache_tokens: number;
+  reasoning_tokens: number;
+  created_at: string;
+}
+
+export interface UsageSummary {
+  requests: number;
+  success: number;
+  failed: number;
+  stream_count: number;
+  prompt_tokens: number;
+  completion_tokens: number;
+  cache_tokens: number;
+  reasoning_tokens: number;
+  total_tokens: number;
+  success_rate: number;
+  cache_hit_rate: number;
+  reasoning_share: number;
+}
+
+export interface UsageByModel {
+  model: string;
+  requests: number;
+  success: number;
+  prompt_tokens: number;
+  completion_tokens: number;
+  cache_tokens: number;
+  reasoning_tokens: number;
+  total_tokens: number;
+}
+
+export interface UsageByDay {
+  day: string;
+  requests: number;
+  success: number;
+  total_tokens: number;
+}
+
+export interface UsageByHour {
+  hour: string;
+  requests: number;
+  success: number;
+  total_tokens: number;
+}
+
+export interface UsageSummaryData {
+  days: number;
+  from: string;
+  to: string;
+  summary: UsageSummary;
+  by_model: UsageByModel[];
+  by_day: UsageByDay[];
+  by_hour: UsageByHour[];
+}
+
+export interface UsageRecentData {
+  items: UsageRow[];
+  total: number;
+  offset: number;
+  limit: number;
+}
+
+export type UsageGroupDim = "account" | "model";
+
+export interface UsageGroupedRow {
+  key: string;
+  requests: number;
+  success: number;
+  failed: number;
+  prompt_tokens: number;
+  completion_tokens: number;
+  cache_tokens: number;
+  reasoning_tokens: number;
+  total_tokens: number;
+  stream_count: number;
+  last_at: string;
+}
+
+export interface UsageGroupedData {
+  dimension: UsageGroupDim;
+  items: UsageGroupedRow[];
+}
+
+export async function fetchUsageSummary(days = 1): Promise<UsageSummaryData> {
+  return request<UsageSummaryData>(`/api/usage?days=${Math.max(1, days)}`);
+}
+
+export async function fetchUsageRecent(
+  offset = 0,
+  limit = 20,
+): Promise<UsageRecentData> {
+  const params = new URLSearchParams({
+    offset: String(Math.max(0, offset)),
+    limit: String(Math.max(1, Math.min(limit, 100))),
+  });
+  return request<UsageRecentData>(`/api/usage/recent?${params.toString()}`);
+}
+
+export async function fetchUsageGrouped(
+  dimension: UsageGroupDim,
+): Promise<UsageGroupedData> {
+  return request<UsageGroupedData>(`/api/usage/grouped?dim=${dimension}`);
 }

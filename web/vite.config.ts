@@ -25,6 +25,14 @@ export default defineConfig({
         target: 'http://127.0.0.1:8787',
         changeOrigin: true,
       },
+      '/zen': {
+        target: 'http://127.0.0.1:8787',
+        changeOrigin: true,
+      },
+      '/grok': {
+        target: 'http://127.0.0.1:8787',
+        changeOrigin: true,
+      },
     },
   },
   build: {

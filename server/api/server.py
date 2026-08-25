@@ -1,5 +1,5 @@
 """
-管理 API 服务（注册 + 号池）。
+管理 API 服务（注册 + 号池 + OpenCode Zen 网关）。
 
 用法:
   uv run python main.py --serve [port]     # 默认 8787
@@ -12,6 +12,13 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
+from api.pool_jobs import (
+    auth_pool_state,
+    auto_refresher,
+    kick_auth_pool,
+    pool_job_manager,
+)
+from api.push import push_manager
 from core import config
 from core.config import API_HOST, API_PORT
 from core.logger import logger
@@ -20,11 +27,16 @@ from db import (
     get_pool_stats,
     init_db,
     query_accounts,
+    query_usage_grouped,
+    query_usage_recent,
+    query_usage_summary,
     soft_delete_accounts,
     update_account_status_by_ids,
 )
-from ops.pool_jobs import auth_pool_state, auto_refresher, kick_auth_pool, pool_job_manager
-from ops.push import push_manager
+from gateway.grok import proxy as grok_proxy
+from gateway.opencode import probe as gateway_probe
+from gateway.opencode import proxy as gateway_proxy
+from gateway.ops import ops_snapshot
 from workflow.jobs import manager
 
 _CORS_ORIGIN = "*"
@@ -74,7 +86,7 @@ def _send_json(handler: BaseHTTPRequestHandler, status: int, payload: Any) -> No
     handler.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
     handler.send_header(
         "Access-Control-Allow-Headers",
-        "Content-Type, Authorization, X-Api-Key",
+        "Content-Type, Authorization, X-Api-Key, X-Account-Id, HTTP-Referer, X-Title, OpenAI-Beta, anthropic-version, anthropic-beta, x-api-key",
     )
     handler.end_headers()
     handler.wfile.write(body)
@@ -98,6 +110,20 @@ def _handle_system_api(
         body = _json_body(handler)
         data = config.update_public_config(body if isinstance(body, dict) else {})
         _send_json(handler, 200, {"ok": True, "data": data})
+        return True
+    return False
+
+
+def _handle_gateway_api(
+    method: str, path: str, _query: dict[str, list[str]], handler: BaseHTTPRequestHandler
+) -> bool:
+    """网关管理面：聚合运维快照（单次拉取）+ Zen 上游探测。"""
+    if method == "GET" and path == "/api/gateway/ops":
+        _send_json(handler, 200, {"ok": True, "data": ops_snapshot()})
+        return True
+    if method == "POST" and path == "/api/gateway/probe":
+        _json_body(handler)  # 排空请求体，避免 keep-alive 把下一请求打成 501
+        _send_json(handler, 200, {"ok": True, "data": gateway_probe()})
         return True
     return False
 
@@ -169,20 +195,23 @@ def _handle_pool_accounts_api(
         if not isinstance(body, dict):
             _error_json(handler, 400, "请求体必须是 JSON 对象")
             return True
+        # ids 缺省或空数组 = 全量模式：仅处理未认证账号
         ids = body.get("ids")
-        if not _is_digit_id_list(ids, allow_empty=False):
-            _error_json(handler, 400, "ids 必须是非空数组")
+        if ids is not None and not _is_digit_id_list(ids, allow_empty=True):
+            _error_json(handler, 400, "ids 必须是数组")
             return True
         from db import add_to_auth_pool, get_auth_pool
         from workflow.oauth import _extract_sso_value
 
-        id_set = {int(i) for i in ids}
+        id_set = {int(i) for i in ids} if ids else None
         accounts = get_all_accounts()
+        # 按注册时间倒序执行（新注册的账号优先处理）
+        accounts.sort(key=lambda a: str(a.get("created_at") or ""), reverse=True)
         pool_emails = {e["email"] for e in get_auth_pool()}
         results: list[dict[str, Any]] = []
         started = False
         for acc in accounts:
-            if acc["id"] not in id_set:
+            if id_set is not None and acc["id"] not in id_set:
                 continue
             if acc.get("access_token"):
                 results.append({"id": acc["id"], "status": "skipped", "reason": "已认证，无需认证"})
@@ -217,11 +246,20 @@ def _handle_pool_accounts_api(
             )
             started = True
         if started:
-            logger.info(f"[认证] {len(ids)} 个账号入认证池，触发 SSO 自动认证")
+            logger.info(
+                f"[认证] {sum(1 for r in results if r['status'] == 'pending')} 个账号入认证池，触发 SSO 自动认证"
+            )
             kick_auth_pool()
+        # 日志聚合：全量模式可能数百条结果，逐个罗列会刷屏
+        pending_total = sum(1 for r in results if r["status"] == "pending")
+        skipped_total = sum(1 for r in results if r["status"] == "skipped")
+        failed_total = sum(1 for r in results if r["status"] == "failed")
+        detail = ", ".join(f"#{r['id']}={r['status']}" for r in results[:20])
+        if len(results) > 20:
+            detail += f" …（共 {len(results)} 个）"
         logger.info(
-            f"[认证] 发起认证 {len(ids)} 个: "
-            + ", ".join(f"#{r['id']}={r['status']}" for r in results)
+            f"[认证] 发起认证 {len(results)} 个："
+            f"待认证 {pending_total} · 跳过 {skipped_total} · 失败 {failed_total}  {detail}"
         )
         _send_json(handler, 200, {"ok": True, "data": {"results": results}})
         return True
@@ -246,20 +284,23 @@ def _handle_pool_operations_api(
             _error_json(handler, 400, "请求体必须是 JSON 对象")
             return True
         ids = body.get("ids")
+        # 空数组/缺省 = 全量模式：服务端筛选全部可巡检账号（已认证且非需重登）
         if ids is not None and not _is_digit_id_list(ids, allow_empty=True):
             _error_json(handler, 400, "ids 必须是数组")
             return True
-        if ids is None:
-            ids = []
         concurrency = _body_int(body, "concurrency", 20)
         try:
             data = pool_job_manager.start(
-                kind="inspect", account_ids=ids, concurrency=concurrency
+                kind="inspect",
+                account_ids=[int(i) for i in ids] if ids else [],
+                concurrency=concurrency,
             )
         except RuntimeError as exc:
             _error_json(handler, 400, str(exc))
             return True
-        logger.info(f"[巡检] 任务启动 账号数={len(ids) or '全部已认证'} task={data.get('id')}")
+        logger.info(
+            f"[巡检] 任务启动 账号数={len(ids) if ids else '全部符合条件'} task={data.get('id')}"
+        )
         _send_json(handler, 200, {"ok": True, "data": data})
         return True
     if method == "POST" and path == "/api/pool/status":
@@ -299,22 +340,23 @@ def _handle_pool_push_api(
             _error_json(handler, 400, "targets 必须是非空的 ['g2a'|'cpa'] 数组")
             return True
         ids = body.get("ids")
+        # 空数组/缺省 = 全量模式：服务端预筛仅保留已认证且状态正常账号
         if ids is not None and not _is_digit_id_list(ids, allow_empty=True):
             _error_json(handler, 400, "ids 必须是数组")
             return True
-        if ids is None:
-            ids = []
         concurrency = _body_int(body, "concurrency", 20)
         try:
             data = push_manager.start(
-                targets=targets, account_ids=ids, concurrency=concurrency
+                targets=targets,
+                account_ids=[int(i) for i in ids] if ids else [],
+                concurrency=concurrency,
             )
         except RuntimeError as exc:
             _error_json(handler, 400, str(exc))
             return True
         labels = "、".join("G2A" if t == "g2a" else "CPA" for t in targets)
         logger.info(
-            f"[推送] 任务启动 targets=[{labels}] 账号数={len(ids) or '全部'} "
+            f"[推送] 任务启动 targets=[{labels}] 账号数={len(ids) if ids else '全部符合条件'} "
             f"task={data.get('id')}"
         )
         _send_json(handler, 200, {"ok": True, "data": data})
@@ -357,20 +399,23 @@ def _handle_pool_maintenance_api(
             _error_json(handler, 400, "请求体必须是 JSON 对象")
             return True
         ids = body.get("ids")
-        if not _is_digit_id_list(ids, allow_empty=False):
-            _error_json(handler, 400, "ids 必须是非空数组")
+        # 空数组/缺省 = 全量模式：服务端仅处理需重登(2)状态的账号
+        if ids is not None and not _is_digit_id_list(ids, allow_empty=True):
+            _error_json(handler, 400, "ids 必须是数组")
             return True
         concurrency = _body_int(body, "concurrency", 5)
         try:
             data = pool_job_manager.start(
                 kind="reauth",
-                account_ids=[int(i) for i in ids],
+                account_ids=[int(i) for i in ids] if ids else [],
                 concurrency=concurrency,
             )
         except RuntimeError as exc:
             _error_json(handler, 400, str(exc))
             return True
-        logger.info(f"[重登] 任务启动 账号数={len(ids)} task={data.get('id')}")
+        logger.info(
+            f"[重登] 任务启动 账号数={len(ids) if ids else '全部符合条件'} task={data.get('id')}"
+        )
         _send_json(handler, 200, {"ok": True, "data": data})
         return True
     if method == "POST" and path == "/api/pool/risk":
@@ -393,11 +438,57 @@ def _handle_pool_maintenance_api(
         _send_json(handler, 200, {"ok": True, "data": data})
         return True
     if method == "GET" and path == "/api/pool/auth/status":
-        _send_json(handler, 200, {"ok": True, "data": auth_pool_state()})
+        after = _after_log_id(query)
+        _send_json(
+            handler, 200, {"ok": True, "data": auth_pool_state(after_log_id=after)}
+        )
         return True
     if method == "GET" and path == "/api/pool/auto-refresh":
         after = _after_log_id(query)
         _send_json(handler, 200, {"ok": True, "data": auto_refresher.state(after_log_id=after)})
+        return True
+    return False
+
+
+def _handle_usage_api(
+    method: str, path: str, query: dict[str, list[str]], handler: BaseHTTPRequestHandler
+) -> bool:
+    """用量统计：窗口聚合 + 分组维度（账号/模型）+ 最近明细分页。"""
+    if method == "GET" and path == "/api/usage":
+        try:
+            days = int(query.get("days", ["1"])[0] or "1")
+        except (TypeError, ValueError):
+            days = 1
+        _send_json(handler, 200, {"ok": True, "data": query_usage_summary(days)})
+        return True
+    if method == "GET" and path == "/api/usage/grouped":
+        dimension = str(query.get("dim", [""])[0] or "").strip()
+        if dimension not in ("account", "model"):
+            _error_json(handler, 400, "dim 仅支持 account / model")
+            return True
+        try:
+            _send_json(
+                handler,
+                200,
+                {"ok": True, "data": query_usage_grouped(dimension=dimension)},
+            )
+        except ValueError as exc:
+            _error_json(handler, 400, str(exc))
+        return True
+    if method == "GET" and path == "/api/usage/recent":
+        try:
+            offset = int(query.get("offset", ["0"])[0] or "0")
+        except (TypeError, ValueError):
+            offset = 0
+        try:
+            limit = int(query.get("limit", ["20"])[0] or "20")
+        except (TypeError, ValueError):
+            limit = 20
+        _send_json(
+            handler,
+            200,
+            {"ok": True, "data": query_usage_recent(offset=offset, limit=limit)},
+        )
         return True
     return False
 
@@ -407,11 +498,13 @@ def _handle_api(
 ) -> bool:
     for route_handler in (
         _handle_system_api,
+        _handle_gateway_api,
         _handle_register_api,
         _handle_pool_accounts_api,
         _handle_pool_operations_api,
         _handle_pool_push_api,
         _handle_pool_maintenance_api,
+        _handle_usage_api,
     ):
         if route_handler(method, path, query, handler):
             return True
@@ -434,8 +527,14 @@ class _ApiHandler(BaseHTTPRequestHandler):
     def do_OPTIONS(self) -> None:
         self.send_response(204)
         self.send_header("Access-Control-Allow-Origin", _CORS_ORIGIN)
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Api-Key")
+        self.send_header(
+            "Access-Control-Allow-Methods",
+            "GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS",
+        )
+        self.send_header(
+            "Access-Control-Allow-Headers",
+            "Content-Type, Authorization, X-Api-Key, X-Account-Id, HTTP-Referer, X-Title, OpenAI-Beta, anthropic-version, anthropic-beta, x-api-key",
+        )
         self.send_header("Content-Length", "0")
         self.end_headers()
 
@@ -451,11 +550,23 @@ class _ApiHandler(BaseHTTPRequestHandler):
     def do_DELETE(self) -> None:
         self._dispatch("DELETE")
 
+    def do_PATCH(self) -> None:
+        self._dispatch("PATCH")
+
+    def do_HEAD(self) -> None:
+        self._dispatch("HEAD")
+
     def _dispatch(self, method: str) -> None:
         parsed = urlparse(self.path)
         path = parsed.path.rstrip("/") or "/"
         query = parse_qs(parsed.query)
         try:
+            if path == "/zen/v1" or path.startswith("/zen/v1/"):
+                gateway_proxy(self, method, path)
+                return
+            if path == "/grok/v1" or path.startswith("/grok/v1/"):
+                grok_proxy(self, method, path)
+                return
             if _handle_api(method, path, query, self):
                 return
         except ValueError as e:
@@ -483,7 +594,9 @@ def serve(host: str | None = None, port: int | None = None) -> None:
     server.daemon_threads = True
     auto_refresher.start()
     logger.success(f"[API] 服务启动: http://{bind_host}:{bind_port}")
-    logger.info("[API] 路由: /api/* （注册 / 号池）")
+    logger.info(
+        "[API] 路由: /api/* （注册 / 号池 / 网关运维）  /zen/v1/* （Zen）  /grok/v1/* （号池 Grok）"
+    )
     try:
         server.serve_forever()
     except KeyboardInterrupt:

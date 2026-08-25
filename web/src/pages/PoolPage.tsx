@@ -97,16 +97,27 @@ import { toast } from "sonner";
 /** 刷新按钮旋转动效保底时长（本地请求过快时旋转至少可见） */
 const MIN_SPIN_MS = 450;
 
+/** 日志中的邮箱脱敏，账号表仍保留完整邮箱供管理操作。 */
+function maskLogEmail(value: string): string {
+  const [local = "", domain = ""] = value.split("@", 2);
+  if (!domain) return value;
+  const [domainName = "", ...suffix] = domain.split(".");
+  const maskedLocal = local ? `${local.slice(0, 2)}***` : "***";
+  const maskedDomain = domainName ? `${domainName.slice(0, 1)}***` : "***";
+  return `${maskedLocal}@${maskedDomain}${suffix.length ? `.${suffix.join(".")}` : ""}`;
+}
+
 export function PoolPage() {
   const [config, setConfig] = useState<AppConfig | null>(null);
   // ── 以下状态走页面缓存：路由切走再回来，数据/筛选/页码保留，秒开 + 静默刷新 ──
-  const [stats, setStats] = usePageCache<PoolStats>("pool.stats", () => ({ total: 0, active: 0, pending_action: 0, abnormal: 0 }));
+  const [stats, setStats] = usePageCache<PoolStats>("pool.stats", () => ({
+    total: 0,
+    active: 0,
+    pending_action: 0,
+    abnormal: 0,
+    task_counts: { push: 0, auth: 0, reauth: 0, inspect: 0 },
+  }));
   const [accounts, setAccounts] = usePageCache<PoolAccount[]>("pool.accounts", () => []);
-  // accounts 的 ref：供认证轮询等 useCallback 闭包读取最新账号列表
-  const accountsRef = useRef<PoolAccount[]>([]);
-  useEffect(() => {
-    accountsRef.current = accounts;
-  }, [accounts]);
   const [total, setTotal] = usePageCache("pool.total", () => 0);
   const [loading, setLoading] = useState(false);
   const [page, setPage] = usePageCache("pool.page", () => 1);
@@ -124,6 +135,12 @@ export function PoolPage() {
   const [visiblePasswords, setVisiblePasswords] = useState<Set<number>>(new Set());
   const [deleteOpen, setDeleteOpen] = useState(false);
   const [pushDialogOpen, setPushDialogOpen] = useState(false);
+  // 任务二次确认：推送 / 认证 / 巡检 / 重登执行前弹窗复核
+  const [confirmTask, setConfirmTask] = useState<{
+    kind: "auth" | "reauth" | "inspect" | "push";
+    scope: string;
+    detail: string;
+  } | null>(null);
   const [detailAccount, setDetailAccount] = useState<PoolAccount | null>(null);
   // 详情弹窗独立的密码可见性，避免与列表 visiblePasswords 共享导致联动
   const [detailPasswordVisible, setDetailPasswordVisible] = useState(false);
@@ -142,6 +159,7 @@ export function PoolPage() {
   const poolAfterRef = useRef(0);
   // 认证轮询：发起认证后短期轮询账号状态，确认 Token 是否交换成功
   const authPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const authAfterRef = useRef(0);
   const keywordTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   // 列表请求序号：竞态保护（搜索/筛选/翻页快速切换时丢弃过期响应）
   const reqSeqRef = useRef(0);
@@ -204,14 +222,24 @@ export function PoolPage() {
     }
   }, [appendLogs]);
 
-  /** 账号 id → 展示名（邮箱优先，缺省回退 ID） */
+  /** 账号 id → 日志展示名（邮箱优先，缺省回退 ID） */
   const accountLabel = useCallback(
     (id: number): string => {
       const acc = accounts.find((a) => a.id === id);
-      return acc ? acc.email : `ID ${id}`;
+      return acc ? maskLogEmail(acc.email) : `ID ${id}`;
     },
     [accounts],
   );
+
+  /** 记录认证日志基线；状态接口暂时不可用时不阻断认证请求。 */
+  const prepareAuthLogCursor = useCallback(async () => {
+    try {
+      const baseline = await fetchAuthPoolStatus(0);
+      authAfterRef.current = baseline.last_log_id;
+    } catch {
+      authAfterRef.current = 0;
+    }
+  }, []);
 
   useEffect(() => {
     let alive = true;
@@ -314,7 +342,7 @@ export function PoolPage() {
     (taskId: string) => {
       stopPushPolling();
       let requestInFlight = false;
-      pushPollRef.current = setInterval(async () => {
+      const tick = async () => {
         if (requestInFlight) return;
         requestInFlight = true;
         try {
@@ -352,7 +380,9 @@ export function PoolPage() {
         } finally {
           requestInFlight = false;
         }
-      }, 3000);
+      };
+      pushPollRef.current = setInterval(() => void tick(), 1000);
+      void tick();
     },
     [appendLogs, load, settleTask, stopPushPolling],
   );
@@ -416,23 +446,11 @@ export function PoolPage() {
     return null;
   })();
 
-  /**
-   * 认证状态轮询：发起认证后每 3 秒查询账号状态（has_token / status），
-   * 直到所有账号出结果为止。无次数上限：后端单账号 Token 交换有 120s
-   * 硬截止（_POLL_DEADLINE），失败必被标记需重登，不会无限未决。
-   * 轮询期间保持 inspecting=true，使「停止认证」按钮可用。
-   */
+  /** 认证任务轮询：按后端日志游标增量拉取，单账号完成后立即显示结果。 */
   const startAuthPolling = useCallback(
-    (ids: number[], labels: Record<number, string>) => {
+    () => {
       stopAuthPolling();
-      if (!ids.length) {
-        setInspecting(false);
-        return;
-      }
       setInspecting(true);
-      const pending = new Set(ids);
-      // 轮数计数：仅用于失败判定缓冲（至少 2 轮再判失败，避开交换完成前的瞬态）
-      let ticks = 0;
       let requestInFlight = false;
 
       const finishAuth = () => {
@@ -440,53 +458,35 @@ export function PoolPage() {
         setInspecting(false);
       };
 
-      authPollRef.current = setInterval(async () => {
+      const tick = async () => {
         if (requestInFlight) return;
         requestInFlight = true;
-        ticks += 1;
         try {
-          await load(true);
-          for (const id of [...pending]) {
-            const acc = accountsRef.current.find((a) => a.id === id);
-            const label = labels[id] ?? `ID ${id}`;
-            if (acc && acc.has_token) {
-              appendLogs([
-                {
-                  type: "auth",
-                  level: "SUCCESS",
-                  message: `认证成功: ${label} Token 已入库`,
-                },
-              ]);
-              pending.delete(id);
-              continue;
-            }
-            // status 被后端标记为需重登（2）或禁用（6）且无 token → 交换失败
-            if (
-              acc &&
-              !acc.has_token &&
-              (acc.status === 2 || acc.status === 6) &&
-              ticks >= 2
-            ) {
-              appendLogs([
-                {
-                  type: "auth",
-                  level: "ERROR",
-                  message: `认证失败: ${label} — ${acc.reason || "Token 交换未成功"}`,
-                },
-              ]);
-              pending.delete(id);
-            }
+          const snap = await fetchAuthPoolStatus(authAfterRef.current);
+          authAfterRef.current = snap.last_log_id;
+          if (snap.logs.length > 0) {
+            appendLogs(
+              snap.logs.map((log) => ({
+                type: "auth" as const,
+                level: log.level as PoolLogEntry["level"],
+                message: log.message,
+              })),
+            );
           }
-          if (pending.size === 0) {
+          if (snap.logs.length > 0 || !snap.running) {
+            await load(true);
+          }
+          if (!snap.running) {
             finishAuth();
-            return;
           }
         } catch {
           // 轮询异常忽略，继续等待
         } finally {
           requestInFlight = false;
         }
-      }, 3000);
+      };
+      authPollRef.current = setInterval(() => void tick(), 1000);
+      void tick();
     },
     [appendLogs, load, stopAuthPolling],
   );
@@ -504,28 +504,35 @@ export function PoolPage() {
     return "巡检";
   };
 
+  /** 合并号池任务接口返回的首批/增量日志。 */
+  const appendPoolTaskLogs = useCallback(
+    (task: PoolOpTask, kind: PoolOpKind) => {
+      if (task.logs.length === 0) return;
+      const logType = poolLogType(kind);
+      appendLogs(
+        task.logs.map((log) => ({
+          type: logType,
+          level: log.level as PoolLogEntry["level"],
+          message: log.message,
+        })),
+      );
+    },
+    [appendLogs],
+  );
+
   /** 巡检/重登/风控任务轮询：增量日志 + 待授权账号弹窗，任务结束收尾 */
   const startPoolPolling = useCallback(
     (taskId: string, kind: PoolOpKind) => {
       stopPoolPolling();
-      const logType = poolLogType(kind);
       let requestInFlight = false;
-      poolPollRef.current = setInterval(async () => {
+      const tick = async () => {
         if (requestInFlight) return;
         requestInFlight = true;
         try {
           const snap = await fetchPoolOpTaskStatus(taskId, poolAfterRef.current);
           poolAfterRef.current = snap.last_log_id;
-          if (snap.logs.length > 0) {
-            appendLogs(
-              snap.logs.map((log) => ({
-                type: logType,
-                level: log.level as PoolLogEntry["level"],
-                message: log.message,
-              })),
-            );
-          }
-          // 重登降级账号已入认证池，后台 SSO 自动认证，进展由任务日志呈现
+          appendPoolTaskLogs(snap, kind);
+          // 重登降级的 SSO 重新认证在任务内直接执行，进展由任务日志呈现
           setPoolTask(snap);
           if (snap.status === "done" || snap.status === "cancelled") {
             stopPoolPolling();
@@ -540,7 +547,7 @@ export function PoolPage() {
           stopPoolPolling();
           appendLogs([
             {
-              type: logType,
+              type: poolLogType(kind),
               level: "ERROR",
               message: `[任务] ${poolKindLabel(kind)}轮询失败：${
                 error instanceof Error ? error.message : String(error)
@@ -551,9 +558,11 @@ export function PoolPage() {
         } finally {
           requestInFlight = false;
         }
-      }, 3000);
+      };
+      poolPollRef.current = setInterval(() => void tick(), 1000);
+      void tick();
     },
-    [appendLogs, load, settleTask, stopPoolPolling],
+    [appendLogs, appendPoolTaskLogs, load, settleTask, stopPoolPolling],
   );
 
   /** 取消巡检/重登/风控任务 */
@@ -583,7 +592,7 @@ export function PoolPage() {
     load();
   }, [load]);
 
-  // 自动续期 daemon 轮询 effect（增量日志 + 进度，常驻 5s；声明见组件顶部）
+  // 自动续期 daemon 轮询 effect（增量日志 + 进度，常驻 1s；声明见组件顶部）
 
   // 组件卸载：停止任务轮询、进度条保留定时器与尚未触发的搜索防抖回调
   useEffect(() => {
@@ -596,7 +605,7 @@ export function PoolPage() {
     };
   }, [stopPoolPolling, stopPushPolling, stopAuthPolling]);
 
-  /** 自动续期轮询：常驻 3s，增量拉取扫描日志；轮询失败静默（服务重启等瞬态） */
+  /** 自动续期轮询：常驻 1s，增量拉取扫描日志；轮询失败静默（服务重启等瞬态） */
   useEffect(() => {
     let stopped = false;
     let inFlight = false;
@@ -624,7 +633,7 @@ export function PoolPage() {
       }
     };
     void tick();
-    const timer = setInterval(tick, 3000);
+    const timer = setInterval(tick, 1000);
     return () => {
       stopped = true;
       clearInterval(timer);
@@ -634,8 +643,13 @@ export function PoolPage() {
   /**
    * 页面刷新恢复执行中的后台任务：服务端快照免 taskId，日志按 last_log_id 续拉。
    * push / 巡检 / 重登 / 风控完整恢复进度条与日志；自动认证池无任务快照，仅提示。
+   * 仅挂载后执行一次：依赖里的轮询函数随 load（分页等）变化，若不拦截会导致
+   * 每次分页都重跑恢复并重复弹出日志抽屉。
    */
+  const taskRecoveredRef = useRef(false);
   useEffect(() => {
+    if (taskRecoveredRef.current) return;
+    taskRecoveredRef.current = true;
     let cancelled = false;
     (async () => {
       // 推送任务
@@ -699,7 +713,17 @@ export function PoolPage() {
       }
       // 自动认证池后台消化（无任务快照，仅提示刷新后仍在进行）
       try {
-        const authSnap = await fetchAuthPoolStatus();
+        const authSnap = await fetchAuthPoolStatus(0);
+        authAfterRef.current = authSnap.last_log_id;
+        if (!cancelled && authSnap.running && authSnap.logs.length > 0) {
+          appendLogs(
+            authSnap.logs.map((log) => ({
+              type: "auth" as const,
+              level: log.level as PoolLogEntry["level"],
+              message: log.message,
+            })),
+          );
+        }
         if (!cancelled && authSnap.running) {
           setLogOpen(true);
           appendLogs([
@@ -709,6 +733,7 @@ export function PoolPage() {
               message: `检测到后台自动认证进行中（队列 ${authSnap.queue_size}），Token 交换完成后账号列表自动更新`,
             },
           ]);
+          startAuthPolling();
         }
       } catch {
         // 静默
@@ -717,7 +742,7 @@ export function PoolPage() {
     return () => {
       cancelled = true;
     };
-  }, [appendLogs, settleTask, startPoolPolling, startPushPolling]);
+  }, [appendLogs, settleTask, startAuthPolling, startPoolPolling, startPushPolling]);
 
   const onKeywordChange = (val: string) => {
     // 输入即时回显；防抖 400ms 后将值提交为查询关键词（依赖驱动重新加载），
@@ -822,6 +847,7 @@ export function PoolPage() {
       if (action === "auth") {
         openLogDrawer();
         setInspecting(true);
+        await prepareAuthLogCursor();
         const res = await authPoolAccounts([id]);
         const r = res.results[0];
         if (r && r.status === "pending") {
@@ -832,7 +858,7 @@ export function PoolPage() {
               message: `[认证] ${label}  正在交换 Token`,
             },
           ]);
-          startAuthPolling([id], { [id]: label });
+          startAuthPolling();
           authPollingStarted = true;
         } else if (r) {
           appendLogs([
@@ -851,6 +877,7 @@ export function PoolPage() {
         openLogDrawer();
         const task = await reauthPoolAccounts([id]);
         setPoolTask(task);
+        appendPoolTaskLogs(task, "reauth");
         poolAfterRef.current = task.last_log_id;
         if (task.id) {
           startPoolPolling(task.id, "reauth");
@@ -859,6 +886,7 @@ export function PoolPage() {
         openLogDrawer();
         const task = await riskPoolAccount(id);
         setPoolTask(task);
+        appendPoolTaskLogs(task, "risk");
         poolAfterRef.current = task.last_log_id;
         if (task.id) {
           startPoolPolling(task.id, "risk");
@@ -906,40 +934,17 @@ export function PoolPage() {
   const handleInspect = async () => {
     if (runningTask) return;
     setInspecting(true);
-    const authedIds =
-      selected.size > 0
-        ? accounts.filter((a) => a.has_token && selected.has(a.id)).map((a) => a.id)
-        : [];
+    // 勾选→仅选中账号（未认证/需重登由服务端跳过）；未勾选→服务端全量筛选
+    const ids = selected.size > 0 ? [...selected] : undefined;
 
-    // 勾选了账号但全部未认证 → 不执行
-    if (selected.size > 0 && authedIds.length === 0) {
-      openLogDrawer();
-      appendLogs([
-        {
-          type: "inspect",
-          level: "WARNING",
-          message: "[巡检] 选中账号均未认证，已跳过",
-        },
-      ]);
-      setInspecting(false);
-      return;
-    }
-
-    // 必须先 openLogDrawer（清空旧日志）再 append，否则启动日志会被清掉
     openLogDrawer();
-    appendLogs([
-      {
-        type: "inspect",
-        level: "INFO",
-        message: `[任务] 巡检开始  ${authedIds.length > 0 ? `选中 ${authedIds.length}` : "全部已认证"} / 并发 ${Number(concurrencyRef.current?.value) || 20}`,
-      },
-    ]);
     try {
       const task = await inspectPoolAccounts(
-        authedIds.length > 0 ? authedIds : undefined,
+        ids,
         Number(concurrencyRef.current?.value) || undefined,
       );
       setPoolTask(task);
+      appendPoolTaskLogs(task, "inspect");
       poolAfterRef.current = task.last_log_id;
       if (task.id) {
         startPoolPolling(task.id, "inspect");
@@ -961,26 +966,8 @@ export function PoolPage() {
   const handleBatchReauth = async () => {
     if (runningTask) return;
     setInspecting(true);
-    // 与单行重登一致：状态 2/4/5 即可，不强制 has_token（无 token 走设备授权降级）
-    const ids = accounts
-      .filter(
-        (a) =>
-          (selected.size === 0 || selected.has(a.id)) &&
-          [2, 4, 5].includes(a.status),
-      )
-      .map((a) => a.id);
-    if (ids.length === 0) {
-      openLogDrawer();
-      appendLogs([
-        {
-          type: "reauth",
-          level: "WARNING",
-          message: "[重登] 无待重登账号，已跳过",
-        },
-      ]);
-      setInspecting(false);
-      return;
-    }
+    // 勾选→仅选中账号；未勾选→服务端全量筛选需重登(2)账号
+    const ids = selected.size > 0 ? [...selected] : undefined;
     openLogDrawer();
     try {
       const task = await reauthPoolAccounts(
@@ -988,6 +975,7 @@ export function PoolPage() {
         Number(concurrencyRef.current?.value) || undefined,
       );
       setPoolTask(task);
+      appendPoolTaskLogs(task, "reauth");
       poolAfterRef.current = task.last_log_id;
       if (task.id) {
         startPoolPolling(task.id, "reauth");
@@ -1015,30 +1003,27 @@ export function PoolPage() {
       ]);
       return;
     }
-    if (runningTask || selected.size === 0) return;
+    if (runningTask) return;
     setInspecting(true);
-    const ids = accounts
-      .filter((a) => !a.has_token && selected.has(a.id))
-      .map((a) => a.id);
-    if (ids.length === 0) {
-      openLogDrawer();
-      appendLogs([
-        {
-          type: "auth",
-          level: "WARNING",
-          message: "[认证] 选中账号均已认证，已跳过",
-        },
-      ]);
-      setInspecting(false);
-      return;
-    }
+    // 勾选→仅选中账号（已认证由服务端跳过）；未勾选→服务端全量筛选未认证账号
+    const ids = selected.size > 0 ? [...selected] : undefined;
     openLogDrawer();
     let authPollingStarted = false;
     try {
+      await prepareAuthLogCursor();
       const res = await authPoolAccounts(ids);
       const results = res.results ?? [];
       const pending = results.filter((r) => r.status === "pending");
-      const rows: PoolLogInput[] = results.map((r): PoolLogInput => {
+      // 已认证跳过折叠为一条摘要，避免全量模式下逐账号刷屏
+      const skippedAuthed = results.filter(
+        (r) => r.status === "skipped" && r.reason === "已认证，无需认证",
+      );
+      const rest = results.filter(
+        (r) =>
+          r.status !== "pending" &&
+          !(r.status === "skipped" && r.reason === "已认证，无需认证"),
+      );
+      const rows: PoolLogInput[] = rest.map((r): PoolLogInput => {
         const label = accountLabel(r.id);
         if (r.status === "pending") {
           return {
@@ -1047,23 +1032,29 @@ export function PoolPage() {
             message: `[认证] ${label}  正在交换 Token`,
           };
         }
-        const ok = r.status === "skipped" && r.reason === "已认证，无需认证";
         return {
           type: "auth",
-          level: ok ? "SUCCESS" : r.status === "skipped" ? "WARNING" : "ERROR",
-          message: ok
-            ? `[认证] ${label}  ${r.reason}`
-            : `[认证] ${label}  ${r.reason || "未发起"}`,
+          level: r.status === "skipped" ? "WARNING" : "ERROR",
+          message: `[认证] ${label}  ${r.reason || "未发起"}`,
         };
       });
+      if (skippedAuthed.length > 0) {
+        rows.unshift({
+          type: "auth",
+          level: "SUCCESS",
+          message: `[认证] ${skippedAuthed.length} 个账号已认证，自动跳过`,
+        });
+      }
+      if (pending.length > 0) {
+        rows.push({
+          type: "auth",
+          level: "INFO",
+          message: `[认证] 已提交 ${pending.length} 个账号，等待 Token 交换`,
+        });
+      }
       appendLogs(rows);
       if (pending.length > 0) {
-        const labels: Record<number, string> = {};
-        for (const r of pending) labels[r.id] = accountLabel(r.id);
-        startAuthPolling(
-          pending.map((r) => r.id),
-          labels,
-        );
+        startAuthPolling();
         authPollingStarted = true;
       }
       void load(true);
@@ -1103,6 +1094,8 @@ export function PoolPage() {
 
   /** 发起推送：异步任务 + 增量日志轮询；服务端预筛未认证/状态非正常账号 */
   const handleStartPush = async () => {
+    // 勾选→仅推送选中；未勾选→服务端全量筛选已认证且状态正常账号
+    const ids = selected.size > 0 ? [...selected] : undefined;
     const targets: Array<"g2a" | "cpa"> = [];
     if (g2aConfigured) targets.push("g2a");
     if (cpaConfigured) targets.push("cpa");
@@ -1113,7 +1106,7 @@ export function PoolPage() {
       const concurrency = Math.min(20, Math.max(1, Number(raw) || 20));
       const task = await pushPoolAccounts(
         targets,
-        selected.size > 0 ? [...selected] : undefined,
+        ids,
         concurrency,
       );
       pushAfterRef.current = task.last_log_id;
@@ -1148,10 +1141,57 @@ export function PoolPage() {
   const cpaConfigured = Boolean(config?.cpa_base_url);
   const anyPushTarget = g2aConfigured || cpaConfigured;
 
-  /** 勾选中是否存在可推送账号（已认证且状态正常）；未勾选视为可推送 */
-  const hasPushableSelected =
-    selected.size === 0 ||
-    accounts.some((a) => a.has_token && a.status === 1 && selected.has(a.id));
+  /**
+   * 打开任务二次确认弹窗：按任务类型与勾选态计算影响面文案。
+   * 勾选 → 精确操作选中集合；未勾选 → 全量模式，由服务端按任务资格全库筛选
+   * （数量取 /api/pool/stats 的 task_counts 全库统计，避免受当前分页影响）。
+   */
+  const openTaskConfirm = (kind: "auth" | "reauth" | "inspect" | "push") => {
+    const picked = selected.size > 0;
+    let scope: string;
+    if (picked) {
+      scope = `选中的 ${selected.size} 个账号`;
+    } else if (stats.task_counts) {
+      // 全量模式：数量取服务端全库统计（避免受当前分页影响）
+      const count = stats.task_counts[kind] ?? 0;
+      if (count === 0) {
+        const reason: Record<typeof kind, string> = {
+          auth: "当前没有未认证的账号",
+          reauth: "当前没有需重登状态的账号",
+          inspect: "当前没有可巡检的账号（已认证且非需重登）",
+          push: "当前没有可推送的账号（已认证且状态正常）",
+        };
+        toast.warning(reason[kind]);
+        return;
+      }
+      scope = `全部符合条件的 ${count} 个账号`;
+    } else {
+      // 统计未加载完成：不误报，交由服务端筛选
+      scope = "全部符合条件的账号";
+    }
+    const detail: Record<typeof kind, string> = {
+      auth: "将对账号发起 SSO 认证并交换 Token，未认证账号才会被处理。",
+      reauth: "将刷新账号登录态；无刷新凭据或刷新被拒时，任务内直接发起 SSO 重新认证。",
+      inspect: "将逐个探活上游并回写风控状态与到期时间，产生真实上游请求。",
+      push: `将把账号同步到 ${[
+        g2aConfigured ? "G2A" : null,
+        cpaConfigured ? "CPA" : null,
+      ]
+        .filter(Boolean)
+        .join(" / ")}，外部系统将创建对应记录。`,
+    };
+    setConfirmTask({ kind, scope, detail: detail[kind] });
+  };
+
+  /** 确认后分发到对应任务 handler（弹窗先关，避免叠层） */
+  const runConfirmedTask = () => {
+    const kind = confirmTask?.kind;
+    setConfirmTask(null);
+    if (kind === "auth") void handleBatchAuth();
+    else if (kind === "reauth") void handleBatchReauth();
+    else if (kind === "inspect") void handleInspect();
+    else if (kind === "push") void handleStartPush();
+  };
 
   return (
     <div className="page-stack pool-page deck-pool">
@@ -1309,19 +1349,13 @@ export function PoolPage() {
               <Button
                 size="sm"
                 variant="outline"
-                disabled={
-                  runningTask !== null || !anyPushTarget || !hasPushableSelected
-                }
+                disabled={runningTask !== null}
                 title={
                   runningTask
                     ? "任务执行中，请先停止"
-                    : !anyPushTarget
-                      ? "请先在「注册页 → 推送目标设置」中配置目标"
-                      : !hasPushableSelected
-                        ? "选中账号均未认证或状态非正常，禁止推送"
-                        : selected.size > 0
-                          ? "推送选中账号（仅已认证且状态正常，其余跳过）"
-                          : "推送全部已认证且状态正常的账号"
+                    : selected.size > 0
+                      ? "推送选中账号（仅已认证且状态正常，其余跳过）"
+                      : "未勾选：推送全部已认证且状态正常的账号"
                 }
                 onClick={() => setPushDialogOpen(true)}
               >
@@ -1358,25 +1392,15 @@ export function PoolPage() {
               <Button
                 size="sm"
                 variant="secondary"
-                disabled={
-                  runningTask !== null ||
-                  selected.size === 0 ||
-                  !accounts.some(
-                    (a) => !a.has_token && selected.has(a.id),
-                  )
-                }
+                disabled={runningTask !== null}
                 title={
                   runningTask
                     ? "任务执行中，请先停止"
-                    : selected.size === 0
-                      ? "请先勾选账号"
-                      : !accounts.some(
-                            (a) => !a.has_token && selected.has(a.id),
-                          )
-                        ? "选中账号均已认证"
-                        : "对选中账号执行认证"
+                    : selected.size > 0
+                      ? "对选中账号执行认证（已认证自动跳过）"
+                      : "未勾选：认证全部未认证账号"
                 }
-                onClick={() => void handleBatchAuth()}
+                onClick={() => openTaskConfirm("auth")}
               >
                 <ShieldCheck className="size-3.5" />
                 认证
@@ -1384,26 +1408,15 @@ export function PoolPage() {
               <Button
                 size="sm"
                 variant="secondary"
-                disabled={
-                  runningTask !== null ||
-                  !accounts.some(
-                    (a) =>
-                      [2, 4, 5].includes(a.status) &&
-                      (selected.size === 0 || selected.has(a.id)),
-                  )
-                }
+                disabled={runningTask !== null}
                 title={
                   runningTask
                     ? "任务执行中，请先停止"
-                    : !accounts.some(
-                          (a) =>
-                            [2, 4, 5].includes(a.status) &&
-                            (selected.size === 0 || selected.has(a.id)),
-                        )
-                      ? "没有待重登的账号"
-                      : "对需重登 / 限额 / 异常账号刷新登录"
+                    : selected.size > 0
+                      ? "对选中账号刷新登录"
+                      : "未勾选：重登全部需重登状态的账号"
                 }
-                onClick={handleBatchReauth}
+                onClick={() => openTaskConfirm("reauth")}
               >
                 <LogIn className="size-3.5" />
                 重登
@@ -1411,11 +1424,6 @@ export function PoolPage() {
               <Button
                 size="sm"
                 variant={runningTask ? "destructive" : "default"}
-                disabled={
-                  !runningTask &&
-                  selected.size > 0 &&
-                  !accounts.some((a) => a.has_token && selected.has(a.id))
-                }
                 title={
                   runningTask
                     ? `停止${
@@ -1429,19 +1437,14 @@ export function PoolPage() {
                                 ? "风控"
                                 : "巡检"
                       }任务`
-                    : selected.size > 0 &&
-                        !accounts.some(
-                          (a) => a.has_token && selected.has(a.id),
-                        )
-                      ? "选中账号均未认证，无法巡检"
-                      : selected.size > 0
-                        ? "巡检探活选中已认证账号"
-                        : "巡检探活全部已认证账号"
+                    : selected.size > 0
+                      ? "巡检探活选中账号（未认证自动跳过）"
+                      : "未勾选：巡检全部可探活账号（排除需重登）"
                 }
                 onClick={
                   runningTask
                     ? handleStopRunning
-                    : () => void handleInspect()
+                    : () => openTaskConfirm("inspect")
                 }
               >
                 {runningTask ? (
@@ -1627,7 +1630,7 @@ export function PoolPage() {
           <DialogHeader>
             <DialogTitle>推送账号</DialogTitle>
             <DialogDescription>
-              将已认证账号同步到所选目标。后台并发执行，进度与巡检探活一致。目标连接信息在「注册页 → 推送目标设置」中配置。
+              将已认证账号同步到所选目标；未勾选账号时推送全部已认证且状态正常的账号。后台并发执行，进度与巡检探活一致。目标连接信息在「注册页 → 推送目标设置」中配置。
             </DialogDescription>
           </DialogHeader>
           <div className="push-target-list">
@@ -1656,14 +1659,18 @@ export function PoolPage() {
             </Button>
             <Button
               type="button"
-              disabled={!anyPushTarget || !hasPushableSelected}
-              onClick={handleStartPush}
+              disabled={!anyPushTarget}
+              onClick={() => {
+                // 推送设置弹窗 → 二次确认弹窗（两段式确认）
+                setPushDialogOpen(false);
+                openTaskConfirm("push");
+              }}
               title={
                 !anyPushTarget
                   ? "请先在「注册页 → 推送目标设置」中配置目标"
-                  : !hasPushableSelected
-                    ? "选中账号均未认证或状态非正常，禁止推送"
-                    : "开始推送（未认证或状态非正常的账号将被跳过）"
+                  : selected.size > 0
+                    ? "开始推送选中账号（未认证或状态非正常的将被跳过）"
+                    : "开始推送全部已认证且状态正常的账号"
               }
             >
               <Share className="size-3.5" />
@@ -1699,6 +1706,37 @@ export function PoolPage() {
               onClick={handleDelete}
             >
               确定删除
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      <AlertDialog
+        open={confirmTask !== null}
+        onOpenChange={(open) => {
+          if (!open) setConfirmTask(null);
+        }}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>
+              确认发起{confirmTask?.kind === "push"
+                ? "推送"
+                : confirmTask?.kind === "auth"
+                  ? "认证"
+                  : confirmTask?.kind === "reauth"
+                    ? "重登"
+                    : "巡检"}
+              ？
+            </AlertDialogTitle>
+            <AlertDialogDescription>
+              即将对 {confirmTask?.scope ?? "—"} 执行任务。{confirmTask?.detail ?? ""}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>取消</AlertDialogCancel>
+            <AlertDialogAction onClick={runConfirmedTask}>
+              确认执行
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>
