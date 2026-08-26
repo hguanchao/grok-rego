@@ -23,7 +23,8 @@ from curl_cffi import requests
 
 from core import config
 from core.logger import logger
-from core.util import now_iso_tz
+from core.util import curl_error_code, now_iso_tz, proxy_endpoint_ready
+from db import insert_usage
 from gateway import egress
 from gateway.anthropic import (
     chat_to_message,
@@ -38,7 +39,6 @@ from gateway.anthropic import (
     uses_chat_completions,
 )
 from gateway.usage import StreamUsageAccumulator, extract_nonstream
-from db import insert_usage
 
 # 上游固定参数（产品约定，不走配置）
 ZEN_BASE = "https://opencode.ai/zen/v1"
@@ -54,6 +54,8 @@ _MAX_BODY = 32 * 1024 * 1024
 _LOG_CAP = 200
 _CONNECT_TIMEOUT = 20.0
 _READ_TIMEOUT = 300.0
+_UPSTREAM_RETRY_CODES = {5, 6, 7, 18, 28, 35, 52, 56}
+_UPSTREAM_RETRY_DELAY = 0.5
 _HOP_BY_HOP = {
     "connection",
     "keep-alive",
@@ -561,6 +563,7 @@ def proxy(handler: BaseHTTPRequestHandler, method: str, path: str) -> None:
     status = 502
     err: str | None = None
     upstream: requests.Response | None = None
+    response_started = False
     # 用量采集：非流式整包解析 / 流式旁路累积
     usage: dict[str, int] = {"prompt_tokens": 0, "completion_tokens": 0, "cache_tokens": 0, "reasoning_tokens": 0}
     acc: StreamUsageAccumulator | None = None
@@ -569,19 +572,53 @@ def proxy(handler: BaseHTTPRequestHandler, method: str, path: str) -> None:
     try:
         # 仅客户端声明 stream 时上游才开流；否则整包读取，避免 curl_cffi
         # stream=True 下 .content 为空、Content-Length=0 把 keep-alive 打乱。
-        upstream = requests.request(
-            method if not translate else "POST",
-            url,
-            headers=headers,
-            data=forward_body if forward_body else None,
-            stream=stream_flag,
-            **_proxy_kwargs(),
-        )
-        status = int(upstream.status_code)
-        content_type = (upstream.headers.get("Content-Type") or "").lower()
-        is_stream = stream_flag and status < 400 and (
-            "text/event-stream" in content_type or not content_type
-        )
+        upstream_method = method if not translate else "POST"
+        is_stream = False
+        raw_chunks = None
+        first_raw_chunk = b""
+        for request_attempt in range(2):
+            try:
+                upstream = requests.request(
+                    upstream_method,
+                    url,
+                    headers=headers,
+                    data=forward_body if forward_body else None,
+                    stream=stream_flag,
+                    **_proxy_kwargs(),
+                )
+                status = int(upstream.status_code)
+                content_type = (upstream.headers.get("Content-Type") or "").lower()
+                is_stream = stream_flag and status < 400 and (
+                    "text/event-stream" in content_type or not content_type
+                )
+                if is_stream and method != "HEAD":
+                    raw_chunks = iter(upstream.iter_content(chunk_size=4096))
+                    for chunk in raw_chunks:
+                        if chunk:
+                            first_raw_chunk = chunk
+                            break
+                break
+            except requests.RequestsError as exc:
+                code = curl_error_code(exc)
+                proxy = str(config.PROXY or "").strip()
+                proxy_ready = proxy_endpoint_ready(proxy, timeout=0.2) if proxy else True
+                can_retry = (
+                    request_attempt == 0
+                    and bytes_out == 0
+                    and code in _UPSTREAM_RETRY_CODES
+                    and (stream_flag or method in {"GET", "HEAD"})
+                )
+                logger.warning(
+                    f"[网关] 上游请求异常 curl={code or 'unknown'} "
+                    f"proxy={'ready' if proxy_ready else 'down'} "
+                    f"attempt={request_attempt + 1}/2 retry={can_retry}"
+                )
+                if not can_retry:
+                    raise
+                if upstream is not None:
+                    upstream.close()
+                    upstream = None
+                time.sleep(_UPSTREAM_RETRY_DELAY)
 
         extra = _response_headers(upstream)
         if is_stream:
@@ -596,8 +633,14 @@ def proxy(handler: BaseHTTPRequestHandler, method: str, path: str) -> None:
                     continue
                 handler.send_header(key, value)
             handler.end_headers()
+            response_started = True
             if method != "HEAD":
-                raw_chunks = upstream.iter_content(chunk_size=4096)
+                def _with_first_chunk():
+                    if first_raw_chunk:
+                        yield first_raw_chunk
+                    if raw_chunks is not None:
+                        yield from raw_chunks
+
                 acc = StreamUsageAccumulator()
                 if translate:
                     # 翻译模式下必须从「上游原始 OpenAI 块」采样 usage——
@@ -608,7 +651,7 @@ def proxy(handler: BaseHTTPRequestHandler, method: str, path: str) -> None:
                                 acc.feed(c)
                             yield c
 
-                    chunks = iter_anthropic_sse(_tee(raw_chunks), model)
+                    chunks = iter_anthropic_sse(_tee(_with_first_chunk()), model)
 
                     def _pass(gen):
                         # 翻译后的块不再重复喂 acc，仅转发
@@ -618,7 +661,7 @@ def proxy(handler: BaseHTTPRequestHandler, method: str, path: str) -> None:
 
                     chunks_iter = _pass(chunks)
                 else:
-                    chunks_iter = raw_chunks
+                    chunks_iter = _with_first_chunk()
                 for chunk in chunks_iter:
                     if not chunk:
                         continue
@@ -656,9 +699,15 @@ def proxy(handler: BaseHTTPRequestHandler, method: str, path: str) -> None:
         err = "client_disconnected"
         logger.warning(f"[网关] 客户端断开 {method} {path}")
     except Exception as exc:
-        err = f"{type(exc).__name__}: {exc}"
+        code = curl_error_code(exc)
+        proxy = str(config.PROXY or "").strip()
+        proxy_ready = proxy_endpoint_ready(proxy, timeout=0.2) if proxy else True
+        err = (
+            f"{type(exc).__name__} curl={code or 'unknown'} "
+            f"proxy={'ready' if proxy_ready else 'down'} bytes_out={bytes_out}: {exc}"
+        )
         logger.error(f"[网关] 转发失败 {method} {path} {err}")
-        if not handler.wfile.closed:
+        if not response_started and not handler.wfile.closed:
             try:
                 fail = _anthropic_error(err, 502) if anthropic_client else _openai_error(err, 502)
                 _send_bytes(handler, 502, fail, "application/json; charset=utf-8")

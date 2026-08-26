@@ -23,6 +23,7 @@ from curl_cffi import requests
 from core import config
 from core.config import OAUTH2_CLIENT_ID, OAUTH2_ISSUER, OAUTH2_SCOPES
 from core.logger import logger
+from core.util import curl_error_code, proxy_endpoint_ready
 
 # ─── OAuth2 端点与协议常量 ───────────────────────────────
 _DEVICE_CODE_URL = f"{OAUTH2_ISSUER}/oauth2/device/code"
@@ -36,6 +37,9 @@ _SCOPE_STR = " ".join(OAUTH2_SCOPES)
 # 协议级 approve 的宽限时间（invalid_grant 短暂重试窗口）与总轮询上限
 _PROTOCOL_GRACE = 8.0
 _POLL_DEADLINE = 120.0
+_REFRESH_RETRY_DELAYS = (1.0, 2.0)
+# 仅连接建立前失败可安全重试；56 属于响应接收阶段，refresh_token 可能已轮换，禁止盲重试。
+_SAFE_REFRESH_RETRY_CODES = {5, 6, 7}
 
 # 客户端版本头（对齐 grok-cli）
 _CLIENT_VERSION = "1.0.3"
@@ -407,28 +411,46 @@ def refresh_token(token: str) -> tuple[dict[str, Any] | None, int]:
     """
     proxy = str(config.PROXY or "").strip()
     proxies = {"http": proxy, "https": proxy} if proxy else None
-    try:
-        resp = requests.post(
-            _TOKEN_ENDPOINT,
-            data={
-                "grant_type": "refresh_token",
-                "refresh_token": token,
-                "client_id": OAUTH2_CLIENT_ID,
-                "scope": _SCOPE_STR,
-            },
-            headers={"referrer": _REFERRER},
-            proxies=proxies,
-            timeout=60,
-            impersonate="chrome",
-        )
-    except requests.RequestsError as e:
-        logger.warning(f"[认证] token 刷新请求异常: {type(e).__name__}")
+    if proxy and not proxy_endpoint_ready(proxy):
+        logger.warning("[认证] token 刷新跳过：代理未就绪")
         return None, 0
-    try:
-        if resp.status_code != 200:
-            logger.warning(f"[认证] token 刷新失败 status={resp.status_code}")
-            return None, resp.status_code
-        logger.success(f"[认证] token 刷新成功  · HTTP {resp.status_code}")
-        return resp.json(), 200
-    finally:
-        resp.close()
+
+    for attempt in range(len(_REFRESH_RETRY_DELAYS) + 1):
+        try:
+            resp = requests.post(
+                _TOKEN_ENDPOINT,
+                data={
+                    "grant_type": "refresh_token",
+                    "refresh_token": token,
+                    "client_id": OAUTH2_CLIENT_ID,
+                    "scope": _SCOPE_STR,
+                },
+                headers={"referrer": _REFERRER},
+                proxies=proxies,
+                timeout=60,
+                impersonate="chrome",
+            )
+        except requests.RequestsError as exc:
+            code = curl_error_code(exc)
+            proxy_ready = proxy_endpoint_ready(proxy, timeout=0.2) if proxy else True
+            can_retry = code in _SAFE_REFRESH_RETRY_CODES and attempt < len(
+                _REFRESH_RETRY_DELAYS
+            )
+            logger.warning(
+                f"[认证] token 刷新请求异常: {type(exc).__name__} "
+                f"curl={code or 'unknown'} proxy={'ready' if proxy_ready else 'down'} "
+                f"retry={can_retry}"
+            )
+            if not can_retry:
+                return None, 0
+            time.sleep(_REFRESH_RETRY_DELAYS[attempt])
+            continue
+        try:
+            if resp.status_code != 200:
+                logger.warning(f"[认证] token 刷新失败 status={resp.status_code}")
+                return None, resp.status_code
+            logger.success(f"[认证] token 刷新成功  · HTTP {resp.status_code}")
+            return resp.json(), 200
+        finally:
+            resp.close()
+    return None, 0

@@ -209,7 +209,7 @@ def auth_pool_state(after_log_id: int = 0) -> dict[str, Any]:
 借鉴 acorn 自动刷新思路（后台固定周期扫描临期账号并续期），按 grok-rego
 栈重写并定制：
 - 周期 30 分钟扫描，token 剩余 ≤10 分钟即续期（沿用参考参数）
-- 临期账号 20 个 worker 并发刷新，每个 worker 做完一个号再隔 1 秒接下一个
+- 临期账号最多 4 个 worker 并发刷新，每个 worker 做完一个号再隔 1 秒接下一个
 - 失败分级：网络瞬时失败跳过本轮不判死；刷新凭据被拒标记 REAUTH
 - 与手动号池任务 / 推送任务互斥：任一进行中则跳过本轮
 - 状态只读暴露（GET /api/pool/auto-refresh），日志走统一 loguru
@@ -226,6 +226,7 @@ from core.util import (
     format_exp,
     mask_email,
     now_str,
+    proxy_endpoint_ready,
     run_account_workers,
 )
 from db import (
@@ -245,10 +246,11 @@ from workflow.oauth import refresh_token as oauth_refresh
 # 固定参数：每 30 分钟检查一次，token 剩余 ≤10 分钟即续期
 INTERVAL_MIN = 30
 LEAD_MIN = 10
-# 续期并发：20 个 worker，每 worker 号间隔 1 秒
-REFRESH_CONCURRENCY = ACCOUNT_WORKERS
+# 续期并发限制为 4，避免代理恢复/切换时形成连接风暴。
+REFRESH_CONCURRENCY = min(4, ACCOUNT_WORKERS)
 # 轮询唤醒间隔（秒）
 _SCAN_WAKE_SEC = 30
+_PROXY_CHECK_TIMEOUT_SEC = 1.0
 # 任务日志内存环形保留条数
 _LOG_LIMIT = 200
 
@@ -358,6 +360,14 @@ class AutoRefresher:
             self._scanning = True
             self._skip_reason = ""
         try:
+            proxy = str(config.PROXY or "").strip()
+            if proxy and not proxy_endpoint_ready(proxy, _PROXY_CHECK_TIMEOUT_SEC):
+                reason = "代理未就绪，延迟本轮续期"
+                self.append_log("WARNING", f"[续期] {reason}")
+                logger.warning(f"[续期] {reason}")
+                with self._lock:
+                    self._skip_reason = reason
+                return
             if self._task_busy():
                 reason = "手动任务进行中，跳过本轮"
                 self.append_log("WARNING", f"[续期] {reason}")
@@ -451,7 +461,7 @@ class AutoRefresher:
         return "rejected"
 
     def _refresh_all(self, due: list[dict[str, Any]]) -> tuple[int, int, int]:
-        """20 个 worker 并发续期，每个 worker 做完一个号再隔 1 秒接下一个。
+        """最多 4 个 worker 并发续期，每个 worker 做完一个号再隔 1 秒接下一个。
 
         返回 (refreshed, rejected, transient)：
         - 刷新成功 → 回写 token，状态恢复 ACTIVE

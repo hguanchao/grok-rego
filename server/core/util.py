@@ -55,10 +55,12 @@ def format_exp(ts: int | None) -> str:
 import base64
 import json
 import re
+import socket
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
+from urllib.parse import urlsplit
 
 # 验证码正则：格式如 OE5-SDO
 _CODE_PATTERN = re.compile(r"\b([A-Z0-9]{3}-[A-Z0-9]{3})\b")
@@ -76,6 +78,42 @@ def extract_verification_code(subject: str, text: str) -> str | None:
     if digit_match:
         return digit_match.group(1)
     return None
+
+
+def curl_error_code(exc: BaseException) -> int | None:
+    """提取 curl_cffi 异常中的 libcurl 错误码。"""
+    value = getattr(exc, "code", None)
+    try:
+        if value is not None and int(value) > 0:
+            return int(value)
+    except (TypeError, ValueError):
+        pass
+    match = re.search(r"curl:\s*\((\d+)\)", str(exc), re.IGNORECASE)
+    return int(match.group(1)) if match else None
+
+
+def proxy_endpoint_ready(proxy: str | None, timeout: float = 1.0) -> bool:
+    """仅检查代理 TCP 端点是否可连接，不发起任何上游请求。"""
+    raw = str(proxy or "").strip()
+    if not raw:
+        return True
+    parsed = urlsplit(raw if "://" in raw else f"//{raw}")
+    if not parsed.hostname:
+        return False
+    try:
+        scheme = parsed.scheme.lower()
+        if scheme in {"socks4", "socks5", "socks5h"}:
+            default_port = 1080
+        else:
+            default_port = 443 if scheme == "https" else 80
+        port = parsed.port or default_port
+    except ValueError:
+        return False
+    try:
+        with socket.create_connection((parsed.hostname, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
 
 
 def elapsed_label(t0: float) -> str:
