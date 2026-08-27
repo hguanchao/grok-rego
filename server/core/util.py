@@ -173,18 +173,6 @@ def run_account_workers(
     return results
 
 
-def mask_email(value: str | None) -> str:
-    """脱敏邮箱账号，供日志输出使用。"""
-    raw = str(value or "").strip()
-    local, separator, domain = raw.partition("@")
-    if not separator:
-        return "***"
-    local_masked = f"{local[:2]}***" if local else "***"
-    domain_name, dot, suffix = domain.partition(".")
-    domain_masked = f"{domain_name[:1]}***" if domain_name else "***"
-    return f"{local_masked}@{domain_masked}{dot}{suffix}"
-
-
 def decode_jwt_exp(token: str | None) -> int | None:
     """解码 JWT payload 提取 exp 时间戳；解析失败返回 None。"""
     if not token:

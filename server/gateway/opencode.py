@@ -697,7 +697,11 @@ def proxy(handler: BaseHTTPRequestHandler, method: str, path: str) -> None:
             _send_bytes(handler, status, payload, ctype, extra)
     except (BrokenPipeError, ConnectionError, ConnectionResetError, ConnectionAbortedError):
         err = "client_disconnected"
-        logger.warning(f"[网关] 客户端断开 {method} {path}")
+        # 上游已成功(status<400)时属客户端提前断开（流式 CLI 读完即关），非故障
+        if status < 400:
+            logger.info(f"[网关] 客户端提前断开（上游已成功 HTTP {status}）{method} {path}")
+        else:
+            logger.warning(f"[网关] 客户端断开 {method} {path} HTTP {status}")
     except Exception as exc:
         code = curl_error_code(exc)
         proxy = str(config.PROXY or "").strip()

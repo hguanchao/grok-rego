@@ -13,7 +13,7 @@ CORE_DIR = os.path.dirname(os.path.abspath(__file__))
 SERVER_DIR = os.path.dirname(CORE_DIR)
 LOG_DIR = os.path.join(SERVER_DIR, "logs")
 
-DB_DIR = os.path.join(SERVER_DIR, "data")
+DB_DIR = os.path.join(SERVER_DIR, "db", "data")
 DB_PATH = os.path.join(DB_DIR, "main.db")
 
 # === 临时邮箱 API（cf）===

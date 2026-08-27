@@ -39,6 +39,11 @@ def _openai_usage(usage: Any) -> dict[str, int]:
         return {"prompt_tokens": 0, "completion_tokens": 0, "cache_tokens": 0, "reasoning_tokens": 0}
     prompt = _to_int(usage.get("prompt_tokens"))
     completion = _to_int(usage.get("completion_tokens"))
+    # Responses API 兼容：input_tokens / output_tokens（OpenAI Chat 用 prompt/completion）
+    if not prompt:
+        prompt = _to_int(usage.get("input_tokens"))
+    if not completion:
+        completion = _to_int(usage.get("output_tokens"))
     cache = 0
     reason = 0
     details = usage.get("prompt_tokens_details")
@@ -202,6 +207,15 @@ class StreamUsageAccumulator:
         message = payload.get("message")
         if isinstance(message, dict) and isinstance(message.get("usage"), dict):
             return _anthropic_usage(message.get("usage"))
+        # Responses 流式事件（response.completed）：usage 深层嵌套在 response.usage
+        inner = payload.get("response")
+        if isinstance(inner, dict) and isinstance(inner.get("usage"), dict):
+            usage = inner["usage"]
+            if (
+                "input_tokens" in usage or "output_tokens" in usage
+            ) and not ("prompt_tokens" in usage or "completion_tokens" in usage):
+                return _anthropic_usage(usage)
+            return _openai_usage(usage)
         return None
 
     def result(self) -> dict[str, int]:

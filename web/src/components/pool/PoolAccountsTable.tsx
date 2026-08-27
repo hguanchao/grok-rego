@@ -102,9 +102,13 @@ function AccountActions({
         variant="ghost"
         size="icon"
         className="row-action-btn"
-        title="重登"
+        title={
+          account.has_token !== 0
+            ? "重登（需重登/拒权/异常状态）"
+            : "未认证：请先点认证"
+        }
         aria-label={`重登 ${account.email}`}
-        disabled={inspecting || ![2, 4, 5].includes(account.status)}
+        disabled={inspecting || account.has_token === 0 || ![2, 4, 5].includes(account.status)}
         onClick={() => onAction("reauth")}
       >
         <LogIn className="size-3.5" strokeWidth={1.8} aria-hidden />
@@ -114,9 +118,15 @@ function AccountActions({
         variant="ghost"
         size="icon"
         className="row-action-btn"
-        title="风控体检（无头浏览器自动过 CF 挑战）"
+        title={
+          account.has_token === 0
+            ? "未认证：请先点认证"
+            : account.status === 6
+              ? "账号已禁用"
+              : "风控体检（无头浏览器自动过 CF 挑战）"
+        }
         aria-label={`风控体检 ${account.email}`}
-        disabled={inspecting}
+        disabled={inspecting || account.has_token === 0 || account.status === 6}
         onClick={() => onAction("risk")}
       >
         <ShieldAlert className="size-3.5" strokeWidth={1.8} aria-hidden />

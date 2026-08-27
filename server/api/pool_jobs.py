@@ -20,6 +20,7 @@ from curl_cffi import requests
 from core import config
 from core.config import UPSTREAM_BASE
 from core.logger import logger
+from core.mutex import acquire as mutex_acquire, release as mutex_release
 
 _PROBE_CONNECT_TIMEOUT = 10
 _PROBE_READ_TIMEOUT = 30
@@ -62,7 +63,7 @@ class ProbeClient:
         result: dict[str, Any] = {"status_code": 0, "error": ""}
         use_proxy = str(proxy or config.PROXY or "").strip()
         email = str(account.get("email") or "").strip()
-        log_email = mask_email(email)
+        log_email = email
         if not use_proxy:
             result["error"] = "探活强制走代理，未配置 proxy"
             logger.error(f"[探活] {log_email} 未配置代理，跳过探活")
@@ -155,11 +156,20 @@ def _append_auth_pool_log(level: str, message: str) -> None:
 
 
 def kick_auth_pool() -> None:
-    """后台线程消化认证池（20 worker，每 worker 间隔 1s）；已有消化线程则跳过本轮。"""
+    """后台线程消化认证池（20 worker，每 worker 间隔 1s）；已有消化线程则跳过本轮。
+
+    全局互斥：其它重任务（推送/号池任务/注册）进行中直接拒绝（API 层转 409）。
+    """
     global _auth_pool_running
     with _auth_pool_lock:
         if _auth_pool_running:
             logger.debug("[认证池] 已有消化线程运行，跳过本轮触发")
+            return
+    # 先占全局互斥再置位：互斥失败不产生“已标记运行却未启动”的脏状态
+    mutex_acquire("认证")
+    with _auth_pool_lock:
+        if _auth_pool_running:  # 并发触发防御
+            mutex_release("认证")
             return
         _auth_pool_running = True
         # 新一轮仅保留本轮日志，游标继续单调递增，避免前端 after 游标回退。
@@ -184,6 +194,7 @@ def kick_auth_pool() -> None:
         finally:
             with _auth_pool_lock:
                 _auth_pool_running = False
+            mutex_release("认证")
 
     threading.Thread(target=worker, daemon=True, name="认证池消化").start()
 
@@ -215,7 +226,6 @@ def auth_pool_state(after_log_id: int = 0) -> dict[str, Any]:
 - 状态只读暴露（GET /api/pool/auto-refresh），日志走统一 loguru
 """
 
-import sqlite3
 import threading
 
 from core.util import (
@@ -224,7 +234,6 @@ from core.util import (
     decode_jwt_exp,
     elapsed_label,
     format_exp,
-    mask_email,
     now_str,
     proxy_endpoint_ready,
     run_account_workers,
@@ -234,8 +243,8 @@ from db import (
     STATUS_DISABLED,
     STATUS_LIMITED,
     STATUS_REAUTH,
-    connect,
     get_all_accounts,
+    list_due_refresh_candidates,
     update_account_status_by_ids,
     update_account_tokens,
     update_risk,
@@ -346,14 +355,14 @@ class AutoRefresher:
     # ─── 扫描与续期 ─────────────────────────────────────────
 
     def _task_busy(self) -> bool:
-        """手动号池任务 / 推送任务进行中则本轮跳过（避免并发刷同一批账号）。"""
-        from api.push import push_manager
+        """任意手动重任务（推送 / 号池任务 / 认证 / 注册）进行中则本轮跳过。
 
-        job = pool_job_manager.status()
-        if job.get("status") in ("pending", "running"):
-            return True
-        push = push_manager.status()
-        return push.get("status") in ("pending", "running")
+        自动续期是低优先级后台任务：不占用全局互斥，主动避让，
+        避免与手动任务并发刷同一批账号。
+        """
+        from core.mutex import active
+
+        return bool(active())
 
     def _scan(self) -> None:
         with self._lock:
@@ -411,29 +420,17 @@ class AutoRefresher:
                 self._scanning = False
 
     def _collect_due(self) -> list[dict[str, Any]]:
-        """收集临期账号：exp ≤ now + LEAD_MIN 且状态允许续期。"""
-        with connect() as conn:
-            conn.row_factory = sqlite3.Row
-            rows = conn.execute(
-                "SELECT id, email, access_token, refresh_token FROM accounts "
-                "WHERE COALESCE(is_deleted, 0) = 0 AND access_token IS NOT NULL AND access_token != '' "
-                "AND refresh_token IS NOT NULL AND refresh_token != '' "
-                f"AND status NOT IN ({STATUS_REAUTH}, {STATUS_DISABLED}) "
-                "ORDER BY created_at DESC"
-            ).fetchall()
-        cutoff = time.time() + LEAD_MIN * 60
-        due = []
-        for row in rows:
-            exp = decode_jwt_exp(str(row["access_token"] or ""))
-            if exp is None or exp <= cutoff:
-                due.append(dict(row))
-        return due
+        """收集临期账号：exp ≤ now + LEAD_MIN 且状态允许续期（查询收敛到 db 层）。"""
+        return list_due_refresh_candidates(
+            due_within_sec=int(LEAD_MIN * 60),
+            exclude_statuses=(STATUS_REAUTH, STATUS_DISABLED),
+        )
 
     def _refresh_one(self, row: dict[str, Any]) -> str:
         """单账号 OIDC 刷新。返回 refreshed / rejected / transient。"""
         account_id = int(row["id"])
         email = str(row["email"] or "")
-        log_email = mask_email(email)
+        log_email = email
         data, http_status = oauth_refresh(str(row["refresh_token"] or ""))
         if data and data.get("access_token"):
             update_account_tokens(
@@ -472,7 +469,7 @@ class AutoRefresher:
         def on_complete(_index: int, row: dict[str, Any], kind: Any) -> None:
             nonlocal refreshed, rejected, transient
             email = str(row.get("email") or "")
-            log_email = mask_email(email)
+            log_email = email
             if isinstance(kind, Exception):
                 self.append_log(
                     "WARNING",
@@ -552,10 +549,10 @@ def _clamp_concurrency(value: Any) -> int:
 
 
 def _who(acc: dict[str, Any]) -> str:
-    """账号日志标识：邮箱脱敏，缺邮箱则回退 #id。"""
+    """账号日志标识：完整邮箱（排查用），缺邮箱则回退 #id。"""
     email = str(acc.get("email") or "").strip()
     aid = int(acc.get("id") or 0)
-    return mask_email(email) if email else f"#{aid}"
+    return email if email else f"#{aid}"
 
 
 def _end_log(job: PoolJob, title: str) -> None:
@@ -689,6 +686,8 @@ class PoolJobManager:
             raise RuntimeError(f"未知任务类型: {kind}")
         concurrency = _clamp_concurrency(concurrency)
         ids = [int(i) for i in account_ids] if account_ids else []
+        # 全局互斥：其它重任务（推送/认证/注册）进行中则拒绝
+        mutex_acquire("号池")
 
         with self._lock:
             job = self._job
@@ -743,6 +742,7 @@ class PoolJobManager:
             job.finished_at = now_str()
             title = "巡检" if job.kind == "inspect" else "重登" if job.kind == "reauth" else "风控"
             _end_log(job, title)
+            mutex_release("号池")
             logger.info(
                 f"[号池任务] {job.kind} {job.id} 结束: status={job.status} "
                 f"成功={job.pushed} 失败={job.failed} 待授权={job.pending} "
@@ -756,9 +756,11 @@ class PoolJobManager:
     ) -> list[dict[str, Any]]:
         """资格预筛：返回候选账号行；跳过账号写入 skipped_list。
 
-        require_token=True（巡检）：无 access_token 或状态为需重登(2) 跳过；
-        require_token=False（重登）：指定 ids 时全部处理（无 token 走重新授权），
-        全量模式（未传 ids）仅处理需重登(2)状态的账号。
+        未认证账号（无 access_token）一律排除：仅可走认证（/api/pool/auth），
+        巡检 / 重登 / 风控均不处理（满足“未认证账号只能执行认证”约束）。
+        require_token=True（巡检）：状态为需重登(2) 亦跳过；
+        require_token=False（重登 / 风控）：指定 ids 时按 id 处理（需重登账号），
+        重登全量模式（未传 ids）仅处理需重登(2)状态的账号。
         跳过明细只记入 skipped_list 与文件日志，任务日志聚合为一条摘要，
         避免全量模式下逐账号刷屏、日志一次性倾泻。
         """
@@ -778,8 +780,13 @@ class PoolJobManager:
                 break
             aid = int(acc.get("id") or 0)
             skip_reason = ""
-            if require_token and not str(acc.get("access_token") or "").strip():
-                skip_reason = "未认证"
+            # 未认证账号仅可走认证（/api/pool/auth），巡检/重登/风控一律排除
+            if not str(acc.get("access_token") or "").strip():
+                skip_reason = "未认证，仅可认证"
+            elif int(acc.get("status") or 1) == STATUS_DISABLED:
+                # 禁用账号不参与巡检/重登/风控（与自动续期 exclude DISABLED 口径一致），
+                # 避免巡检探活通过后回写 ACTIVE 将禁用账号“复活”
+                skip_reason = "账号已禁用"
             elif require_token and int(acc.get("status") or 1) == 2:
                 # 巡检排除需重登状态（探活无意义，待重登闭环处理）
                 skip_reason = "需重登"

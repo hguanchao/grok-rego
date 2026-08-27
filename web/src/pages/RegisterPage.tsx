@@ -53,6 +53,7 @@ import {
   clearRegisterLogs,
   fetchConfig,
   fetchRegisterStatus,
+  fetchTaskActive,
   saveConfig,
   startRegister,
   stopRegister,
@@ -175,6 +176,7 @@ export function RegisterPage() {
   const seenWorkersRef = useRef<Set<string>>(new Set());
   const userTouchedCollapse = useRef(false);
 
+  const [globalTaskBusy, setGlobalTaskBusy] = useState(false);
   const busy = isActiveStatus(job.status);
   const formDisabled = busy || loadingConfig || starting;
 
@@ -373,6 +375,25 @@ export function RegisterPage() {
     const id = window.setInterval(() => setTick((n) => n + 1), 1000);
     return () => window.clearInterval(id);
   }, [job.status]);
+
+  // 全局任务互斥：其它任务（推送/巡检/认证/号池）执行中禁用「开始注册」
+  useEffect(() => {
+    let alive = true;
+    const tick = () => {
+      if (!alive) return;
+      fetchTaskActive()
+        .then((d) => {
+          if (alive) setGlobalTaskBusy(d.register || d.push || d.pool || d.auth);
+        })
+        .catch(() => {});
+    };
+    tick();
+    const timer = window.setInterval(tick, 1000);
+    return () => {
+      alive = false;
+      window.clearInterval(timer);
+    };
+  }, []);
 
   // 日志自动滚底
   useEffect(() => {
@@ -679,7 +700,7 @@ export function RegisterPage() {
             <Button
               type="button"
               className="rail-start-btn"
-              disabled={formDisabled || starting || busy}
+              disabled={formDisabled || starting || busy || globalTaskBusy}
               onClick={() => void handleStart()}
             >
               <Play strokeWidth={1.6} />

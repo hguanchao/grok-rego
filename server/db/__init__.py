@@ -2,12 +2,6 @@
 
 from __future__ import annotations
 
-"""
-数据库连接基础模块。
-
-提供统一的 SQLite 连接上下文管理器与北京时间戳工具，供 accounts / auth_pool 模块使用。
-"""
-
 import contextlib
 import sqlite3
 from collections.abc import Iterator
@@ -38,7 +32,7 @@ from datetime import date, timedelta
 from typing import Any
 
 from core.logger import logger
-from core.util import decode_jwt_exp, mask_email, now_dt, now_iso_tz
+from core.util import decode_jwt_exp, now_dt, now_iso_tz
 
 # 兼容已有数据库：表已存在但缺少新字段时补加
 _ACCOUNT_MIGRATIONS = [
@@ -185,7 +179,7 @@ def save_account(
         account_id = cursor.execute(
             "SELECT id FROM accounts WHERE email=?", (email,)
         ).fetchone()[0]
-    logger.success(f"[数据库] 账号已保存 (ID: {account_id}, email: {mask_email(email)})")
+    logger.success(f"[数据库] 账号已保存 (ID: {account_id}, email: {email})")
     return account_id
 
 
@@ -198,8 +192,54 @@ def get_account_by_email(email: str) -> dict[str, Any] | None:
         ).fetchone()
     if row:
         return _row_to_account(row)
-    logger.warning(f"[数据库] 未找到账号: {mask_email(email)}")
+    logger.warning(f"[数据库] 未找到账号: {email}")
     return None
+
+
+def list_gateway_candidates() -> list[dict[str, Any]]:
+    """网关自动选号候选：ACTIVE 且已认证的未删除账号（按 id 升序）。
+
+    只返回 id / email / access_token 三个字段，供网关轮询转发使用。
+    """
+    with connect() as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT id, email, access_token FROM accounts "
+            "WHERE COALESCE(is_deleted, 0) = 0 "
+            "AND COALESCE(status, 1) = ? "
+            "AND COALESCE(access_token, '') != '' "
+            "ORDER BY id",
+            (STATUS_ACTIVE,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def list_due_refresh_candidates(
+    due_within_sec: int, exclude_statuses: tuple[int, ...]
+) -> list[dict[str, Any]]:
+    """收集临期需续期账号：token exp ≤ now + due_within_sec，且状态不在排除集。
+
+    为 AutoRefresher 服务；仅关注拥有 access_token + refresh_token 的账号，
+    JWT exp 解析失败的视为临期（交由刷新链路判断）。
+    """
+    status_placeholders = ",".join("?" * len(exclude_statuses))
+    with connect() as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT id, email, access_token, refresh_token FROM accounts "
+            "WHERE COALESCE(is_deleted, 0) = 0 AND access_token IS NOT NULL AND access_token != '' "
+            "AND refresh_token IS NOT NULL AND refresh_token != '' "
+            f"AND status NOT IN ({status_placeholders}) "
+            "ORDER BY created_at DESC",
+            tuple(exclude_statuses),
+        ).fetchall()
+    cutoff = time.time() + due_within_sec
+    due = []
+    for row in rows:
+        exp = decode_jwt_exp(str(row["access_token"] or ""))
+        if exp is None or exp <= cutoff:
+            due.append(dict(row))
+    return due
 
 
 def get_account_by_id(account_id: int) -> dict[str, Any] | None:
@@ -227,10 +267,10 @@ def update_risk(
         is_updated = cursor.rowcount > 0
     if is_updated:
         logger.success(
-            f"[数据库] 已更新风控结果 (email: {mask_email(email)}, bfs: {bfs})"
+            f"[数据库] 已更新风控结果 (email: {email}, bfs: {bfs})"
         )
     else:
-        logger.warning(f"[数据库] 未找到账号，风控结果未更新: {mask_email(email)}")
+        logger.warning(f"[数据库] 未找到账号，风控结果未更新: {email}")
     return is_updated
 
 
@@ -254,10 +294,10 @@ def update_account_status(
         is_updated = cursor.rowcount > 0
     if is_updated:
         logger.info(
-            f"[数据库] 账号状态更新 (email: {mask_email(email)}, status: {status})"
+            f"[数据库] 账号状态更新 (email: {email}, status: {status})"
         )
     else:
-        logger.warning(f"[数据库] 未找到账号，状态未更新: {mask_email(email)}")
+        logger.warning(f"[数据库] 未找到账号，状态未更新: {email}")
     return is_updated
 
 
@@ -348,8 +388,6 @@ def update_account_sso_cookie(
     else:
         logger.warning(f"[数据库] 未更新 SSO cookie (ID: {account_id})")
     return ok
-
-
 
 
 def get_all_accounts() -> list[dict[str, Any]]:
@@ -476,11 +514,17 @@ def get_pool_stats() -> dict[str, int]:
                     CASE WHEN COALESCE(access_token, '') != ''
                               AND COALESCE(status, 1) = 1 THEN 1 ELSE 0 END
                 ) AS push_count,
-                SUM(CASE WHEN COALESCE(access_token, '') = '' THEN 1 ELSE 0 END) AS auth_count,
-                SUM(CASE WHEN COALESCE(status, 1) = 2 THEN 1 ELSE 0 END) AS reauth_count,
+                SUM(
+                    CASE WHEN COALESCE(access_token, '') = ''
+                              AND COALESCE(status, 1) != 6 THEN 1 ELSE 0 END
+                ) AS auth_count,
                 SUM(
                     CASE WHEN COALESCE(access_token, '') != ''
-                              AND COALESCE(status, 1) != 2 THEN 1 ELSE 0 END
+                              AND COALESCE(status, 1) = 2 THEN 1 ELSE 0 END
+                ) AS reauth_count,
+                SUM(
+                    CASE WHEN COALESCE(access_token, '') != ''
+                              AND COALESCE(status, 1) NOT IN (2, 6) THEN 1 ELSE 0 END
                 ) AS inspect_count
             FROM accounts WHERE COALESCE(is_deleted, 0) = 0
             """
@@ -567,7 +611,7 @@ def add_to_auth_pool(email: str, device_code: str, interval: int, account_id: in
             (account_id, email, device_code, interval, now_str()),
         )
         conn.commit()
-    logger.info(f"[认证池] 已加入认证池: {mask_email(email)} (account_id={account_id})")
+    logger.info(f"[认证池] 已加入认证池: {email} (account_id={account_id})")
 
 
 def get_auth_pool() -> list[dict[str, Any]]:
@@ -585,7 +629,7 @@ def remove_from_auth_pool(email: str) -> None:
     with connect() as conn:
         conn.execute("DELETE FROM auth_pool WHERE email=?", (email,))
         conn.commit()
-    logger.info(f"[认证池] 已移除: {mask_email(email)}")
+    logger.info(f"[认证池] 已移除: {email}")
 
 
 """
@@ -1092,6 +1136,7 @@ def query_account_usage_24h() -> dict[int, int]:
     init_usages_table()
     where, params = _usages_since(24)
     with connect() as conn:
+        conn.row_factory = sqlite3.Row
         rows = conn.execute(
             f"""
             SELECT account_id, COUNT(*) AS requests
@@ -1104,7 +1149,6 @@ def query_account_usage_24h() -> dict[int, int]:
     return {int(row["account_id"]): _usages_int(row, "requests") for row in rows}
 
 
-
 """
 数据库初始化入口。
 
@@ -1113,7 +1157,11 @@ def query_account_usage_24h() -> dict[int, int]:
 
 
 def init_db() -> None:
-    """初始化全部数据库表结构。"""
+    """初始化全部数据库表结构（自动创建数据目录）。"""
+    from core.config import DB_DIR
+    import os
+
+    os.makedirs(DB_DIR, exist_ok=True)
     init_accounts_table()
     init_auth_pool_table()
     init_usages_table()

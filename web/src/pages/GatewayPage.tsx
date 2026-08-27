@@ -2,7 +2,7 @@
  * 网关运维页（UI 结构对齐 acorn 参考项目）
  * 上：工具栏 + KPI 条
  * 左：网关配置（接入地址 · 鉴权密钥）
- * 右：号池账号运行态
+ * 右：账号运行态
  */
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import {
@@ -21,7 +21,7 @@ import {
   Waypoints,
 } from "lucide-react";
 import { toast } from "sonner";
-import { Button, Input, Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui";
+import { Badge, Button, Input, Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui";
 import {
   ApiError,
   fetchConfig,
@@ -232,9 +232,9 @@ export function GatewayPage() {
                   <Users className="metric-ico" strokeWidth={1.6} />
                   账号池
                 </div>
-                <div className="metric-v is-live">{pool?.authed ?? 0}</div>
+                <div className="metric-v is-live">{pool?.active ?? 0}</div>
                 <div className="metric-sub usage-metric-sub">
-                  共 {pool?.total ?? 0} · 停用 {pool?.disabled ?? 0}
+                  共 {pool?.total ?? 0} · 在用 {pool?.in_use ?? 0}
                 </div>
               </div>
               <div className="metric">
@@ -305,7 +305,7 @@ export function GatewayPage() {
                   <div className="gw-section-label">
                     <Link2 className="size-3" strokeWidth={1.6} aria-hidden />
                     <span>接入地址</span>
-                    <LabelHelp tip="Claude Code 将 ANTHROPIC_BASE_URL 设为 http://127.0.0.1:8787/zen（不带 /v1）；Grok 客户端用完整 /grok/v1 地址并携带 X-Account-Id 选号。" />
+                    <LabelHelp tip="Claude Code 将 ANTHROPIC_BASE_URL 设为 http://127.0.0.1:8787/zen（不带 /v1）；Grok 客户端用完整 /grok/v1 地址，网关自动从号池轮询取号。" />
                   </div>
                   {[zenChannel, grokChannel].map((channel, index) => (
                     <div
@@ -402,32 +402,29 @@ export function GatewayPage() {
 
               </section>
 
-              {/* ── 右：号池账号运行态 ── */}
+              {/* ── 右：账号运行态 ── */}
               <section className="gw-panel gw-col">
                 <div className="gw-panel-head">
                   <Users className="size-3.5" strokeWidth={1.6} aria-hidden />
-                  <h2 className="gw-panel-title">号池账号运行态</h2>
-                  <span className="gw-panel-meta">
-                    {pool?.total ?? 0} 账号 · 24h 调用 {pool?.requests_24h ?? 0}
-                  </span>
+                  <h2 className="gw-panel-title">账号运行态</h2>
                 </div>
 
                 <div className="gw-pool-summary">
-                  <div className="gw-pool-chip is-sticky">
-                    <em>{pool?.authed ?? 0}</em>
-                    <span>已认证</span>
-                  </div>
                   <div className="gw-pool-chip is-idle">
-                    <em>{Math.max(0, (pool?.total ?? 0) - (pool?.authed ?? 0))}</em>
-                    <span>未认证</span>
-                  </div>
-                  <div className="gw-pool-chip is-cool">
-                    <em>{pool?.disabled ?? 0}</em>
-                    <span>已停用</span>
+                    <em>{pool?.active ?? 0}</em>
+                    <span>正常</span>
                   </div>
                   <div className="gw-pool-chip is-busy">
-                    <em>{pool?.requests_24h ?? 0}</em>
-                    <span>24h 调用</span>
+                    <em>{pool?.in_use ?? 0}</em>
+                    <span>在用</span>
+                  </div>
+                  <div className="gw-pool-chip is-sticky">
+                    <em>{pool?.sticky ?? 0}</em>
+                    <span>粘性</span>
+                  </div>
+                  <div className="gw-pool-chip is-cool">
+                    <em>{pool?.cooling ?? 0}</em>
+                    <span>冷却</span>
                   </div>
                 </div>
 
@@ -442,40 +439,51 @@ export function GatewayPage() {
                       <li
                         key={a.id}
                         className={cn(
-                          "gw-acct-card",
-                          a.disabled ? "is-strikes" : a.authed ? "is-idle" : "is-cooling",
+                          "gw-acct-row",
+                          a.disabled
+                            ? "is-strikes"
+                            : a.cooling
+                              ? "is-cool"
+                              : a.authed
+                                ? "is-idle"
+                                : "is-cooling",
                         )}
                       >
-                        <div className="gw-acct-main">
-                          <div className="gw-acct-id">
-                            <span className="gw-acct-badge">#{a.id}</span>
-                            <span
-                              className={cn(
-                                "gw-acct-state",
-                                a.disabled
-                                  ? "is-strikes"
-                                  : a.authed
-                                    ? "is-idle"
-                                    : "is-cooling",
-                              )}
-                            >
-                              {a.disabled ? "停用" : a.authed ? "就绪" : "未认证"}
-                            </span>
-                          </div>
-                          <div className="gw-acct-email" title={a.email}>
-                            {a.email || "—"}
-                          </div>
-                        </div>
-                        <div className="gw-acct-meta">
+                        <span className="gw-acct-cell gw-acct-cell-id">
+                          #{a.id}
+                        </span>
+                        <span
+                          className="gw-acct-cell gw-acct-cell-email"
+                          title={a.email}
+                        >
+                          {a.email || "—"}
+                        </span>
+                        <span
+                          className="gw-acct-cell gw-acct-cell-usage"
+                          title="近 24h 请求数"
+                        >
                           {a.requests_24h > 0 ? (
-                            <span className="gw-acct-tag is-sticky" title="近 24h 请求数">
+                            <Badge variant="secondary" className="gw-usage-badge">
                               24h×{a.requests_24h}
-                            </span>
-                          ) : null}
-                          {!a.authed && !a.disabled ? (
-                            <span className="gw-acct-tag is-warn">缺 token</span>
-                          ) : null}
-                        </div>
+                            </Badge>
+                          ) : (
+                            "—"
+                          )}
+                        </span>
+                        <span
+                          className={cn(
+                            "gw-acct-state",
+                            a.disabled
+                              ? "is-strikes"
+                              : a.cooling
+                                ? "is-cool"
+                                : a.authed
+                                  ? "is-idle"
+                                  : "is-cooling",
+                          )}
+                        >
+                          {a.disabled ? "禁用" : a.cooling ? "冷却" : a.authed ? "正常" : "未认证"}
+                        </span>
                       </li>
                     ))}
                   </ul>

@@ -34,7 +34,7 @@ htmlcov/
 .amp/
 
 # Runtime data
-server/data/
+server/db/data/
 server/logs/
 *.bak
 *.db-journal

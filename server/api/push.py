@@ -313,7 +313,7 @@ def push_one_g2a(row: dict, *, base_url: str, access_token: str) -> dict[str, An
     base = str(base_url or "").strip().rstrip("/")
     token = str(access_token or "").strip()
     email = str(row.get("email") or "").strip()
-    log_email = mask_email(email)
+    log_email = email
     if not base:
         return {"ok": False, "target": "g2a", "action": "", "message": "G2A 未配置地址", "http_status": 0}
     if not token:
@@ -482,11 +482,11 @@ import time
 import uuid
 
 from core import config
+from core.mutex import acquire as mutex_acquire, release as mutex_release
 from core.util import (
     ACCOUNT_WORKER_GAP_SEC,
     ACCOUNT_WORKERS,
     elapsed_label,
-    mask_email,
     now_str,
     run_account_workers,
 )
@@ -499,10 +499,10 @@ _LOG_LIMIT = 500
 
 
 def _who(acc: dict[str, Any]) -> str:
-    """账号日志标识：邮箱脱敏，缺邮箱则回退 #id。"""
+    """账号日志标识：完整邮箱（排查用），缺邮箱则回退 #id。"""
     email = str(acc.get("email") or "").strip()
     aid = int(acc.get("id") or 0)
-    return mask_email(email) if email else f"#{aid}"
+    return email if email else f"#{aid}"
 
 
 def _end_log(job: PushJob) -> None:
@@ -642,6 +642,8 @@ class PushManager:
             )
         concurrency = _clamp_concurrency(concurrency)
         ids = [int(i) for i in account_ids] if account_ids else []
+        # 全局互斥：其它重任务（号池任务/认证/注册）进行中则拒绝
+        mutex_acquire("推送")
 
         with self._lock:
             job = self._job
@@ -703,6 +705,7 @@ class PushManager:
             job.status = "cancelled" if job.cancel_event.is_set() else "done"
             job.finished_at = now_str()
             _end_log(job)
+            mutex_release("推送")
             logger.info(
                 f"[推送] 任务 {job.id} 结束: status={job.status} "
                 f"成功={job.pushed} 失败={job.failed} 跳过={len(job.skipped_list)}"
@@ -765,8 +768,9 @@ class PushManager:
                 break
             aid = int(acc.get("id") or 0)
             skip_reason = ""
+            # 未认证账号仅可走认证（/api/pool/auth），推送一律排除
             if not str(acc.get("access_token") or "").strip():
-                skip_reason = "未认证"
+                skip_reason = "未认证，仅可认证"
             elif int(acc.get("status") or 1) != STATUS_ACTIVE:
                 skip_reason = f"状态非正常(status={acc.get('status')})"
             if skip_reason:

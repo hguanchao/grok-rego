@@ -30,12 +30,12 @@ from core.util import (
     decode_jwt_exp,
     elapsed_label,
     format_exp,
-    mask_email,
     now_str,
     run_account_workers,
 )
 from db import (
     STATUS_ACTIVE,
+    STATUS_DISABLED,
     STATUS_REAUTH,
     add_to_auth_pool,
     get_account_by_email,
@@ -87,6 +87,10 @@ def _proxies() -> dict[str, str] | None:
 # ─── 超时与重试参数 ─────────────────────────────────────────────────────
 CF_WAIT_TIMEOUT = 90  # 等待 Cloudflare 挑战通过的最长时间（秒）
 CF_POLL_INTERVAL = 2  # 风控扫描轮询间隔（秒）
+# grok 风控体检是落地后的可选增强：单次扫描不再死等满 CF_WAIT_TIMEOUT。
+# 体检属于次要目标，必须快点收敛，避免注册完成后浏览器被拖住迟迟不关。
+RISK_SCAN_TIMEOUT = 25  # 单次风控扫描轮询的最长时间（秒）
+RISK_SCAN_ATTEMPTS = 2  # 单轮体检最多跳转重试的次数
 MAX_ATTEMPTS = 3  # 邮箱/验证码/资料阶段失败允许重启浏览器的最大次数（邮箱与资料复用）
 POST_EMAIL_RETRIES = 2  # 仅 SSO 阶段失败：刷新页面重试的次数（不重启浏览器）
 EMAIL_PAGE_WAIT_SECS = 15  # 等待邮箱填写页出现的最长时间（秒）
@@ -462,9 +466,12 @@ def _scan_grok_page(page: Any) -> tuple[int | None, str]:
     若连续 2 次检测到页面为未登录态（出现 Sign in / Sign up 入口且无 botFlag），
     说明 grok.com 未完成登录，体检无意义，提前结束。
     单次命中不退出：SPA 首屏渲染初期可能短暂包含 Sign up / Sign in 文案。
+    体检是落地后的可选增强：上限 RISK_SCAN_TIMEOUT（而非 CF_WAIT_TIMEOUT），
+    拿不到风控字段也要尽快收敛，避免注册完成后浏览器被拖住迟迟不关。
     """
     unauth_count = 0
-    for _ in range(int(CF_WAIT_TIMEOUT / CF_POLL_INTERVAL)):
+    idle_rounds = 0  # 连续无 botFlag 且无变化的轮数，稳定页面提前退出，不硬等满
+    for _ in range(int(RISK_SCAN_TIMEOUT / CF_POLL_INTERVAL)):
         page.wait_for_timeout(CF_POLL_INTERVAL * 1000)
         try:
             html = page.content()
@@ -482,6 +489,14 @@ def _scan_grok_page(page: Any) -> tuple[int | None, str]:
                 return None, ""
         else:
             unauth_count = 0
+        # 稳定无字段：连续 5 个轮询周期（约 10s）页面既无 botFlag 也未出现未登录态波动，
+        # 视为体检页拿不到风控字段，提前放弃（仍远短于原 90s 硬等）
+        idle_rounds += 1
+        if idle_rounds >= 5:
+            logger.debug(
+                f"[风控] grok.com 连续 {idle_rounds} 轮无 botFlag 字段，提前结束体检"
+            )
+            return None, ""
     return None, ""
 
 
@@ -517,18 +532,20 @@ def check_account_risk(page: Any) -> tuple[int | None, str]:
 
     页面已位于 grok.com 则直接扫描，否则先跳转；解析失败自动重试一次，
     仍失败返回 (None, "")，由调用方标记 unknown，不阻塞主流程。
+    体检是落地后的可选增强：最多跳转重试 RISK_SCAN_ATTEMPTS 次，
+    每次扫描上限 RISK_SCAN_TIMEOUT，确保拿到风控结果后尽快收敛、关闭浏览器。
     """
     _seed_sso_for_grok(page)
-    for attempt in (1, 2):
+    for attempt in range(1, RISK_SCAN_ATTEMPTS + 1):
         try:
             current_url = page.url
         except Exception:
             current_url = ""
-        if "grok.com" not in current_url or attempt == 2:
-            logger.debug(f"[风控] 正在跳转 grok.com（第 {attempt}/2 次）")
+        if "grok.com" not in current_url or attempt == RISK_SCAN_ATTEMPTS:
+            logger.debug(f"[风控] 正在跳转 grok.com（第 {attempt}/{RISK_SCAN_ATTEMPTS} 次）")
             safe_goto(page, config.GROK_URL)
         else:
-            logger.debug(f"[风控] 已在 grok.com，直接扫描（第 {attempt}/2 次）")
+            logger.debug(f"[风控] 已在 grok.com，直接扫描（第 {attempt}/{RISK_SCAN_ATTEMPTS} 次）")
 
         bfs, details = _scan_grok_page(page)
         if bfs is not None:
@@ -586,7 +603,7 @@ def _ensure_email(
         if not email:
             logger.error(f"[邮箱] 邮箱创建失败  · {elapsed_label(create_t0)}")
             return None
-        logger.debug(f"[邮箱] 已创建 {mask_email(email)}  · {elapsed_label(create_t0)}")
+        logger.debug(f"[邮箱] 已创建 {email}  · {elapsed_label(create_t0)}")
     if not first_name or not last_name:
         first_name, last_name = _generate_profile_name()
     return email, jwt, first_name, last_name
@@ -608,7 +625,7 @@ def _submit_email(page: Any, email: str) -> tuple[str, bool]:
     允许重启浏览器复用邮箱重试；失败阶段 'post'：已越过邮箱填写阶段。
     """
     t0 = time.monotonic()
-    log_email = mask_email(email)
+    log_email = email
     if not fill(page, email, ["input[type='email']", "input"]):
         logger.warning(f"[邮箱] 未找到输入框  {log_email}  · {elapsed_label(t0)}")
         return "email", False
@@ -696,7 +713,7 @@ def _form_ready_skip(page: Any, email: str, t0: float) -> bool:
     """页面已直接到达资料表单（验证码阶段可跳过）时返回 True。"""
     if _on_form_page(page):
         logger.success(
-            f"[邮件] 已在资料表单，跳过验证码  {mask_email(email)}  · {elapsed_label(t0)}"
+            f"[邮件] 已在资料表单，跳过验证码  {email}  · {elapsed_label(t0)}"
         )
         return True
     return False
@@ -705,7 +722,7 @@ def _form_ready_skip(page: Any, email: str, t0: float) -> bool:
 def _verify_email(page: Any, email: str, jwt: str) -> bool:
     """验证码阶段：等验证码页 → 取码 → 填码 → 等到资料表单。表单未出现视为失败。"""
     t0 = time.monotonic()
-    log_email = mask_email(email)
+    log_email = email
     if _form_ready_skip(page, email, t0):
         return True
     if not wait_until(page, ["verify your email", "one-time code"], OTP_PAGE_WAIT_SECS, check_for_errors=True):
@@ -1044,7 +1061,20 @@ def _run_attempt(
 
             if config.IS_AUTH:  # 浏览器仍开着，顺带 grok.com 风控体检（已登录）
                 risk_t0 = time.monotonic()
-                risk = check_account_risk(page)
+                # 体检是落地后的可选增强：异常不阻断注册成功收尾，也不拖累浏览器关闭。
+                try:
+                    risk = check_account_risk(page)
+                except Exception as exc:
+                    if "TargetClosed" in type(exc).__name__ or "closed" in str(exc).lower():
+                        logger.debug(
+                            f"[风控] {email}  浏览器已关闭，跳过体检  · {elapsed_label(risk_t0)}"
+                        )
+                    else:
+                        logger.warning(
+                            f"[风控] {email}  体检异常，忽略  {type(exc).__name__}: "
+                            f"{str(exc)[:120]}  · {elapsed_label(risk_t0)}"
+                        )
+                    risk = (None, "")
                 bfs, details = risk
                 if bfs is None:
                     logger.warning(
@@ -1180,7 +1210,7 @@ def run_signup(headless: bool = False) -> tuple[bool, str | None, int | None]:
             logger.warning("[注册] 已取消，中止当前账号")
             break
         if attempt > 1:
-            log_email = mask_email(email)
+            log_email = email
             logger.debug(
                 f"[注册] 第 {attempt}/{MAX_ATTEMPTS} 次尝试"
                 f"{f'  {log_email}' if log_email else ''}"
@@ -1195,23 +1225,23 @@ def run_signup(headless: bool = False) -> tuple[bool, str | None, int | None]:
         if stage == "post":
             logger.debug(
                 f"[注册] 第 {attempt} 次尝试在 SSO 阶段失败，不再重启浏览器，"
-                f"放弃: {mask_email(email)}"
+                f"放弃: {email}"
             )
             break
         label = {"email": "邮箱", "otp": "验证码", "form": "资料"}.get(stage, stage)
-        log_email = mask_email(email)
+        log_email = email
         logger.debug(
             f"[注册] {label}阶段失败，重启浏览器"
             f"{f'  {log_email}' if log_email else ''}"
         )
 
     if account_id and email:
-        logger.debug(f"[SSO] 账号已入库，待认证池交换 Token: {mask_email(email)}")
+        logger.debug(f"[SSO] 账号已入库，待认证池交换 Token: {email}")
         if config.IS_AUTH and risk[0] is not None:
             update_risk(email, risk[0], risk[1] or None, now_str())
         return True, email, risk[0]
 
-    logger.error(f"[注册] 全部尝试失败，放弃: {mask_email(email)}")
+    logger.error(f"[注册] 全部尝试失败，放弃: {email}")
     return False, email, risk[0]
 
 
@@ -1275,7 +1305,7 @@ def run_auth_pool(
     （verify + approve 模拟用户授权），再轮询 token 端点。
     成功补写 accounts 并出池；失败出池并标记需重登（保留 sso 可重试）。
     stop_when: 可选，返回 True 时提前结束（用于任务取消）。
-    on_result: 可选，单账号完成后立即回调脱敏邮箱、结果和原因。
+    on_result: 可选，单账号完成后立即回调完整邮箱、结果和原因。
     """
     from workflow.oauth import auth_with_sso
 
@@ -1292,13 +1322,20 @@ def run_auth_pool(
         if stop_when is not None and stop_when():
             return False
         email = entry["email"]
-        log_email = mask_email(email)
+        log_email = email
         account = get_account_by_email(email)
         if account is None:
             logger.warning(f"[出池] {log_email}  账号不存在，已移除")
             remove_from_auth_pool(email)
             if on_result is not None:
                 on_result(log_email, False, "账号不存在")
+            return False
+        # 禁用账号不参与自动认证：直接出队不认证（认证成功会回写 ACTIVE，避免复活禁用账号）
+        if int(account.get("status") or 1) == STATUS_DISABLED:
+            remove_from_auth_pool(email)
+            logger.warning(f"[出池] {log_email}  已禁用，跳过认证并入队移除")
+            if on_result is not None:
+                on_result(log_email, False, "账号已禁用")
             return False
         t0 = time.monotonic()
         token, reason = auth_with_sso(account.get("sso_cookie"))
@@ -1340,7 +1377,7 @@ def run_auth_pool(
                 success_count += 1
             return
         if isinstance(result, Exception):
-            email = mask_email(str(entry.get("email") or ""))
+            email = str(entry.get("email") or "")
             reason = f"{type(result).__name__}: {result}"
             logger.warning(f"[出池] {email}  认证异常：{reason}")
             if on_result is not None:

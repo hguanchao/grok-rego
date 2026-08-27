@@ -12,6 +12,7 @@ from typing import Any
 
 from core.logger import logger
 from core.util import now_iso
+from core.mutex import acquire as mutex_acquire, release as mutex_release
 from workflow import register as register_wf
 
 # 单任务日志条数上限
@@ -154,6 +155,8 @@ class JobManager:
         count = max(1, min(int(count), 100))
         threads = max(1, min(int(threads), 20))
         validate_mail_ready()
+        # 全局互斥：其它重任务（推送/号池任务/认证）进行中则拒绝
+        mutex_acquire("注册")
 
         with self._lock:
             if self._job is not None and self._job.status in ("pending", "running", "stopping"):
@@ -303,6 +306,7 @@ class JobManager:
         finally:
             self._detach_log_sink()
             register_wf.clear_cancel()
+            mutex_release("注册")
 
 
 # 进程级单例

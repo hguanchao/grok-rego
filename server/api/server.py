@@ -200,7 +200,7 @@ def _handle_pool_accounts_api(
         if ids is not None and not _is_digit_id_list(ids, allow_empty=True):
             _error_json(handler, 400, "ids 必须是数组")
             return True
-        from db import add_to_auth_pool, get_auth_pool
+        from db import STATUS_DISABLED, add_to_auth_pool, get_auth_pool
         from workflow.oauth import _extract_sso_value
 
         id_set = {int(i) for i in ids} if ids else None
@@ -215,6 +215,10 @@ def _handle_pool_accounts_api(
                 continue
             if acc.get("access_token"):
                 results.append({"id": acc["id"], "status": "skipped", "reason": "已认证，无需认证"})
+                continue
+            if int(acc.get("status") or 1) == STATUS_DISABLED:
+                # 禁用账号不入认证池（认证成功会回写 ACTIVE），尊重禁用标记
+                results.append({"id": acc["id"], "status": "skipped", "reason": "账号已禁用"})
                 continue
             if acc["email"] in pool_emails:
                 results.append(
@@ -493,6 +497,31 @@ def _handle_usage_api(
     return False
 
 
+def _handle_task_api(
+    method: str, path: str, _query: dict[str, list[str]], handler: BaseHTTPRequestHandler
+) -> bool:
+    """全局任务互斥视图：供前端禁用其它任务按钮（防并发误触）。"""
+    if method == "GET" and path == "/api/tasks/active":
+        from core.mutex import active
+
+        names = set(active())
+        _send_json(
+            handler,
+            200,
+            {
+                "ok": True,
+                "data": {
+                    "register": "注册" in names,
+                    "push": "推送" in names,
+                    "pool": "号池" in names,
+                    "auth": "认证" in names,
+                },
+            },
+        )
+        return True
+    return False
+
+
 def _handle_api(
     method: str, path: str, query: dict[str, list[str]], handler: BaseHTTPRequestHandler
 ) -> bool:
@@ -505,6 +534,7 @@ def _handle_api(
         _handle_pool_push_api,
         _handle_pool_maintenance_api,
         _handle_usage_api,
+        _handle_task_api,
     ):
         if route_handler(method, path, query, handler):
             return True

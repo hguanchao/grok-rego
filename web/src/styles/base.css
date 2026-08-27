@@ -48,6 +48,10 @@
   }::selection {
     background: color-mix(in srgb, var(--primary) 28%, transparent);
     color: var(--foreground);
+  }/* Tailwind v4 preflight 默认 button cursor:default，恢复小手 */
+  button:not(:disabled),
+  [role="button"]:not(:disabled) {
+    cursor: pointer;
   }
 }
 /* ══════════════════════════════════════════════

@@ -349,6 +349,18 @@ export async function fetchAutoRefreshStatus(afterLogId: number): Promise<AutoRe
   );
 }
 
+/** 全局任务互斥状态：任一为 true 表示对应重任务正在执行（用于禁用其它任务按钮）。 */
+export interface TaskActiveStatus {
+  register: boolean;
+  push: boolean;
+  pool: boolean; // 巡检 / 重登 / 风控 共享槽
+  auth: boolean;
+}
+
+export async function fetchTaskActive(): Promise<TaskActiveStatus> {
+  return request<TaskActiveStatus>("/api/tasks/active");
+}
+
 export interface PoolAuthResultItem {
   id: number;
   email?: string;
@@ -459,7 +471,9 @@ export interface GatewayAccountRow {
   id: number;
   email: string;
   authed: boolean;
+  status: number;
   disabled: boolean;
+  cooling: boolean;
   requests_24h: number;
 }
 
@@ -470,8 +484,10 @@ export interface GatewayOpsData {
   stats_24h: Record<string, GatewayChannelStats>;
   account_pool: {
     total: number;
-    authed: number;
-    disabled: number;
+    active: number;
+    in_use: number;
+    sticky: number;
+    cooling: number;
     requests_24h: number;
     accounts: GatewayAccountRow[];
   };

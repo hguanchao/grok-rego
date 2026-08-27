@@ -462,6 +462,55 @@
   border-color: color-mix(in srgb, var(--primary) 35%, var(--border));
 }
 
+/* 账号运行态：三列网格（#ID / 邮箱 / 状态，无表头） */
+.gw-acct-row {
+  display: grid;
+  grid-template-columns: 84px 1fr 96px 92px;
+  align-items: center;
+  gap: 12px;
+  padding: 7px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: color-mix(in srgb, var(--muted) 22%, transparent);
+  transition:
+    border-color var(--ap-dur-fast, 140ms) ease,
+    background-color var(--ap-dur-fast, 140ms) ease;
+}
+.gw-acct-row.is-cooling {
+  border-color: color-mix(in srgb, var(--warn) 40%, var(--border));
+  background: color-mix(in srgb, var(--warn) 8%, transparent);
+}
+.gw-acct-row.is-strikes {
+  border-color: color-mix(in srgb, var(--destructive) 30%, var(--border));
+  background: color-mix(in srgb, var(--destructive) 6%, transparent);
+}
+.gw-acct-cell {
+  min-width: 0;
+}
+.gw-acct-cell-id {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--foreground);
+  font-variant-numeric: tabular-nums;
+}
+.gw-acct-cell-email {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
+}
+.gw-acct-cell-usage {
+  justify-self: end;
+}
+.gw-usage-badge {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+.gw-acct-state {
+  justify-self: end;
+}
+
 .gw-empty-sub {
   display: block;
   margin-top: 6px;

@@ -126,28 +126,27 @@ Web UI「网关运维」页：接入点复制、鉴权密钥（随机生成 sk- 
 
 ## Grok 号池网关
 
-用号池已认证账号的 `access_token` 转发到 `https://cli-chat-proxy.grok.com/v1`。选号：请求头 `X-Account-Id` 或查询参数 `account_id`。
+用号池已认证账号的 `access_token` 转发到 `https://cli-chat-proxy.grok.com/v1`。每次请求自动从号池取号（ACTIVE + 已认证 + token 未过期，轮询分摊）；上游判定为坏号的账号（401/403/404/429 等）临时冷却，到期自动解冻，避免反复命中。
 
 | 项 | 值 |
 | --- | --- |
 | 客户端 Base URL | `http://127.0.0.1:8787/grok/v1` |
-| 选号 | `X-Account-Id: <账号 id>` |
+| 选号 | 自动轮询 + 坏号临时冷却（无需配置） |
 | 上游 | `https://cli-chat-proxy.grok.com/v1` |
 | 鉴权 | 号池账号 Bearer token（网关注入） |
 
 ```bash
-curl http://127.0.0.1:8787/grok/v1/models -H "X-Account-Id: 1"
+curl http://127.0.0.1:8787/grok/v1/models
 
 curl http://127.0.0.1:8787/grok/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -H "X-Account-Id: 1" \
   -d '{"model":"grok-4","messages":[{"role":"user","content":"hi"}]}'
 ```
 
 ## 安全说明
 
 - `server/config.json`（含密钥 / Token）不在版本库内；提交代码前请确认仅保留 `config.example.json` 模板
-- 日志输出对敏感字段做脱敏处理
+- 日志尽量保留完整账号信息（邮箱等）便于排查，但**绝不打印 access_token / refresh_token / SSO cookie 等凭据明文**
 - 管理 API **无访问认证**，默认仅监听 `127.0.0.1`；请勿暴露到公网或反代到外网
 
 ## License

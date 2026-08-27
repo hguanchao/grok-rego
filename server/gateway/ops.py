@@ -18,8 +18,14 @@ from collections.abc import Callable
 from typing import Any
 
 from core import config
-from core.util import mask_email, now_iso_tz
-from db import get_all_accounts, query_account_usage_24h, query_channel_usage_24h
+from core.util import now_iso_tz
+from db import (
+    STATUS_ACTIVE,
+    STATUS_DISABLED,
+    get_all_accounts,
+    query_account_usage_24h,
+    query_channel_usage_24h,
+)
 from gateway import grok as grok_gateway
 from gateway import opencode as zen_gateway
 
@@ -61,35 +67,53 @@ def _channels() -> list[dict[str, Any]]:
 
 
 def _account_pool() -> dict[str, Any]:
-    """号池账号运行态：计数汇总 + 逐账号脱敏行（含近 24h 请求数）。"""
+    """号池账号运行态：四维 KPI（正常/在用/粘性/冷却）+ 逐账号行（含近 24h 请求数）。
+
+    口径：正常=已认证且状态 ACTIVE(1)；在用=近 24h 产生过请求的活跃账号；
+    粘性=网关粘性会话绑定数；冷却=当前短期冻结中账号数。邮箱完整展示供排查运维。
+    """
     accounts = get_all_accounts()
     per_account = query_account_usage_24h()
+    cooling_until = grok_gateway.cooldown_until_map()
+    now_mono = time.monotonic()
+    cooled_ids = {aid for aid, until in cooling_until.items() if until > now_mono}
+    sticky = int(grok_gateway.snapshot().get("sticky_sessions") or 0)
 
     rows: list[dict[str, Any]] = []
-    authed = 0
-    disabled = 0
+    active = 0
+    in_use = 0
+    cooling = 0
     for acc in accounts:
         has_token = bool(str(acc.get("access_token") or "").strip())
-        is_disabled = int(acc.get("status") or 1) != 1
-        if has_token:
-            authed += 1
-        if is_disabled:
-            disabled += 1
+        status = int(acc.get("status") or 1)
+        is_cooling = int(acc["id"]) in cooled_ids
+        is_disabled = status == STATUS_DISABLED
+        requests = per_account.get(int(acc["id"]), 0)
+        if has_token and status == STATUS_ACTIVE:
+            active += 1
+        if requests > 0:
+            in_use += 1
+        if is_cooling:
+            cooling += 1
         rows.append(
             {
                 "id": acc["id"],
-                # 安全约束：管理面展示一律脱敏邮箱
-                "email": mask_email(acc.get("email")),
+                # 排查运维：管理面账号池展示完整邮箱（不做脱敏）
+                "email": acc.get("email") or "",
                 "authed": has_token,
+                "status": status,
                 "disabled": is_disabled,
-                "requests_24h": per_account.get(int(acc["id"]), 0),
+                "cooling": is_cooling,
+                "requests_24h": requests,
             }
         )
 
     return {
         "total": len(accounts),
-        "authed": authed,
-        "disabled": disabled,
+        "active": active,
+        "in_use": in_use,
+        "sticky": sticky,
+        "cooling": cooling,
         "requests_24h": sum(per_account.values()),
         "accounts": rows,
     }

@@ -81,6 +81,7 @@ import {
   updatePoolAccountStatus,
   fetchAutoRefreshStatus,
   fetchAuthPoolStatus,
+  fetchTaskActive,
   STATUS_LABELS,
   ApiError,
   type AppConfig,
@@ -96,16 +97,6 @@ import { toast } from "sonner";
 
 /** 刷新按钮旋转动效保底时长（本地请求过快时旋转至少可见） */
 const MIN_SPIN_MS = 450;
-
-/** 日志中的邮箱脱敏，账号表仍保留完整邮箱供管理操作。 */
-function maskLogEmail(value: string): string {
-  const [local = "", domain = ""] = value.split("@", 2);
-  if (!domain) return value;
-  const [domainName = "", ...suffix] = domain.split(".");
-  const maskedLocal = local ? `${local.slice(0, 2)}***` : "***";
-  const maskedDomain = domainName ? `${domainName.slice(0, 1)}***` : "***";
-  return `${maskedLocal}@${maskedDomain}${suffix.length ? `.${suffix.join(".")}` : ""}`;
-}
 
 export function PoolPage() {
   const [config, setConfig] = useState<AppConfig | null>(null);
@@ -145,6 +136,8 @@ export function PoolPage() {
   // 详情弹窗独立的密码可见性，避免与列表 visiblePasswords 共享导致联动
   const [detailPasswordVisible, setDetailPasswordVisible] = useState(false);
   const [inspecting, setInspecting] = useState(false);
+  // 全局互斥：其它任务（含注册页）执行中时禁用本页任务发起按钮
+  const [globalTaskBusy, setGlobalTaskBusy] = useState(false);
   // 推送异步任务：running 时轮询状态，结束后清空；null 表示无任务
   const [pushTask, setPushTask] = useState<PoolPushTask | null>(null);
   // 自动续期 daemon 状态（常驻轮询：进度条 + 增量日志；声明需在 activeTask 之前）
@@ -226,7 +219,7 @@ export function PoolPage() {
   const accountLabel = useCallback(
     (id: number): string => {
       const acc = accounts.find((a) => a.id === id);
-      return acc ? maskLogEmail(acc.email) : `ID ${id}`;
+      return acc ? acc.email : `ID ${id}`;
     },
     [accounts],
   );
@@ -387,6 +380,25 @@ export function PoolPage() {
     [appendLogs, load, settleTask, stopPushPolling],
   );
 
+  // 全局任务互斥轮询：任一重任务（注册/推送/认证/号池）执行中禁用本页发起按钮
+  useEffect(() => {
+    let alive = true;
+    const tick = () => {
+      if (!alive) return;
+      fetchTaskActive()
+        .then((d) => {
+          if (alive) setGlobalTaskBusy(d.register || d.push || d.pool || d.auth);
+        })
+        .catch(() => {});
+    };
+    tick();
+    const timer = window.setInterval(tick, 1000);
+    return () => {
+      alive = false;
+      window.clearInterval(timer);
+    };
+  }, []);
+
   /** 当前运行中的任务类型，用于按钮切换为停止态（终态保留展示中的任务不算运行中） */
   const runningTask: "inspect" | "reauth" | "risk" | "push" | "auth" | null = (() => {
     const active = (t: PoolPushTask | PoolOpTask | null) =>
@@ -400,6 +412,9 @@ export function PoolPage() {
     if (inspecting) return "auth";
     return null;
   })();
+
+  // 页面内任务或全局其它任务执行中：发起类按钮整体禁用
+  const anyBusy = runningTask !== null || globalTaskBusy;
 
   // 当前任务进度条数据：名称 · 状态 + done/total + 百分比；终态仅在保留期内展示
   const activeTask = (() => {
@@ -426,9 +441,9 @@ export function PoolPage() {
       };
     };
     if (pushTask) return pick(pushTask, "推送");
-    if (poolTask?.kind === "reauth") return pick(poolTask, "重登");
-    if (poolTask?.kind === "risk") return pick(poolTask, "风控");
-    if (poolTask?.kind === "inspect") return pick(poolTask, "巡检");
+    if (poolTask?.kind === "reauth") return pick(poolTask, "重新登录");
+    if (poolTask?.kind === "risk") return pick(poolTask, "风控体检");
+    if (poolTask?.kind === "inspect") return pick(poolTask, "巡检探活");
     // 自动续期后台扫描进行中时展示进度条（非手动任务，扫描结束自动隐藏）
     if (refreshState?.running) {
       const pct =
@@ -436,7 +451,7 @@ export function PoolPage() {
           ? Math.min(100, Math.round((refreshState.done / refreshState.total) * 100))
           : 0;
       return {
-        name: "续期",
+        name: "自动续期",
         status: "执行中",
         done: refreshState.done,
         total: refreshState.total,
@@ -1158,7 +1173,7 @@ export function PoolPage() {
         const reason: Record<typeof kind, string> = {
           auth: "当前没有未认证的账号",
           reauth: "当前没有需重登状态的账号",
-          inspect: "当前没有可巡检的账号（已认证且非需重登）",
+          inspect: "当前没有可巡检的账号（已认证且非需重登且非禁用）",
           push: "当前没有可推送的账号（已认证且状态正常）",
         };
         toast.warning(reason[kind]);
@@ -1226,7 +1241,7 @@ export function PoolPage() {
           >
             <div className="metric-k">待处理</div>
             <div className="metric-v is-warn">{stats.pending_action}</div>
-            <div className="metric-sub">需重新登录 + 限额</div>
+            <div className="metric-sub">需重登 + 限额</div>
           </button>
           <button
             type="button"
@@ -1329,7 +1344,7 @@ export function PoolPage() {
               <Button
                 size="sm"
                 variant={logOpen ? "default" : "outline"}
-                className={cn("ops-log-trigger", runningTask && "is-live")}
+                className={cn("ops-log-trigger", (runningTask || refreshState?.running) && "is-live")}
                 onClick={() => {
                   if (logOpen) setLogOpen(false);
                   else showLogDrawer();
@@ -1342,14 +1357,14 @@ export function PoolPage() {
               >
                 <ScrollText className="size-3.5" strokeWidth={1.6} aria-hidden />
                 日志
-                {runningTask ? (
+                {runningTask || refreshState?.running ? (
                   <span className="ops-log-live-dot" aria-hidden />
                 ) : null}
               </Button>
               <Button
                 size="sm"
                 variant="outline"
-                disabled={runningTask !== null}
+                disabled={anyBusy}
                 title={
                   runningTask
                     ? "任务执行中，请先停止"
@@ -1392,7 +1407,7 @@ export function PoolPage() {
               <Button
                 size="sm"
                 variant="secondary"
-                disabled={runningTask !== null}
+                disabled={anyBusy}
                 title={
                   runningTask
                     ? "任务执行中，请先停止"
@@ -1408,7 +1423,7 @@ export function PoolPage() {
               <Button
                 size="sm"
                 variant="secondary"
-                disabled={runningTask !== null}
+                disabled={anyBusy}
                 title={
                   runningTask
                     ? "任务执行中，请先停止"
@@ -1424,6 +1439,7 @@ export function PoolPage() {
               <Button
                 size="sm"
                 variant={runningTask ? "destructive" : "default"}
+                disabled={!runningTask && globalTaskBusy}
                 title={
                   runningTask
                     ? `停止${
@@ -1529,7 +1545,6 @@ export function PoolPage() {
         <DialogContent className="account-detail-dialog sm:max-w-lg">
           <DialogHeader>
             <DialogTitle>账号详情</DialogTitle>
-            <DialogDescription>ID {detailAccount?.id} 的完整账号信息。</DialogDescription>
           </DialogHeader>
           {detailAccount ? (
             <dl className="account-detail-grid">
