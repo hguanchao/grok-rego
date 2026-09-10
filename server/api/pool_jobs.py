@@ -990,11 +990,20 @@ class PoolJobManager:
 
             # 凭证失效（401/403）：刷新后再探
             if status in _HTTP_TOKEN_INVALID:
-                new_token = self._refresh_and_reprobe(job, acc)
-                if new_token:
+                refreshed = self._refresh_and_reprobe(job, acc)
+                if refreshed:
+                    new_token, result = refreshed
                     update_account_status_by_ids([aid], STATUS_ACTIVE, "")
                     exp_str = format_exp(decode_jwt_exp(new_token))
-                    msg = f"{status} 刷新后探活通过 · 到期时间 {exp_str}"
+                    tps = float(result.get("output_tps") or 0)
+                    thinking = 1 if result.get("has_thinking") else 0
+                    dumbed = int(result.get("dumbed") or 0)
+                    dumb_tag = "降智" if dumbed else "正常"
+                    think_tag = "有思考链" if thinking else "无思考链"
+                    msg = (
+                        f"{status} 刷新后探活通过 · {think_tag} · {tps:.1f} token/s · "
+                        f"{dumb_tag} · 到期 {exp_str}"
+                    )
                     return {"aid": aid, "ok": True, "message": msg, "cost": elapsed_label(t0)}
                 update_account_status_by_ids(
                     [aid], STATUS_REAUTH, "探活失败，token 失效，需重新登录"
@@ -1015,8 +1024,10 @@ class PoolJobManager:
 
         self._run_concurrent(job, candidates, work)
 
-    def _refresh_and_reprobe(self, job: PoolJob, acc: dict[str, Any]) -> str | None:
-        """刷新 token 成功后用新 token 再探一次；成功返回新 access_token，失败返回 None。"""
+    def _refresh_and_reprobe(
+        self, job: PoolJob, acc: dict[str, Any]
+    ) -> tuple[str, dict[str, Any]] | None:
+        """刷新 token 成功后用新 token 再探一次；成功返回 (access_token, 探活结果)。"""
         refresh_token = str(acc.get("refresh_token") or "").strip()
         if not refresh_token:
             logger.warning(f"[巡检] {_who(acc)} 无 refresh_token，无法刷新")
@@ -1060,7 +1071,7 @@ class PoolJobManager:
                 f"[巡检] {_who(acc)} 二次探活通过 · HTTP {reprobe_status} "
                 f"thinking={thinking} tps={tps:.1f} dumbed={dumbed}"
             )
-            return new_token
+            return new_token, result
         logger.warning(f"[巡检] {_who(acc)} 二次探活失败 · HTTP {reprobe_status or 'N/A'}")
         return None
 

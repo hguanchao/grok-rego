@@ -365,7 +365,7 @@
 .pool-table-wrap .pool-col-auth,
 .pool-table-wrap .pool-col-time,
 .pool-table-wrap .pool-col-status,
-.pool-table-wrap .pool-col-bfs,
+.pool-table-wrap .pool-col-inspect,
 .pool-table-wrap .pool-col-actions {
   width: auto;
   white-space: nowrap;

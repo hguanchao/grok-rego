@@ -201,9 +201,10 @@ def get_account_by_email(email: str) -> dict[str, Any] | None:
 
 
 def list_gateway_candidates() -> list[dict[str, Any]]:
-    """网关自动选号候选：ACTIVE 且已认证的未删除账号（按 id 升序）。
+    """网关自动选号候选：ACTIVE、已认证、未降智的未删除账号（按 id 升序）。
 
-    只返回 id / email / access_token 三个字段，供网关轮询转发使用。
+    dumbed=1 由推理巡检写入，转发会拿到无思考链的降智号，这里直接排除。
+    dumbed 为空（尚未巡检）仍可入选。只返回 id / email / access_token。
     """
     with connect() as conn:
         conn.row_factory = sqlite3.Row
@@ -212,6 +213,7 @@ def list_gateway_candidates() -> list[dict[str, Any]]:
             "WHERE COALESCE(is_deleted, 0) = 0 "
             "AND COALESCE(status, 1) = ? "
             "AND COALESCE(access_token, '') != '' "
+            "AND COALESCE(dumbed, 0) = 0 "
             "ORDER BY id",
             (STATUS_ACTIVE,),
         ).fetchall()
@@ -287,6 +289,25 @@ def update_account_inspect(
             f"tps={inspect_tps:.1f} thinking={inspect_thinking}"
         )
     return ok
+
+
+def update_risk(
+    email: str, bfs: int | None = None, risk: str | None = None, checked_at: str | None = None
+) -> bool:
+    """更新账号注册风控体检结果（bfs / risk / checked_at）。"""
+    with connect() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE accounts SET bfs=?, risk=?, checked_at=?, updated_at=? WHERE email=?",
+            (bfs, risk, checked_at, now_iso_tz(), email),
+        )
+        conn.commit()
+        is_updated = cursor.rowcount > 0
+    if is_updated:
+        logger.success(f"[数据库] 已更新风控结果 (email: {email}, bfs: {bfs})")
+    else:
+        logger.warning(f"[数据库] 未找到账号，风控结果未更新: {email}")
+    return is_updated
 
 
 def update_account_status(

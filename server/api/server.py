@@ -422,25 +422,6 @@ def _handle_pool_maintenance_api(
         )
         _send_json(handler, 200, {"ok": True, "data": data})
         return True
-    if method == "POST" and path == "/api/pool/risk":
-        body = _json_body(handler) or {}
-        if not isinstance(body, dict):
-            _error_json(handler, 400, "请求体必须是 JSON 对象")
-            return True
-        ids = body.get("ids")
-        if not _is_digit_id_list(ids, allow_empty=False) or len(ids) != 1:
-            _error_json(handler, 400, "ids 必须是长度为 1 的数组")
-            return True
-        try:
-            data = pool_job_manager.start(
-                kind="risk", account_ids=[int(i) for i in ids], concurrency=1
-            )
-        except RuntimeError as exc:
-            _error_json(handler, 400, str(exc))
-            return True
-        logger.info(f"[风控] 任务启动 账号 id={ids[0]} task={data.get('id')}")
-        _send_json(handler, 200, {"ok": True, "data": data})
-        return True
     if method == "GET" and path == "/api/pool/auth/status":
         after = _after_log_id(query)
         _send_json(

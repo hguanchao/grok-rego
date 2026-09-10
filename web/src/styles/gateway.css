@@ -432,6 +432,14 @@
 .gw-acct-row.is-sticky {
   border-color: color-mix(in srgb, var(--primary) 35%, var(--border));
 }
+.gw-acct-state.is-dumbed {
+  color: var(--destructive);
+  border-color: color-mix(in srgb, var(--destructive) 45%, var(--border));
+  background: color-mix(in srgb, var(--destructive) 10%, transparent);
+}
+.gw-acct-row.is-dumbed {
+  border-color: color-mix(in srgb, var(--destructive) 35%, var(--border));
+}
 .gw-acct-state.is-idle {
   color: var(--ok);
   border-color: color-mix(in srgb, var(--ok) 35%, var(--border));

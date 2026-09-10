@@ -49,12 +49,12 @@ import {
   AUTH_FILTER_OPTIONS,
   EXPIRY_FILTER_OPTIONS,
   PAGE_SIZE_OPTIONS,
-  RISK_VARIANT,
+  INSPECT_VARIANT,
   STATUS_FILTER_OPTIONS,
   formatPoolExpiry,
+  inspectLabel,
+  inspectTitle,
   poolLogNow,
-  riskLabel,
-  riskTitle,
   type PoolLogEntry,
 } from "@/components/pool/PoolPageParts";
 import {
@@ -77,7 +77,6 @@ import {
   cancelPoolOpTask,
   fetchPoolOpTaskStatus,
   reauthPoolAccounts,
-  riskPoolAccount,
   updatePoolAccountStatus,
   fetchAutoRefreshStatus,
   fetchAuthPoolStatus,
@@ -298,7 +297,7 @@ export function PoolPage() {
     }
   }, []);
 
-  /** 停止巡检/重登/风控任务轮询 */
+  /** 停止巡检/重登任务轮询 */
   const stopPoolPolling = useCallback(() => {
     if (poolPollRef.current) {
       clearInterval(poolPollRef.current);
@@ -400,13 +399,13 @@ export function PoolPage() {
   }, []);
 
   /** 当前运行中的任务类型，用于按钮切换为停止态（终态保留展示中的任务不算运行中） */
-  const runningTask: "inspect" | "reauth" | "risk" | "push" | "auth" | null = (() => {
+  const runningTask: "inspect" | "reauth" | "push" | "auth" | null = (() => {
     const active = (t: PoolPushTask | PoolOpTask | null) =>
       !!t && (t.status === "pending" || t.status === "running");
     if (active(pushTask)) return "push";
     if (active(poolTask)) {
       const kind = poolTask?.kind;
-      if (kind === "inspect" || kind === "reauth" || kind === "risk") return kind;
+      if (kind === "inspect" || kind === "reauth") return kind;
     }
     // 认证轮询期间 inspecting 保持 true（见 startAuthPolling）
     if (inspecting) return "auth";
@@ -442,7 +441,6 @@ export function PoolPage() {
     };
     if (pushTask) return pick(pushTask, "推送");
     if (poolTask?.kind === "reauth") return pick(poolTask, "重新登录");
-    if (poolTask?.kind === "risk") return pick(poolTask, "风控体检");
     if (poolTask?.kind === "inspect") return pick(poolTask, "巡检探活");
     // 自动续期后台扫描进行中时展示进度条（非手动任务，扫描结束自动隐藏）
     if (refreshState?.running) {
@@ -506,16 +504,14 @@ export function PoolPage() {
     [appendLogs, load, stopAuthPolling],
   );
 
-  /** 号池任务日志类型：inspect / reauth / risk */
+  /** 号池任务日志类型：inspect / reauth */
   const poolLogType = (kind: PoolOpKind): PoolLogEntry["type"] => {
     if (kind === "reauth") return "reauth";
-    if (kind === "risk") return "inspect"; // 风控归入巡检类日志通道
     return "inspect";
   };
 
   const poolKindLabel = (kind: PoolOpKind): string => {
     if (kind === "reauth") return "重登";
-    if (kind === "risk") return "风控";
     return "巡检";
   };
 
@@ -535,7 +531,7 @@ export function PoolPage() {
     [appendLogs],
   );
 
-  /** 巡检/重登/风控任务轮询：增量日志 + 待授权账号弹窗，任务结束收尾 */
+  /** 巡检/重登任务轮询：增量日志 + 待授权账号弹窗，任务结束收尾 */
   const startPoolPolling = useCallback(
     (taskId: string, kind: PoolOpKind) => {
       stopPoolPolling();
@@ -580,7 +576,7 @@ export function PoolPage() {
     [appendLogs, appendPoolTaskLogs, load, settleTask, stopPoolPolling],
   );
 
-  /** 取消巡检/重登/风控任务 */
+  /** 取消巡检/重登任务 */
   const handleCancelPoolTask = useCallback(async () => {
     const kind = poolTask?.kind ?? "inspect";
     try {
@@ -657,7 +653,7 @@ export function PoolPage() {
 
   /**
    * 页面刷新恢复执行中的后台任务：服务端快照免 taskId，日志按 last_log_id 续拉。
-   * push / 巡检 / 重登 / 风控完整恢复进度条与日志；自动认证池无任务快照，仅提示。
+   * push / 巡检 / 重登完整恢复进度条与日志；自动认证池无任务快照，仅提示。
    * 仅挂载后执行一次：依赖里的轮询函数随 load（分页等）变化，若不拦截会导致
    * 每次分页都重跑恢复并重复弹出日志抽屉。
    */
@@ -697,7 +693,7 @@ export function PoolPage() {
       } catch {
         // 静默：无可恢复任务
       }
-      // 巡检 / 重登 / 风控（共用同一任务槽）
+      // 巡检 / 重登（共用同一任务槽）
       try {
         const snap = await fetchPoolOpTaskStatus("", 0);
         if (!cancelled && snap.id && snap.status !== "idle") {
@@ -897,15 +893,6 @@ export function PoolPage() {
         if (task.id) {
           startPoolPolling(task.id, "reauth");
         }
-      } else if (action === "risk") {
-        openLogDrawer();
-        const task = await riskPoolAccount(id);
-        setPoolTask(task);
-        appendPoolTaskLogs(task, "risk");
-        poolAfterRef.current = task.last_log_id;
-        if (task.id) {
-          startPoolPolling(task.id, "risk");
-        }
       } else if (action === "disable") {
         await updatePoolAccountStatus([id], 6, "已禁用");
         toast.success("已禁用");
@@ -915,7 +902,7 @@ export function PoolPage() {
       const reason =
         e instanceof ApiError ? e.message : `${(e as Error)?.name ?? "Error"}: ${(e as Error)?.message ?? "未知"}`;
       const type = action === "auth" ? "auth" : action === "reauth" ? "reauth" : "inspect";
-      const tag = action === "auth" ? "认证" : action === "reauth" ? "重登" : action === "risk" ? "风控" : "任务";
+      const tag = action === "auth" ? "认证" : action === "reauth" ? "重登" : "任务";
       appendLogs([
         {
           type,
@@ -1086,7 +1073,7 @@ export function PoolPage() {
     }
   };
 
-  /** 停止当前运行中的任务（推送/认证/重登/巡检/风控统一入口） */
+  /** 停止当前运行中的任务（推送/认证/重登/巡检统一入口） */
   const handleStopRunning = useCallback(() => {
     switch (runningTask) {
       case "push":
@@ -1094,7 +1081,6 @@ export function PoolPage() {
         break;
       case "inspect":
       case "reauth":
-      case "risk":
         void handleCancelPoolTask();
         break;
       case "auth":
@@ -1187,7 +1173,7 @@ export function PoolPage() {
     const detail: Record<typeof kind, string> = {
       auth: "将对账号发起 SSO 认证并交换 Token，未认证账号才会被处理。",
       reauth: "将刷新账号登录态；无刷新凭据或刷新被拒时，任务内直接发起 SSO 重新认证。",
-      inspect: "将逐个探活上游并回写风控状态与到期时间，产生真实上游请求。",
+      inspect: "将逐个推理巡检并回写降智判定与到期时间，产生真实上游请求。",
       push: `将把账号同步到 ${[
         g2aConfigured ? "G2A" : null,
         cpaConfigured ? "CPA" : null,
@@ -1449,9 +1435,7 @@ export function PoolPage() {
                             ? "认证"
                             : runningTask === "reauth"
                               ? "重登"
-                              : runningTask === "risk"
-                                ? "风控"
-                                : "巡检"
+                              : "巡检"
                       }任务`
                     : selected.size > 0
                       ? "巡检探活选中账号（未认证自动跳过）"
@@ -1608,16 +1592,29 @@ export function PoolPage() {
                 </dd>
               </div>
               <div>
-                <dt>风控强度</dt>
-                <dd title={riskTitle(detailAccount.risk, detailAccount.bfs, detailAccount.checked_at)}>
-                  <Badge variant={RISK_VARIANT[riskLabel(detailAccount.risk, detailAccount.bfs).label] || "secondary"}>
-                    {riskLabel(detailAccount.risk, detailAccount.bfs).label}
+                <dt>巡检</dt>
+                <dd
+                  title={inspectTitle(
+                    detailAccount.dumbed,
+                    detailAccount.inspect_tps,
+                    detailAccount.inspect_thinking,
+                    detailAccount.inspected_at
+                      ? formatAccountTime(detailAccount.inspected_at)
+                      : null,
+                  )}
+                >
+                  <Badge
+                    variant={
+                      INSPECT_VARIANT[inspectLabel(detailAccount.dumbed)] || "secondary"
+                    }
+                  >
+                    {inspectLabel(detailAccount.dumbed)}
                   </Badge>
                 </dd>
               </div>
               <div>
-                <dt>风控检测时间</dt>
-                <dd>{formatAccountTime(detailAccount.checked_at)}</dd>
+                <dt>巡检时间</dt>
+                <dd>{formatAccountTime(detailAccount.inspected_at)}</dd>
               </div>
               <div className="detail-reason">
                 <dt>原因</dt>

@@ -15,10 +15,9 @@ export const ACCOUNT_STATUS_VARIANT: Record<number, BadgeVariant> = {
   6: "destructive",
 };
 
-export const RISK_VARIANT: Record<string, BadgeVariant> = {
-  低: "success",
-  中: "warning",
-  高: "destructive",
+export const INSPECT_VARIANT: Record<string, BadgeVariant> = {
+  正常: "success",
+  降智: "destructive",
 };
 
 export const STATUS_FILTER_OPTIONS: Array<{
@@ -84,31 +83,35 @@ export function poolExpiryTone(
   return isPoolExpired(expiresAt) ? "expired" : "ok";
 }
 
-export function riskLabel(
-  risk: string | null,
-  bfs: number | null,
-): { label: string; score: string | null } {
-  // bfs 未检测时保持「未知」；0=低 / 1=中 / ≥2=高（与后端 botFlagSource 对齐）
-  let level = "未知";
-  if (bfs === 0) level = "低";
-  else if (bfs === 1) level = "中";
-  else if (bfs != null && bfs >= 2) level = "高";
-  const score = risk ? /risk=([\d.]+)/.exec(risk)?.[1] ?? null : null;
-  return { label: level, score };
+/** 巡检降智徽章：未巡检=未知，dumbed=1=降智，否则正常 */
+export function inspectLabel(dumbed: number | null | undefined): string {
+  if (dumbed == null) return "未知";
+  return dumbed === 1 ? "降智" : "正常";
 }
 
-export function riskTitle(
-  risk: string | null,
-  bfs: number | null,
-  checkedAt: string | null,
+export function inspectTpsText(tps: number | null | undefined): string {
+  if (tps == null || !Number.isFinite(tps) || tps <= 0) return "—";
+  return tps >= 100 ? `${Math.round(tps)}/s` : `${tps.toFixed(1)}/s`;
+}
+
+export function inspectTitle(
+  dumbed: number | null | undefined,
+  inspectTps: number | null | undefined,
+  inspectThinking: number | null | undefined,
+  inspectedAt: string | null | undefined,
 ): string {
-  const { label, score } = riskLabel(risk, bfs);
+  const label = inspectLabel(dumbed);
   const parts = [
-    label === "未知" ? "未检测" : label,
-    score ? `risk=${score}` : null,
-    checkedAt ? `检测于 ${checkedAt}` : null,
+    label === "未知" ? "未巡检" : label,
+    inspectThinking === 1
+      ? "有思考链"
+      : inspectThinking === 0
+        ? "无思考链"
+        : null,
+    inspectTps != null && inspectTps > 0 ? inspectTpsText(inspectTps) : null,
+    inspectedAt ? `巡检于 ${inspectedAt}` : null,
   ].filter(Boolean) as string[];
-  return parts.join(" · ") || "未检测";
+  return parts.join(" · ") || "未巡检";
 }
 
 // ─── 号池操作日志 ───────────────────────────────────────────

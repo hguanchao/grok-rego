@@ -187,9 +187,10 @@ export interface PoolAccount {
   expires_at: number | null;
   status: number;
   reason: string | null;
-  bfs: number | null;
-  risk: string | null;
-  checked_at: string | null;
+  dumbed: number | null;
+  inspect_tps: number | null;
+  inspect_thinking: number | null;
+  inspected_at: string | null;
   is_deleted: number;
   created_at: string;
   updated_at: string | null;
@@ -249,7 +250,7 @@ export async function deletePoolAccounts(ids: number[]): Promise<{ deleted: numb
   });
 }
 
-export type PoolOpKind = "inspect" | "reauth" | "risk" | "";
+export type PoolOpKind = "inspect" | "reauth" | "";
 
 export interface PoolOpTask {
   id: string | null;
@@ -310,13 +311,6 @@ export async function reauthPoolAccounts(
   });
 }
 
-export async function riskPoolAccount(id: number): Promise<PoolOpTask> {
-  return request<PoolOpTask>("/api/pool/risk", {
-    method: "POST",
-    body: JSON.stringify({ ids: [id] }),
-  });
-}
-
 export interface AutoRefreshStatus {
   running: boolean;
   interval_min: number;
@@ -353,7 +347,7 @@ export async function fetchAutoRefreshStatus(afterLogId: number): Promise<AutoRe
 export interface TaskActiveStatus {
   register: boolean;
   push: boolean;
-  pool: boolean; // 巡检 / 重登 / 风控 共享槽
+  pool: boolean; // 巡检 / 重登 共享槽
   auth: boolean;
 }
 
@@ -475,6 +469,7 @@ export interface GatewayAccountRow {
   disabled: boolean;
   cooling: boolean;
   sticky: boolean;
+  dumbed: boolean;
   requests_24h: number;
 }
 

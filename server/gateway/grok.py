@@ -409,10 +409,11 @@ def _read_body(handler: BaseHTTPRequestHandler) -> bytes:
 
 
 def _pick_account(session_key: str = "") -> tuple[dict[str, Any] | None, str]:
-    """从号池候选（ACTIVE + 已认证）按「粘性会话 + 轮询」挑选 token 未过期、未冷却的账号。
+    """从号池候选（ACTIVE + 已认证 + 未降智）按「粘性会话 + 轮询」挑选 token 未过期、未冷却的账号。
 
     - 过滤 JWT 已过期的账号（exp 解析失败的视为有效，交由上游判定）
     - 过滤冷却中的账号（上游判定坏号后临时冻结，到期自动解冻）
+    - 过滤 dumbed=1（推理巡检判定降智，候选查询已排除）
     - 粘性会话（对齐 CLIProxyAPI SessionAffinity）：会话标识非空时，
       绑定账号在 TTL 内复用；绑定账号冷却 / 禁用 / 删除 / token 过期
       则自动解绑并故障切换到新号后重建绑定；无会话标识时退化为纯轮询
@@ -427,7 +428,7 @@ def _pick_account(session_key: str = "") -> tuple[dict[str, Any] | None, str]:
         if (exp := decode_jwt_exp(row.get("access_token"))) is None or exp > now
     ]
     if not candidates:
-        return None, "号池无可用账号（需 ACTIVE 且已认证）"
+        return None, "号池无可用账号（需 ACTIVE、已认证且未降智）"
     with _lock:
         # 清理已到期的冷却记录，避免内存无界增长
         expired_ids = [acc_id for acc_id, until in _cooldowns.items() if until <= now_mono]

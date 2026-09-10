@@ -6,7 +6,6 @@ import {
   Info,
   LogIn,
   SearchX,
-  ShieldAlert,
   ShieldCheck,
   Trash2,
 } from "lucide-react";
@@ -31,19 +30,14 @@ import { STATUS_LABELS } from "@/lib/api";
 import { cn, formatAccountTime } from "@/lib/utils";
 import {
   ACCOUNT_STATUS_VARIANT,
-  RISK_VARIANT,
+  INSPECT_VARIANT,
   formatPoolExpiry,
+  inspectLabel,
+  inspectTitle,
   poolExpiryTone,
-  riskLabel,
-  riskTitle,
 } from "./PoolPageParts";
 
-export type PoolRowAction =
-  | "auth"
-  | "reauth"
-  | "risk"
-  | "disable"
-  | "delete";
+export type PoolRowAction = "auth" | "reauth" | "disable" | "delete";
 
 interface PoolAccountsTableProps {
   accounts: PoolAccount[];
@@ -117,24 +111,6 @@ function AccountActions({
         type="button"
         variant="ghost"
         size="icon"
-        className="row-action-btn"
-        title={
-          account.has_token === 0
-            ? "未认证：请先点认证"
-            : account.status === 6
-              ? "账号已禁用"
-              : "风控体检（无头浏览器自动过 CF 挑战）"
-        }
-        aria-label={`风控体检 ${account.email}`}
-        disabled={inspecting || account.has_token === 0 || account.status === 6}
-        onClick={() => onAction("risk")}
-      >
-        <ShieldAlert className="size-3.5" strokeWidth={1.8} aria-hidden />
-      </Button>
-      <Button
-        type="button"
-        variant="ghost"
-        size="icon"
         className="row-action-btn text-warn"
         title="禁用"
         aria-label={`禁用 ${account.email}`}
@@ -187,7 +163,7 @@ function SkeletonRows() {
           <TableCell className="pool-col-status">
             <span className="pool-skel pool-skel-badge" />
           </TableCell>
-          <TableCell className="pool-col-bfs">
+          <TableCell className="pool-col-inspect">
             <span className="pool-skel pool-skel-badge" />
           </TableCell>
           <TableCell className="pool-col-reason">
@@ -250,7 +226,7 @@ export function PoolAccountsTable({
             <TableHead className="pool-col-time">注册时间</TableHead>
             <TableHead className="pool-col-auth">认证状态</TableHead>
             <TableHead className="pool-col-status">账号状态</TableHead>
-            <TableHead className="pool-col-bfs">风控强度</TableHead>
+            <TableHead className="pool-col-inspect">巡检</TableHead>
             <TableHead className="pool-col-reason">原因</TableHead>
             <TableHead className="pool-col-actions">操作</TableHead>
           </TableRow>
@@ -278,7 +254,7 @@ export function PoolAccountsTable({
           ) : (
             accounts.map((account) => {
               const passwordVisible = visiblePasswords.has(account.id);
-              const risk = riskLabel(account.risk, account.bfs);
+              const inspect = inspectLabel(account.dumbed);
               const expiryTone = poolExpiryTone(account.expires_at);
               return (
                 <TableRow
@@ -383,22 +359,25 @@ export function PoolAccountsTable({
                       {STATUS_LABELS[account.status] || "未知"}
                     </Badge>
                   </TableCell>
-                  <TableCell className="pool-col-bfs">
+                  <TableCell className="pool-col-inspect">
                     <Tooltip>
                       <TooltipTrigger asChild>
                         <span>
                           <Badge
-                            variant={RISK_VARIANT[risk.label] || "secondary"}
+                            variant={INSPECT_VARIANT[inspect] || "secondary"}
                           >
-                            {risk.label}
+                            {inspect}
                           </Badge>
                         </span>
                       </TooltipTrigger>
                       <TooltipContent side="top">
-                        {riskTitle(
-                          account.risk,
-                          account.bfs,
-                          account.checked_at,
+                        {inspectTitle(
+                          account.dumbed,
+                          account.inspect_tps,
+                          account.inspect_thinking,
+                          account.inspected_at
+                            ? formatAccountTime(account.inspected_at)
+                            : null,
                         )}
                       </TooltipContent>
                     </Tooltip>

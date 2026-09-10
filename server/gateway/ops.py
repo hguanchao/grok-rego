@@ -69,7 +69,7 @@ def _channels() -> list[dict[str, Any]]:
 def _account_pool() -> dict[str, Any]:
     """号池账号运行态：四维 KPI（正常/在用/粘性/冷却）+ 逐账号行（含近 24h 请求数）。
 
-    口径：正常=已认证且状态 ACTIVE(1)；在用=近 24h 产生过请求的活跃账号；
+    口径：正常=已认证且状态 ACTIVE(1) 且未降智；在用=近 24h 产生过请求的账号；
     粘性=网关粘性会话绑定数；冷却=当前短期冻结中账号数。邮箱完整展示供排查运维。
     """
     accounts = get_all_accounts()
@@ -90,8 +90,9 @@ def _account_pool() -> dict[str, Any]:
         is_cooling = int(acc["id"]) in cooled_ids
         is_disabled = status == STATUS_DISABLED
         is_sticky = int(acc["id"]) in sticky_ids
+        is_dumbed = int(acc.get("dumbed") or 0) == 1
         requests = per_account.get(int(acc["id"]), 0)
-        if has_token and status == STATUS_ACTIVE:
+        if has_token and status == STATUS_ACTIVE and not is_dumbed:
             active += 1
         if requests > 0:
             in_use += 1
@@ -107,6 +108,7 @@ def _account_pool() -> dict[str, Any]:
                 "disabled": is_disabled,
                 "cooling": is_cooling,
                 "sticky": is_sticky,
+                "dumbed": is_dumbed,
                 "requests_24h": requests,
             }
         )
