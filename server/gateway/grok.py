@@ -15,6 +15,7 @@ import threading
 import time
 from collections import deque
 from http.server import BaseHTTPRequestHandler
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
@@ -31,7 +32,7 @@ from core.util import (
 )
 from db import get_account_by_id, insert_usage, list_gateway_candidates
 from gateway import egress
-from gateway.usage import StreamUsageAccumulator, extract_nonstream
+from gateway.usage import StreamUsageAccumulator, extract_nonstream, output_tps
 
 GROK_BASE = UPSTREAM_BASE.rstrip("/")
 _CLIENT_VERSION = "0.2.120"  # 与 Grok CLI chat-proxy 期望的客户端版本保持同步（对齐 CLIProxyAPI 维护值）
@@ -47,7 +48,7 @@ _MAX_BODY = 32 * 1024 * 1024
 _LOG_CAP = 200
 _CONNECT_TIMEOUT = 20.0
 _READ_TIMEOUT = 300.0
-_UPSTREAM_RETRY_CODES = {5, 6, 7, 18, 28, 35, 52, 56}
+_UPSTREAM_RETRY_CODES = {5, 6, 7, 18, 28, 35, 52, 56, 92}
 _UPSTREAM_RETRY_DELAY = 0.5
 _HOP_BY_HOP = {
     "connection",
@@ -126,6 +127,7 @@ def _record(
     usage: dict[str, int] | None = None,
     ip: str | None = None,
     client_ua: str | None = None,
+    first_ms: int = 0,
 ) -> None:
     """写入环形日志、累加计数，并落库一条用量记录（含号池账号归属）。"""
     usage = usage or {"prompt_tokens": 0, "completion_tokens": 0, "cache_tokens": 0, "reasoning_tokens": 0}
@@ -180,6 +182,11 @@ def _record(
             completion_tokens=usage.get("completion_tokens", 0),
             cache_tokens=usage.get("cache_tokens", 0),
             reasoning_tokens=usage.get("reasoning_tokens", 0),
+            output_tps=output_tps(
+                usage.get("completion_tokens", 0),
+                ms,
+                first_ms if stream else 0,
+            ),
         )
     except Exception:
         # 落库失败绝不阻塞网关转发
@@ -221,6 +228,75 @@ def _upstream_url(path: str, query: str) -> str:
     if query:
         url = f"{url}?{query}"
     return url
+
+
+# ── 模型列表：本地清单文件（与 zen-models.json 同构的扁平 dict），由上游 /models 快照固化 ──
+_MODELS_JSON = Path(__file__).resolve().parent / "grok-models.json"
+
+_MODELS_ENTRY_CACHE: tuple[float, int, list[dict[str, Any]]] | None = None
+
+
+def _model_entry(model_id: str, created: int) -> dict[str, Any]:
+    """构造单个 OpenAI models 列表项（与 zen 网关同构）。"""
+    return {
+        "id": model_id,
+        "object": "model",
+        "created": created,
+        "owned_by": "grok",
+        "display_name": model_id,
+    }
+
+
+def _local_model_entries() -> list[dict[str, Any]]:
+    """从 grok-models.json（扁平 dict）读取模型清单，转成 OpenAI models 列表项。
+
+    按 (mtime, size) 缓存：文件热更新后自动失效，无需重启服务；
+    文件缺失或损坏时回退到内置 grok-4.6，保证端点可用。
+    """
+    global _MODELS_ENTRY_CACHE
+    try:
+        stat = _MODELS_JSON.stat()
+        if _MODELS_ENTRY_CACHE is not None and _MODELS_ENTRY_CACHE[:2] == (stat.st_mtime, stat.st_size):
+            return _MODELS_ENTRY_CACHE[2]
+        data = json.loads(_MODELS_JSON.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        data = {"grok-4.6": "grok-4.6"}
+    except OSError:
+        return [_model_entry("grok-4.6", int(time.time()))]
+    if not isinstance(data, dict):
+        data = {"grok-4.6": "grok-4.6"}
+    created = int(stat.st_mtime)
+    items = [_model_entry(str(mid).strip(), created) for mid in data if str(mid).strip()]
+    _MODELS_ENTRY_CACHE = (stat.st_mtime, stat.st_size, items)
+    return items
+
+
+def _models_dict() -> dict[str, str]:
+    """读 grok-models.json 扁平映射表（key=cli 模型 id，value=实际上游模型 id）。"""
+    try:
+        data = json.loads(_MODELS_JSON.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return {}
+
+
+def _map_body_model(body: bytes) -> bytes:
+    """请求体 model 查表透传：cli 传 key → grok-models.json 命中则替换为 value，未命中原样。"""
+    if not body:
+        return body
+    try:
+        payload = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return body
+    if not isinstance(payload, dict) or not isinstance(payload.get("model"), str):
+        return body
+    ident = payload["model"].strip()
+    mapping = _models_dict()
+    mapped = mapping.get(ident)
+    if mapped is None or str(mapped) == ident:
+        return body
+    payload["model"] = str(mapped)
+    return json.dumps(payload, ensure_ascii=False).encode("utf-8")
 
 
 _SESSION_BODY_KEYS = ("conversation_id", "session_id", "previous_response_id", "prompt_cache_key")
@@ -395,6 +471,19 @@ def cooldown_until_map() -> dict[int, float]:
         return dict(_cooldowns)
 
 
+def sticky_bound_account_ids() -> set[int]:
+    """当前活跃粘性会话绑定的账号 id 集合（顺带清理过期绑定，供运维页逐账号标记粘性）。"""
+    now_mono = time.monotonic()
+    with _lock:
+        expired = [
+            k for k, (_, at) in _session_bindings.items()
+            if at + _SESSION_TTL_SEC < now_mono
+        ]
+        for k in expired:
+            del _session_bindings[k]
+        return {acc_id for acc_id, _ in _session_bindings.values()}
+
+
 def _forward_headers(incoming: Any, token: str) -> dict[str, str]:
     out: dict[str, str] = {}
     for key, value in incoming.items():
@@ -470,6 +559,8 @@ def _proxy_kwargs() -> dict[str, Any]:
         "allow_redirects": False,
         "verify": True,
         "impersonate": "chrome",
+        # 强制 HTTP/1.1：规避 HTTP/2 帧层兼容问题（curl 92 PROTOCOL_ERROR reset）
+        "http_version": "v1",
     }
     if proxy:
         kwargs["proxy"] = proxy
@@ -528,6 +619,20 @@ def proxy(handler: BaseHTTPRequestHandler, method: str, path: str) -> None:
         )
         return
 
+    # 模型映射：cli 传 model → grok-models.json 查 value 透传上游
+    body = _map_body_model(body)
+
+    # ── 模型列表：读本地 grok-models.json（扁平 dict）转 OpenAI 列表，不请求上游 ──
+    if method in ("GET", "HEAD") and path.endswith("/models"):
+        payload = json.dumps(
+            {"object": "list", "data": _local_model_entries()},
+            ensure_ascii=False,
+        ).encode("utf-8")
+        t0 = time.monotonic()
+        _send_bytes(handler, 200, payload, "application/json; charset=utf-8")
+        logger.info(f"[Grok网关] GET {path} model=- status=200 {int((time.monotonic() - t0) * 1000)}ms in=0 out={len(payload)}")
+        return
+
     acc, acc_err = _pick_account(_session_key(handler, body))
     if acc is None:
         _send_bytes(
@@ -543,6 +648,7 @@ def proxy(handler: BaseHTTPRequestHandler, method: str, path: str) -> None:
     token = str(acc.get("access_token") or "")
     headers = _forward_headers(handler.headers, token)
     t0 = time.monotonic()
+    t_first: float | None = None
     bytes_out = 0
     status = 502
     err: str | None = None
@@ -581,6 +687,7 @@ def proxy(handler: BaseHTTPRequestHandler, method: str, path: str) -> None:
                     for chunk in raw_chunks:
                         if chunk:
                             first_raw_chunk = chunk
+                            t_first = time.monotonic()
                             break
                 break
             except requests.RequestsError as exc:
@@ -682,6 +789,7 @@ def proxy(handler: BaseHTTPRequestHandler, method: str, path: str) -> None:
             except Exception:
                 pass
         ms = int((time.monotonic() - t0) * 1000)
+        first_ms = int((t_first - t0) * 1000) if t_first is not None else 0
         _record(
             method=method,
             path=path,
@@ -699,6 +807,7 @@ def proxy(handler: BaseHTTPRequestHandler, method: str, path: str) -> None:
             usage=usage,
             ip=client_ip,
             client_ua=client_ua,
+            first_ms=first_ms,
         )
         # 上游明确判定的坏号进入临时冷却（网络异常 / 客户端断开不归咎账号）
         if (

@@ -1,4 +1,4 @@
-"""号池任务：探活、认证池消化、自动续期、巡检/重登/风控。"""
+"""号池任务：探活、认证池消化、自动续期、巡检/重登。"""
 
 from __future__ import annotations
 
@@ -6,7 +6,8 @@ from __future__ import annotations
 号池账号上游活体探测客户端。
 
 - HTTP 直连 curl_cffi（Chrome TLS 指纹），代理走 config.PROXY
-- 探活用 GET /billing?format=credits：不消耗配额、不触发推理、秒级返回
+- 巡检走 POST /v1/responses（推理题 + 流式），取思考链与可见输出吞吐
+- 无思考链且可见输出 > 50 token/s 判定为降智
 - 网络失败自动重试一次
 """
 
@@ -21,11 +22,20 @@ from core import config
 from core.config import UPSTREAM_BASE
 from core.logger import logger
 from core.mutex import acquire as mutex_acquire, release as mutex_release
+from gateway.usage import output_tps
 
-_PROBE_CONNECT_TIMEOUT = 10
-_PROBE_READ_TIMEOUT = 30
+_PROBE_CONNECT_TIMEOUT = 20
+_PROBE_READ_TIMEOUT = 300
 _PROBE_RETRY_DELAY = 1.0
-_CLIENT_VERSION = "1.0.0"
+_CLIENT_VERSION = "0.2.120"
+_DUMB_TPS_THRESHOLD = 50.0
+_INSPECT_MODEL = "grok-4.6"
+_INSPECT_QUESTION = (
+    "A farmer needs to get a wolf, a goat, and a cabbage across a river. "
+    "The boat holds the farmer plus at most one item. The wolf cannot be left "
+    "alone with the goat, and the goat cannot be left alone with the cabbage. "
+    "Give the shortest sequence of crossings. Think step by step before answering."
+)
 
 _thread_local = threading.local()
 
@@ -48,19 +58,32 @@ class ProbeClient:
     def _headers(account: dict[str, Any]) -> dict[str, str]:
         return {
             "Authorization": f"Bearer {account.get('access_token') or ''!s}",
+            "Content-Type": "application/json",
+            "Accept": "text/event-stream",
             "X-XAI-Token-Auth": "xai-grok-cli",
             "x-grok-client-version": _CLIENT_VERSION,
-            "Accept": "application/json",
+            "x-grok-client-identifier": "grok-shell",
+            "x-authenticateresponse": "authenticate-response",
+            "User-Agent": f"xai-grok-workspace/{_CLIENT_VERSION}",
         }
 
     def probe(self, account: dict[str, Any], proxy: str = "") -> dict[str, Any]:
-        """单账号活体探测：GET /billing?format=credits，返回探活结果。
+        """单账号巡检：POST /responses 推理题，返回探活 + 降智判定。
 
         返回 dict：
-          status_code  200=有效 / 401·403=失效 / 402=配额 / 429=限流 / 0=网络异常
-          error        失败原因摘要
+          status_code     200=有效 / 401·403=失效 / 402=配额 / 429=限流 / 0=网络异常
+          error           失败原因摘要
+          has_thinking    响应是否含思考链（加密 blob / 摘要 / reasoning 事件）
+          output_tps      可见输出 token/s（首字节后窗口）
+          dumbed          1=降智（无思考链且吞吐 > 50）
         """
-        result: dict[str, Any] = {"status_code": 0, "error": ""}
+        result: dict[str, Any] = {
+            "status_code": 0,
+            "error": "",
+            "has_thinking": False,
+            "output_tps": 0.0,
+            "dumbed": 0,
+        }
         use_proxy = str(proxy or config.PROXY or "").strip()
         email = str(account.get("email") or "").strip()
         log_email = email
@@ -69,14 +92,26 @@ class ProbeClient:
             logger.error(f"[探活] {log_email} 未配置代理，跳过探活")
             return result
         session = self._session(use_proxy)
+        body = {
+            "model": _INSPECT_MODEL,
+            "input": [{"role": "user", "content": _INSPECT_QUESTION}],
+            "reasoning": {"effort": "high"},
+            "include": ["reasoning.encrypted_content"],
+            "store": False,
+            "stream": True,
+        }
 
+        t0 = time.monotonic()
+        response = None
         for attempt in range(2):
             try:
-                logger.debug(f"[探活] {log_email} 请求 GET /billing?format=credits · 尝试 {attempt + 1}/2")
-                response = session.get(
-                    f"{self.base_url}/billing?format=credits",
+                logger.debug(f"[探活] {log_email} 请求 POST /responses · 尝试 {attempt + 1}/2")
+                response = session.post(
+                    f"{self.base_url}/responses",
                     headers=self._headers(account),
+                    json=body,
                     timeout=(_PROBE_CONNECT_TIMEOUT, _PROBE_READ_TIMEOUT),
+                    stream=True,
                 )
                 break
             except requests.RequestsError as exc:
@@ -91,15 +126,110 @@ class ProbeClient:
                 logger.error(f"[探活] {log_email} 请求失败: {type(exc).__name__}: {detail}")
                 return result
 
-        result["status_code"] = int(response.status_code)
-        if 200 <= response.status_code < 300:
-            result["error"] = "探活通过"
-            logger.debug(f"[探活] {log_email} 探活通过 · HTTP {response.status_code}")
-        else:
-            err = _simplify_error(response.status_code, response.text or "")
+        status = int(response.status_code)
+        result["status_code"] = status
+        raw = b""
+        t_first: float | None = None
+        try:
+            for chunk in response.iter_content(chunk_size=4096):
+                if not chunk:
+                    continue
+                if t_first is None:
+                    t_first = time.monotonic()
+                raw += chunk
+        finally:
+            response.close()
+        elapsed_ms = int((time.monotonic() - t0) * 1000)
+        first_ms = int((t_first - t0) * 1000) if t_first is not None else 0
+
+        if not (200 <= status < 300):
+            err = _simplify_error(status, raw.decode("utf-8", "replace"))
             result["error"] = err
-            logger.warning(f"[探活] {log_email} 探活失败 · HTTP {response.status_code} {err}")
+            logger.warning(f"[探活] {log_email} 探活失败 · HTTP {status} {err}")
+            return result
+
+        parsed = _parse_responses_stream(raw)
+        tps = output_tps(parsed["completion_tokens"], elapsed_ms, first_ms)
+        has_thinking = parsed["has_thinking"]
+        dumbed = 0 if has_thinking else int(tps > _DUMB_TPS_THRESHOLD)
+        result["has_thinking"] = has_thinking
+        result["output_tps"] = tps
+        result["dumbed"] = dumbed
+        result["error"] = "探活通过"
+        logger.debug(
+            f"[探活] {log_email} 探活通过 · HTTP {status} "
+            f"thinking={int(has_thinking)} tps={tps:.1f} dumbed={dumbed}"
+        )
         return result
+
+
+def _parse_responses_stream(raw: bytes) -> dict[str, Any]:
+    """从 /responses SSE 取出思考链有无与 completion token 数。"""
+    has_thinking = False
+    completion = 0
+    text = raw.decode("utf-8", "replace")
+    for block in text.split("\n\n"):
+        data_lines = [
+            line[5:].lstrip() for line in block.split("\n") if line.startswith("data:")
+        ]
+        data_raw = "\n".join(data_lines).strip()
+        if not data_raw or data_raw == "[DONE]":
+            continue
+        try:
+            obj = json.loads(data_raw)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        etype = str(obj.get("type") or "")
+        if etype in (
+            "response.reasoning_text.delta",
+            "response.reasoning_summary_text.delta",
+        ):
+            delta = obj.get("delta")
+            if isinstance(delta, str) and delta.strip():
+                has_thinking = True
+        item = obj.get("item") if etype in ("response.output_item.added", "response.output_item.done") else None
+        if isinstance(item, dict) and item.get("type") == "reasoning":
+            enc = item.get("encrypted_content")
+            if isinstance(enc, str) and enc.strip():
+                has_thinking = True
+            summary = item.get("summary")
+            if isinstance(summary, list) and any(
+                isinstance(part, dict) and str(part.get("text") or "").strip()
+                for part in summary
+            ):
+                has_thinking = True
+            elif isinstance(summary, str) and summary.strip():
+                has_thinking = True
+        payload = obj.get("response") if etype == "response.completed" else obj
+        if isinstance(payload, dict):
+            usage = payload.get("usage")
+            if isinstance(usage, dict):
+                total_out = int(usage.get("output_tokens") or usage.get("completion_tokens") or 0)
+                details = usage.get("output_tokens_details") or usage.get("completion_tokens_details")
+                reasoning = 0
+                if isinstance(details, dict):
+                    reasoning = int(details.get("reasoning_tokens") or 0)
+                # 可见输出 = 总输出 − 推理 token（Responses 把推理计入 output_tokens）
+                completion = max(0, total_out - reasoning)
+            out_items = payload.get("output")
+            if isinstance(out_items, list):
+                for out in out_items:
+                    if not isinstance(out, dict) or out.get("type") != "reasoning":
+                        continue
+                    enc = out.get("encrypted_content")
+                    if isinstance(enc, str) and enc.strip():
+                        has_thinking = True
+                    summary = out.get("summary")
+                    if isinstance(summary, list) and any(
+                        isinstance(part, dict) and str(part.get("text") or "").strip()
+                        for part in summary
+                    ):
+                        has_thinking = True
+                    elif isinstance(summary, str) and summary.strip():
+                        has_thinking = True
+    return {"has_thinking": has_thinking, "completion_tokens": completion}
 
 
 def _simplify_error(status: int, body: str) -> str:
@@ -245,9 +375,9 @@ from db import (
     STATUS_REAUTH,
     get_all_accounts,
     list_due_refresh_candidates,
+    update_account_inspect,
     update_account_status_by_ids,
     update_account_tokens,
-    update_risk,
 )
 from workflow.oauth import auth_with_sso
 from workflow.oauth import refresh_token as oauth_refresh
@@ -513,15 +643,12 @@ auto_refresher = AutoRefresher()
 - 探活 / 刷新均为真实上游请求，账号间随机间隔防风控
 - 协作式取消：cancel 事件贯穿预筛 / 探活 / 刷新 / 重登降级各阶段
 
-kind=inspect  探活分流：2xx 通过 / 401·403 恢复链（刷新后再探，仍失效标
-              REAUTH）/ 402·429 限流配额 / 网络与 5xx 不改状态只记原因
-              风控（bfs/risk）不在巡检阶段更新：grok.com 全站 Cloudflare
-              挑战拦截 curl_cffi，仅注册流程的浏览器路径能拿到 botFlag，
-              巡检保留注册时写入的风控值即可
+kind=inspect  POST /responses 推理题探活：2xx 通过并回写降智判定 /
+              401·403 恢复链（刷新后再探，仍失效标 REAUTH）/
+              402·429 限流配额 / 网络与 5xx 不改状态只记原因
+              降智：响应体无思考链且可见输出 > 50 token/s
 kind=reauth   重登闭环：有 refresh_token 先 OIDC 刷新；被拒或无刷新凭据
               降级为 device flow 重新授权（入认证池），远端交换 token
-kind=risk     风控体检：单账号无头浏览器开 grok.com，自动过 CF 挑战后
-              解析 botFlagSource / botFlagDetails 回写 risk / bfs
 """
 
 import threading
@@ -681,8 +808,8 @@ class PoolJobManager:
         account_ids: list[int] | None,
         concurrency: int = MAX_CONCURRENCY,
     ) -> dict[str, Any]:
-        """启动巡检 / 重登 / 风控任务；已有任务进行中则抛 RuntimeError。"""
-        if kind not in ("inspect", "reauth", "risk"):
+        """启动巡检 / 重登任务；已有任务进行中则抛 RuntimeError。"""
+        if kind not in ("inspect", "reauth"):
             raise RuntimeError(f"未知任务类型: {kind}")
         concurrency = _clamp_concurrency(concurrency)
         ids = [int(i) for i in account_ids] if account_ids else []
@@ -728,19 +855,17 @@ class PoolJobManager:
         try:
             if job.kind == "inspect":
                 self._run_inspect(job)
-            elif job.kind == "reauth":
-                self._run_reauth(job)
             else:
-                self._run_risk(job)
+                self._run_reauth(job)
         except Exception as exc:
             job.error = f"{type(exc).__name__}: {exc}"
-            title = "巡检" if job.kind == "inspect" else "重登" if job.kind == "reauth" else "风控"
+            title = "巡检" if job.kind == "inspect" else "重登"
             job.append_log("ERROR", f"[任务] {title}异常 {job.error}")
             logger.error(f"[号池任务] {job.kind} 异常: {job.error}")
         finally:
             job.status = "cancelled" if job.cancel_event.is_set() else "done"
             job.finished_at = now_str()
-            title = "巡检" if job.kind == "inspect" else "重登" if job.kind == "reauth" else "风控"
+            title = "巡检" if job.kind == "inspect" else "重登"
             _end_log(job, title)
             mutex_release("号池")
             logger.info(
@@ -757,9 +882,9 @@ class PoolJobManager:
         """资格预筛：返回候选账号行；跳过账号写入 skipped_list。
 
         未认证账号（无 access_token）一律排除：仅可走认证（/api/pool/auth），
-        巡检 / 重登 / 风控均不处理（满足“未认证账号只能执行认证”约束）。
+        巡检 / 重登均不处理（满足“未认证账号只能执行认证”约束）。
         require_token=True（巡检）：状态为需重登(2) 亦跳过；
-        require_token=False（重登 / 风控）：指定 ids 时按 id 处理（需重登账号），
+        require_token=False（重登）：指定 ids 时按 id 处理（需重登账号），
         重登全量模式（未传 ids）仅处理需重登(2)状态的账号。
         跳过明细只记入 skipped_list 与文件日志，任务日志聚合为一条摘要，
         避免全量模式下逐账号刷屏、日志一次性倾泻。
@@ -780,11 +905,11 @@ class PoolJobManager:
                 break
             aid = int(acc.get("id") or 0)
             skip_reason = ""
-            # 未认证账号仅可走认证（/api/pool/auth），巡检/重登/风控一律排除
+            # 未认证账号仅可走认证（/api/pool/auth），巡检/重登一律排除
             if not str(acc.get("access_token") or "").strip():
                 skip_reason = "未认证，仅可认证"
             elif int(acc.get("status") or 1) == STATUS_DISABLED:
-                # 禁用账号不参与巡检/重登/风控（与自动续期 exclude DISABLED 口径一致），
+                # 禁用账号不参与巡检/重登（与自动续期 exclude DISABLED 口径一致），
                 # 避免巡检探活通过后回写 ACTIVE 将禁用账号“复活”
                 skip_reason = "账号已禁用"
             elif require_token and int(acc.get("status") or 1) == 2:
@@ -835,7 +960,7 @@ class PoolJobManager:
             return
 
         def work(acc: dict[str, Any]) -> dict[str, Any] | None:
-            """单账号探活：GET /billing 探活，按状态码分流。"""
+            """单账号探活：POST /responses 推理题，按状态码分流并回写降智。"""
             if job.cancel_event.is_set():
                 return None
             t0 = time.monotonic()
@@ -845,11 +970,22 @@ class PoolJobManager:
             status = int(result.get("status_code") or 0)
             detail = str(result.get("error") or "").strip()
 
-            # 通过：恢复 ACTIVE（风控字段保留注册时的值，巡检不更新）
+            # 通过：恢复 ACTIVE，回写降智判定
             if _HTTP_OK_MIN <= status <= _HTTP_OK_MAX:
                 update_account_status_by_ids([aid], STATUS_ACTIVE, "")
+                tps = float(result.get("output_tps") or 0)
+                thinking = 1 if result.get("has_thinking") else 0
+                dumbed = int(result.get("dumbed") or 0)
+                update_account_inspect(
+                    aid, dumbed=dumbed, inspect_tps=tps, inspect_thinking=thinking
+                )
                 exp_str = format_exp(decode_jwt_exp(str(acc.get("access_token") or "")))
-                msg = f"{status} 探活通过 · 到期时间 {exp_str}"
+                dumb_tag = "降智" if dumbed else "正常"
+                think_tag = "有思考链" if thinking else "无思考链"
+                msg = (
+                    f"{status} 探活通过 · {think_tag} · {tps:.1f} token/s · "
+                    f"{dumb_tag} · 到期 {exp_str}"
+                )
                 return {"aid": aid, "ok": True, "message": msg, "cost": elapsed_label(t0)}
 
             # 凭证失效（401/403）：刷新后再探
@@ -914,7 +1050,16 @@ class PoolJobManager:
         result = self._probe_client.probe(fresh, proxy=str(config.PROXY or "").strip())
         reprobe_status = int(result.get("status_code") or 0)
         if _HTTP_OK_MIN <= reprobe_status <= _HTTP_OK_MAX:
-            logger.success(f"[巡检] {_who(acc)} 二次探活通过 · HTTP {reprobe_status}")
+            tps = float(result.get("output_tps") or 0)
+            thinking = 1 if result.get("has_thinking") else 0
+            dumbed = int(result.get("dumbed") or 0)
+            update_account_inspect(
+                aid, dumbed=dumbed, inspect_tps=tps, inspect_thinking=thinking
+            )
+            logger.success(
+                f"[巡检] {_who(acc)} 二次探活通过 · HTTP {reprobe_status} "
+                f"thinking={thinking} tps={tps:.1f} dumbed={dumbed}"
+            )
             return new_token
         logger.warning(f"[巡检] {_who(acc)} 二次探活失败 · HTTP {reprobe_status or 'N/A'}")
         return None
@@ -1015,98 +1160,11 @@ class PoolJobManager:
 
         self._run_concurrent(job, candidates, work)
 
-    # ─── kind=risk：风控体检 ─────────────────────────────
-
-    def _run_risk(self, job: PoolJob) -> None:
-        """单账号风控体检：无头 Camoufox 开 grok.com，自动过 CF 挑战后解析 botFlag。
-
-        仅支持单账号（前端按行触发，不做批量）；无 SSO cookie 跳过。
-        """
-        job.status = "running"
-        candidates = self._screen(job, require_token=False)
-        job.append_log("INFO", f"[任务] 风控体检开始 {job.count} 个")
-        logger.info(f"[号池任务] 风控启动 候选 {job.count} 个 / 任务 {job.id}")
-        if not candidates:
-            return
-
-        # 风控体检必须串行（浏览器重资源 + CF 挑战易触发风控），单账号场景无需并发
-        for acc in candidates:
-            if job.cancel_event.is_set():
-                break
-            result = self._risk_one(acc)
-            if result is None:
-                continue
-            job.done += 1
-            body = str(result.get("message") or "")
-            if result.get("ok"):
-                job.pushed += 1
-                job.append_log("SUCCESS", f"[风控] {_who(acc)} {body}")
-            else:
-                job.failed += 1
-                job.append_log("ERROR", f"[风控] {_who(acc)} {body}")
-
-    def _risk_one(self, acc: dict[str, Any]) -> dict[str, Any] | None:
-        """单账号浏览器风控体检：注入 SSO → grok.com → 过 CF → 解析 botFlag 回写。
-
-        返回结果 dict（含 aid / ok / message）；账号无 SSO 或浏览器异常返回 None（跳过计数）。
-        """
-        # 局部导入：Camoufox 重依赖，避免模块加载时拉起
-        from camoufox.sync_api import Camoufox
-
-        from core import config
-        from workflow.register import check_account_risk
-
-        aid = int(acc.get("id") or 0)
-        email = str(acc.get("email") or "")
-        sso = str(acc.get("sso_cookie") or "").strip()
-        if not sso:
-            logger.warning(f"[风控] {_who(acc)} 无 SSO cookie，跳过")
-            return None
-
-        t0 = time.monotonic()
-        logger.info(f"[风控] {_who(acc)} 开始风控体检（无头浏览器）")
-        kwargs: dict[str, Any] = {
-            "headless": True,
-            "humanize": True,
-            "geoip": True,
-            "locale": ["en-US", "en"],
-        }
-        if config.PROXY:
-            kwargs["proxy"] = {"server": config.PROXY}
-
-        try:
-            with Camoufox(**kwargs) as browser:
-                context = browser.new_context()
-                # 注入 SSO cookie 到 grok.com 域
-                payload = []
-                for name in ("sso", "sso-rw"):
-                    for domain in (".grok.com", "grok.com"):
-                        payload.append({
-                            "name": name, "value": sso, "domain": domain,
-                            "path": "/", "httpOnly": True, "secure": True, "sameSite": "Lax",
-                        })
-                context.add_cookies(payload)
-                page = context.new_page()
-                # check_account_risk 内部完成 SSO 注入 + 导航 + CF 挑战 + 轮询 botFlag
-                bfs, details = check_account_risk(page)
-                if bfs is None:
-                    logger.warning(f"[风控] {_who(acc)} 未解析到风控字段 · {elapsed_label(t0)}")
-                    return {"aid": aid, "ok": False, "message": f"未解析到风控字段 · {elapsed_label(t0)}"}
-
-                update_risk(email, bfs, details or None, now_str())
-                tag = "风控正常" if bfs not in (1, 2) else "风控被标记"
-                extra = f" details={details}" if details else ""
-                logger.success(f"[风控] {_who(acc)} {tag} bfs={bfs}{extra} · {elapsed_label(t0)}")
-                return {"aid": aid, "ok": True, "message": f"bfs={bfs} · {elapsed_label(t0)}"}
-        except Exception as exc:
-            logger.error(f"[风控] {_who(acc)} 浏览器异常: {type(exc).__name__}: {exc} · {elapsed_label(t0)}")
-            return {"aid": aid, "ok": False, "message": f"浏览器异常: {type(exc).__name__} · {elapsed_label(t0)}"}
-
     # ─── 公共：并发执行与结果汇总 ─────────────────────────
 
     def _run_concurrent(self, job: PoolJob, candidates, work) -> None:
         """20 个 worker 并发执行 work(acc)，每个 worker 做完一个号再隔 1 秒接下一个。"""
-        label = "巡检" if job.kind == "inspect" else "重登" if job.kind == "reauth" else "风控"
+        label = "巡检" if job.kind == "inspect" else "重登"
 
         def on_complete(_index: int, acc: dict[str, Any], result: Any) -> None:
             level = "ERROR"

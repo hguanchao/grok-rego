@@ -444,9 +444,11 @@ export function GatewayPage() {
                             ? "is-strikes"
                             : a.cooling
                               ? "is-cool"
-                              : a.authed
-                                ? "is-idle"
-                                : "is-cooling",
+                              : a.sticky
+                                ? "is-sticky"
+                                : a.authed
+                                  ? "is-idle"
+                                  : "is-cooling",
                         )}
                       >
                         <span className="gw-acct-cell gw-acct-cell-id">
@@ -477,12 +479,22 @@ export function GatewayPage() {
                               ? "is-strikes"
                               : a.cooling
                                 ? "is-cool"
-                                : a.authed
-                                  ? "is-idle"
-                                  : "is-cooling",
+                                : a.sticky
+                                  ? "is-sticky"
+                                  : a.authed
+                                    ? "is-idle"
+                                    : "is-cooling",
                           )}
                         >
-                          {a.disabled ? "禁用" : a.cooling ? "冷却" : a.authed ? "正常" : "未认证"}
+                          {a.disabled
+                            ? "禁用"
+                            : a.cooling
+                              ? "冷却"
+                              : a.sticky
+                                ? "粘性"
+                                : a.authed
+                                  ? "正常"
+                                  : "未认证"}
                         </span>
                       </li>
                     ))}

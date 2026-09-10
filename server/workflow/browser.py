@@ -224,43 +224,96 @@ def _turnstile_widget(page: Any) -> Any | None:
     return None
 
 
+
+
+_TURNSTILE_CHECKBOX_SEL = (
+    "input[type='checkbox']",
+    "[role='checkbox']",
+    ".ctp-checkbox-start",
+    ".ctp-checkbox-label",
+    "label.ctp-checkbox",
+)
+
+
 def _click_turnstile_checkbox(page: Any, widget: Any) -> bool:
-    """点 Turnstile 左侧勾选框（约 28×28，相对 iframe 左上）。"""
+    """点 Turnstile 左侧勾选框。
+
+
+
+    优先穿透 iframe 元素级点击真实勾选框（不依赖像素位置，兼容布局/缩放偏移）；
+    无真实元素时回退盲点左上坐标；全程短路、记日志标明点击方式。
+    """
     try:
         widget.scroll_into_view_if_needed(timeout=2000)
     except Exception:
         pass
+    # 1) 元素级：穿透 iframe 内找勾选框点击（最稳，不依赖像素坐标）
     try:
-        widget.click(position={"x": 28, "y": 30}, timeout=2500)
-        return True
+        frame = widget.content_frame()
+        if frame is not None:
+            for sel in _TURNSTILE_CHECKBOX_SEL:
+                try:
+                    cand = frame.locator(sel).first
+                    if cand.count() > 0:
+                        cand.click(timeout=2500, force=True)
+                        logger.debug(f"[Turnstile] 已元素级点击勾选框（iframe 内 {sel}）")
+                        return True
+                except Exception:
+                    continue
     except Exception:
         pass
+    # 2) 精确定位：以 iframe 盒模型左上为基准点勾选框（约相对 (28,32))），拿不到盒模型则放弃
     try:
-        box = widget.bounding_box()
+        box0 = widget.bounding_box()
     except Exception:
-        box = None
-    if not box or box["width"] <= 0:
-        return False
-    x = box["x"] + 28
-    y = box["y"] + min(box["height"] * 0.5, 32)
-    try:
-        _human_click(page, x, y)
-        return True
-    except Exception:
-        return False
+        box0 = None
+    if box0 and box0["width"] > 0:
+        try:
+            widget.click(position={"x": 28, "y": 30}, timeout=2500)
+            logger.debug("[Turnstile] 已坐标点击勾选框（iframe 内 (28,30))）")
+            return True
+        except Exception:
+            pass
+        x = box0["x"] + 28
+        y = box0["y"] + min(box0["height"] * 0.5, 32)
+        try:
+            _human_click(page, x, y)
+            logger.debug("[Turnstile] 已坐标点击勾选框（页面坐标）")
+            return True
+        except Exception:
+            pass
+    logger.debug("[Turnstile] 勾选框点击失败（无可见可点元素/盒模型）")
+    return False
 
 
 def _turnstile_passed(page: Any) -> bool:
-    """检查 Turnstile token 是否已生成（验证通过）。"""
+    """检查 Turnstile token 是否已生成（验证通过）；主文档优先，iframe 兑底。"""
     try:
         token = page.evaluate("""() => {
             const el = document.querySelector('input[name="cf-turnstile-response"]');
-            return el ? el.value : null;
+            if (!el) return '';
+            return el.value || el.getAttribute('value') || '';
         }""")
-        return bool(token)
+        if token:
+            return True
     except Exception:
-        return False
-
+        pass
+    # 兑底：穿透 iframe 帧内查同名 token（部分站点写入 iframe 内）
+    try:
+        for frame in page.frames:
+            try:
+                t = frame.evaluate("""() => {
+                    const el = document.querySelector('input[name="cf-turnstile-response"]');
+                    if (!el) return '';
+                    return el.value || el.getAttribute('value') || '';
+                }""")
+                if t:
+                    return True
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return False
 
 def _has_turnstile(page: Any) -> bool:
     """检测页面是否包含 Turnstile 验证组件。"""

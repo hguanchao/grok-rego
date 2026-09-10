@@ -47,6 +47,10 @@ _ACCOUNT_MIGRATIONS = [
     ("is_deleted", "INTEGER DEFAULT 0"),
     ("updated_at", "TEXT"),
     ("used", "INTEGER DEFAULT 500000"),
+    ("dumbed", "INTEGER"),
+    ("inspect_tps", "REAL"),
+    ("inspect_thinking", "INTEGER"),
+    ("inspected_at", "TEXT"),
 ]
 
 # 账号状态码（整数，对齐前端 PoolPage 筛选）
@@ -253,25 +257,36 @@ def get_account_by_id(account_id: int) -> dict[str, Any] | None:
     return _row_to_account(row) if row else None
 
 
-def update_risk(
-    email: str, bfs: int | None = None, risk: str | None = None, checked_at: str | None = None
+def update_account_inspect(
+    account_id: int,
+    *,
+    dumbed: int,
+    inspect_tps: float,
+    inspect_thinking: int,
 ) -> bool:
-    """更新账号的风控体检结果（bfs / risk / checked_at）。"""
+    """回写巡检降智判定（dumbed / 吞吐 / 是否有思考链）。"""
     with connect() as conn:
         cursor = conn.cursor()
         cursor.execute(
-            "UPDATE accounts SET bfs=?, risk=?, checked_at=?, updated_at=? WHERE email=?",
-            (bfs, risk, checked_at, now_iso_tz(), email),
+            "UPDATE accounts SET dumbed=?, inspect_tps=?, inspect_thinking=?, "
+            "inspected_at=?, updated_at=? WHERE id=? AND COALESCE(is_deleted, 0) = 0",
+            (
+                int(dumbed),
+                float(inspect_tps),
+                int(inspect_thinking),
+                now_iso_tz(),
+                now_iso_tz(),
+                int(account_id),
+            ),
         )
         conn.commit()
-        is_updated = cursor.rowcount > 0
-    if is_updated:
-        logger.success(
-            f"[数据库] 已更新风控结果 (email: {email}, bfs: {bfs})"
+        ok = cursor.rowcount > 0
+    if ok:
+        logger.info(
+            f"[数据库] 巡检结果 id={account_id} dumbed={dumbed} "
+            f"tps={inspect_tps:.1f} thinking={inspect_thinking}"
         )
-    else:
-        logger.warning(f"[数据库] 未找到账号，风控结果未更新: {email}")
-    return is_updated
+    return ok
 
 
 def update_account_status(
@@ -407,8 +422,8 @@ _POOL_COLUMNS = (
     "id, email, password, first_name, last_name, "
     "access_token IS NOT NULL AND access_token != '' AS has_token, "
     "refresh_token IS NOT NULL AND refresh_token != '' AS has_refresh, "
-    "expires_in, status, reason, bfs, risk, checked_at, is_deleted, created_at, updated_at, "
-    "used"
+    "expires_in, status, reason, dumbed, inspect_tps, inspect_thinking, inspected_at, "
+    "is_deleted, created_at, updated_at, used"
 )
 
 
@@ -656,6 +671,7 @@ _USAGES_COLUMNS = (
     "completion_tokens",
     "cache_tokens",
     "reasoning_tokens",
+    "output_tps",
     "created_at",
 )
 _USAGES_TOKEN_COLUMNS = (
@@ -681,6 +697,7 @@ _USAGES_TYPES = {
     "completion_tokens": "INTEGER",
     "cache_tokens": "INTEGER",
     "reasoning_tokens": "INTEGER",
+    "output_tps": "REAL",
     "created_at": "TEXT",
 }
 
@@ -701,6 +718,7 @@ _USAGES_SCHEMA = """
         completion_tokens INTEGER NOT NULL DEFAULT 0,
         cache_tokens INTEGER NOT NULL DEFAULT 0,
         reasoning_tokens INTEGER NOT NULL DEFAULT 0,
+        output_tps REAL NOT NULL DEFAULT 0,
         created_at TEXT NOT NULL
     )
 """
@@ -714,7 +732,7 @@ def _usages_select_expr(name: str, old_types: dict[str, str]) -> str:
             "replace(datetime(created_at / 1000, 'unixepoch', '+8 hours'), ' ', 'T')"
             " || '+08:00'"
         )
-    if name in _USAGES_TOKEN_COLUMNS:
+    if name in _USAGES_TOKEN_COLUMNS or name == "output_tps":
         return f"COALESCE({name}, 0)"
     return name
 
@@ -782,11 +800,13 @@ def insert_usage(
     completion_tokens: int = 0,
     cache_tokens: int = 0,
     reasoning_tokens: int = 0,
+    output_tps: float = 0,
 ) -> None:
     """写入一条网关用量记录（每次请求一行，幂等可重复调用）。
 
     落库供前端用量统计（/api/usage）聚合展示；status=1 记成功，其余记失败。
     token 各列均为尽力而为：无法从上游解析时记 0，绝不阻塞转发。
+    output_tps 为可见输出 token/s（流式按首字节后窗口，非流式按全程）。
     """
     init_usages_table()
     with connect() as conn:
@@ -796,14 +816,15 @@ def insert_usage(
                 ip, client_ua, endpoint, model, effort, stream,
                 account_id, account_email, status, reason,
                 prompt_tokens, completion_tokens, cache_tokens, reasoning_tokens,
-                created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                output_tps, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 ip, client_ua, endpoint, model, effort,
                 1 if stream else 0,
                 account_id, account_email, status, reason,
                 prompt_tokens, completion_tokens, cache_tokens, reasoning_tokens,
+                float(output_tps or 0),
                 now_iso_tz(),
             ),
         )

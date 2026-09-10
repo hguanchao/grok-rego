@@ -474,6 +474,7 @@ export interface GatewayAccountRow {
   status: number;
   disabled: boolean;
   cooling: boolean;
+  sticky: boolean;
   requests_24h: number;
 }
 
@@ -536,6 +537,7 @@ export interface UsageRow {
   completion_tokens: number;
   cache_tokens: number;
   reasoning_tokens: number;
+  output_tps: number;
   created_at: string;
 }
 

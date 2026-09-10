@@ -33,6 +33,23 @@ def _to_int(value: Any) -> int:
         return 0
 
 
+def output_tps(completion_tokens: int, elapsed_ms: int, first_ms: int = 0) -> float:
+    """可见输出 token/s（completion_tokens / 生成窗口）。
+
+    流式：窗口 = 首字节之后到结束（排除静默推理等待）；
+    非流式：窗口 = 全程。无法计算时返回 0。
+    """
+    tokens = _to_int(completion_tokens)
+    elapsed = _to_int(elapsed_ms)
+    first = _to_int(first_ms)
+    if tokens <= 0 or elapsed <= 0:
+        return 0.0
+    window = elapsed - first if first > 0 else elapsed
+    if window <= 0:
+        window = elapsed
+    return round(tokens * 1000.0 / window, 2)
+
+
 def _openai_usage(usage: Any) -> dict[str, int]:
     """OpenAI 风格 usage 字典 → (prompt, completion, cache, reasoning)。"""
     if not isinstance(usage, dict):
@@ -49,9 +66,20 @@ def _openai_usage(usage: Any) -> dict[str, int]:
     details = usage.get("prompt_tokens_details")
     if isinstance(details, dict):
         cache += _to_int(details.get("cached_tokens"))
+    # Responses API：缓存命中字段是 input_tokens_details.cached_tokens（OpenAI Chat 才是 prompt_tokens_details）
+    # 两者互斥出现，未从 prompt 侧取到缓存时再查 input 侧，避免漏计缓存命中
+    if not cache:
+        i_details = usage.get("input_tokens_details")
+        if isinstance(i_details, dict):
+            cache += _to_int(i_details.get("cached_tokens"))
     c_details = usage.get("completion_tokens_details")
     if isinstance(c_details, dict):
         reason += _to_int(c_details.get("reasoning_tokens"))
+    # Responses API：推理 token 也可能在 output_tokens_details.reasoning_tokens（与 completion 侧同语义兜底）
+    if not reason:
+        o_details = usage.get("output_tokens_details")
+        if isinstance(o_details, dict):
+            reason += _to_int(o_details.get("reasoning_tokens"))
     # Anthropic 兼容字段（上游偶发混用）
     if not cache:
         cache = _to_int(usage.get("cache_read_input_tokens")) + _to_int(
@@ -82,17 +110,34 @@ def _anthropic_usage(usage: Any) -> dict[str, int]:
     }
 
 
+def _dispatch_usage(usage: Any) -> dict[str, int] | None:
+    """按 usage 键形态自动归类 OpenAI / Anthropic。
+
+    Responses API 的 input_tokens/output_tokens 与 Anthropic 同名，但带
+    input_tokens_details / output_tokens_details 特征键可区分；带 details 键一律走
+    OpenAI 风格，否则 input/output 键走 Anthropic 风格。
+    """
+    if not isinstance(usage, dict):
+        return None
+    has_details = any(
+        k in usage
+        for k in ("input_tokens_details", "output_tokens_details", "prompt_tokens_details", "completion_tokens_details")
+    )
+    if has_details:
+        return _openai_usage(usage)
+    if ("input_tokens" in usage or "output_tokens" in usage) and not (
+        "prompt_tokens" in usage or "completion_tokens" in usage
+    ):
+        return _anthropic_usage(usage)
+    return _openai_usage(usage)
+
+
 def _parse_object(payload: Any) -> dict[str, int] | None:
     """从已解析 JSON 顶层取 usage；Anthropic message 的 usage 在 message 内。"""
     if not isinstance(payload, dict):
         return None
     if "usage" in payload:
-        usage = payload.get("usage")
-        if isinstance(usage, dict) and (
-            "input_tokens" in usage or "output_tokens" in usage
-        ) and not ("prompt_tokens" in usage or "completion_tokens" in usage):
-            return _anthropic_usage(usage)
-        return _openai_usage(usage)
+        return _dispatch_usage(payload.get("usage"))
     message = payload.get("message")
     if isinstance(message, dict) and isinstance(message.get("usage"), dict):
         return _anthropic_usage(message.get("usage"))
@@ -197,25 +242,14 @@ class StreamUsageAccumulator:
         if not isinstance(payload, dict):
             return None
         if "usage" in payload:
-            usage = payload.get("usage")
-            # OpenAI 键 → OpenAI 风格；Anthropic 键（input/output）→ Anthropic 风格
-            if isinstance(usage, dict) and (
-                "input_tokens" in usage or "output_tokens" in usage
-            ) and not ("prompt_tokens" in usage or "completion_tokens" in usage):
-                return _anthropic_usage(usage)
-            return _openai_usage(usage)
+            return _dispatch_usage(payload.get("usage"))
         message = payload.get("message")
         if isinstance(message, dict) and isinstance(message.get("usage"), dict):
             return _anthropic_usage(message.get("usage"))
         # Responses 流式事件（response.completed）：usage 深层嵌套在 response.usage
         inner = payload.get("response")
-        if isinstance(inner, dict) and isinstance(inner.get("usage"), dict):
-            usage = inner["usage"]
-            if (
-                "input_tokens" in usage or "output_tokens" in usage
-            ) and not ("prompt_tokens" in usage or "completion_tokens" in usage):
-                return _anthropic_usage(usage)
-            return _openai_usage(usage)
+        if isinstance(inner, dict):
+            return _dispatch_usage(inner.get("usage"))
         return None
 
     def result(self) -> dict[str, int]:

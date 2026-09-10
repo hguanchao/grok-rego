@@ -35,6 +35,7 @@ htmlcov/
 
 # Runtime data
 server/db/data/
+server/gateway/grok-models.json
 server/logs/
 *.bak
 *.db-journal

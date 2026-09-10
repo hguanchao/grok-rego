@@ -33,12 +33,16 @@ from gateway.anthropic import (
     is_count_tokens_path,
     is_messages_path,
     iter_anthropic_sse,
+    iter_responses_sse,
     messages_to_chat,
+    messages_to_responses,
+    responses_to_message,
     rewrite_body_model,
     rewrite_model_id,
     uses_chat_completions,
+    uses_responses,
 )
-from gateway.usage import StreamUsageAccumulator, extract_nonstream
+from gateway.usage import StreamUsageAccumulator, extract_nonstream, output_tps
 
 # 上游固定参数（产品约定，不走配置）
 ZEN_BASE = "https://opencode.ai/zen/v1"
@@ -54,7 +58,7 @@ _MAX_BODY = 32 * 1024 * 1024
 _LOG_CAP = 200
 _CONNECT_TIMEOUT = 20.0
 _READ_TIMEOUT = 300.0
-_UPSTREAM_RETRY_CODES = {5, 6, 7, 18, 28, 35, 52, 56}
+_UPSTREAM_RETRY_CODES = {5, 6, 7, 18, 28, 35, 52, 56, 92}
 _UPSTREAM_RETRY_DELAY = 0.5
 _HOP_BY_HOP = {
     "connection",
@@ -112,6 +116,7 @@ def _record(
     effort: str | None = None,
     ip: str | None = None,
     client_ua: str | None = None,
+    first_ms: int = 0,
 ) -> None:
     """写入环形日志、累加计数，并落库一条用量记录。"""
     usage = usage or {"prompt_tokens": 0, "completion_tokens": 0, "cache_tokens": 0, "reasoning_tokens": 0}
@@ -161,6 +166,11 @@ def _record(
             completion_tokens=usage.get("completion_tokens", 0),
             cache_tokens=usage.get("cache_tokens", 0),
             reasoning_tokens=usage.get("reasoning_tokens", 0),
+            output_tps=output_tps(
+                usage.get("completion_tokens", 0),
+                ms,
+                first_ms if stream else 0,
+            ),
         )
     except Exception:
         # 落库失败绝不阻塞网关转发
@@ -221,6 +231,34 @@ def local_model_entries() -> list[dict[str, Any]]:
     ]
     _models_cache = (stat.st_mtime, stat.st_size, items)
     return items
+
+
+def _zen_models_dict() -> dict[str, str]:
+    """读 zen-models.json 扁平映射表（key=cli 模型 id，value=实际上游模型 id）。"""
+    try:
+        data = json.loads(_MODELS_JSON.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return {}
+
+
+def _map_body_model(body: bytes) -> bytes:
+    """请求体 model 查表透传：cli 传 key → zen-models.json 命中则替换为 value，未命中原样。"""
+    if not body:
+        return body
+    try:
+        payload = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return body
+    if not isinstance(payload, dict) or not isinstance(payload.get("model"), str):
+        return body
+    ident = payload["model"].strip()
+    mapping = _zen_models_dict()
+    mapped = mapping.get(ident)
+    if mapped is None or str(mapped) == ident:
+        return body
+    payload["model"] = str(mapped)
+    return json.dumps(payload, ensure_ascii=False).encode("utf-8")
 
 
 def _is_free_model(model_id: str) -> bool:
@@ -391,6 +429,8 @@ def _proxy_kwargs() -> dict[str, Any]:
         "timeout": (_CONNECT_TIMEOUT, _READ_TIMEOUT),
         "allow_redirects": False,
         "verify": True,
+        # 强制 HTTP/1.1：规避 HTTP/2 帧层兼容问题（curl 92 PROTOCOL_ERROR reset）
+        "http_version": "v1",
     }
     if proxy:
         kwargs["proxy"] = proxy
@@ -505,11 +545,13 @@ def proxy(handler: BaseHTTPRequestHandler, method: str, path: str) -> None:
         )
         return
 
-    body = rewrite_body_model(body)
+    body = _map_body_model(body)  # zen-models.json 查表映射：cli 传 key → value 透传上游
+    body = rewrite_body_model(body)  # 未命中时 Claude Code 档位/别名改写到免费模型兜底
     model, stream_flag = _extract_meta(body)
     model = rewrite_model_id(model)
     anthropic_client = is_messages_path(path)
     translate = anthropic_client and uses_chat_completions(model)
+    use_responses = uses_responses(model)  # muse 等仅支持 /responses，单独走 responses 路由
     # 推理档位：翻译路径取转换后 chat 体，直连路径读原始 reasoning_effort
     effort_flag: str | None = None
 
@@ -540,14 +582,26 @@ def proxy(handler: BaseHTTPRequestHandler, method: str, path: str) -> None:
             src = {}
         if not isinstance(src, dict):
             src = {}
-        chat = messages_to_chat(src)
-        stream_flag = bool(chat.get("stream"))
-        forward_body = json.dumps(chat, ensure_ascii=False).encode("utf-8")
-        forward_path = "/zen/v1/chat/completions"
-        query = ""
-        effort_flag = (
-            str(chat["reasoning_effort"]) if "reasoning_effort" in chat else None
-        )
+        if use_responses:
+            # muse 等仅支持 /responses：把 Anthropic Messages 译成 Responses 请求体
+            resp = messages_to_responses(src)
+            stream_flag = bool(resp.get("stream"))
+            forward_body = json.dumps(resp, ensure_ascii=False).encode("utf-8")
+            forward_path = "/zen/v1/responses"
+            query = ""
+            effort_flag = None
+            rr = resp.get("reasoning") if isinstance(resp.get("reasoning"), dict) else None
+            if isinstance(rr, dict) and isinstance(rr.get("effort"), str):
+                effort_flag = rr["effort"]
+        else:
+            chat = messages_to_chat(src)
+            stream_flag = bool(chat.get("stream"))
+            forward_body = json.dumps(chat, ensure_ascii=False).encode("utf-8")
+            forward_path = "/zen/v1/chat/completions"
+            query = ""
+            effort_flag = (
+                str(chat["reasoning_effort"]) if "reasoning_effort" in chat else None
+            )
     else:
         try:
             raw_src = json.loads(body.decode("utf-8")) if body else {}
@@ -559,6 +613,7 @@ def proxy(handler: BaseHTTPRequestHandler, method: str, path: str) -> None:
     url = _upstream_url(forward_path, query)
     headers = _forward_headers(handler.headers)
     t0 = time.monotonic()
+    t_first: float | None = None
     bytes_out = 0
     status = 502
     err: str | None = None
@@ -596,6 +651,7 @@ def proxy(handler: BaseHTTPRequestHandler, method: str, path: str) -> None:
                     for chunk in raw_chunks:
                         if chunk:
                             first_raw_chunk = chunk
+                            t_first = time.monotonic()
                             break
                 break
             except requests.RequestsError as exc:
@@ -651,7 +707,10 @@ def proxy(handler: BaseHTTPRequestHandler, method: str, path: str) -> None:
                                 acc.feed(c)
                             yield c
 
-                    chunks = iter_anthropic_sse(_tee(_with_first_chunk()), model)
+                    if use_responses:
+                        chunks = iter_responses_sse(_tee(_with_first_chunk()), model)
+                    else:
+                        chunks = iter_anthropic_sse(_tee(_with_first_chunk()), model)
 
                     def _pass(gen):
                         # 翻译后的块不再重复喂 acc，仅转发
@@ -682,9 +741,15 @@ def proxy(handler: BaseHTTPRequestHandler, method: str, path: str) -> None:
                 except (UnicodeDecodeError, json.JSONDecodeError):
                     obj = {}
                 if isinstance(obj, dict):
-                    payload = json.dumps(
-                        chat_to_message(obj, model), ensure_ascii=False
-                    ).encode("utf-8")
+                    if use_responses:
+                        # Responses 整包响应 → Anthropic Messages
+                        payload = json.dumps(
+                            responses_to_message(obj, model), ensure_ascii=False
+                        ).encode("utf-8")
+                    else:
+                        payload = json.dumps(
+                            chat_to_message(obj, model), ensure_ascii=False
+                        ).encode("utf-8")
             elif status >= 400 and anthropic_client:
                 payload = _wrap_upstream_error(payload, True)
             bytes_out = len(payload)
@@ -725,6 +790,7 @@ def proxy(handler: BaseHTTPRequestHandler, method: str, path: str) -> None:
             except Exception:
                 pass
         ms = int((time.monotonic() - t0) * 1000)
+        first_ms = int((t_first - t0) * 1000) if t_first is not None else 0
         _record(
             method=method,
             path=path,
@@ -739,6 +805,7 @@ def proxy(handler: BaseHTTPRequestHandler, method: str, path: str) -> None:
             effort=effort_flag,
             ip=egress.current_ip(),
             client_ua=client_ua,
+            first_ms=first_ms,
         )
         if err != "client_disconnected":
             logger.info(

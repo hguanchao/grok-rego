@@ -572,3 +572,343 @@ def iter_anthropic_sse(openai_chunks: Iterator[bytes], model: str | None) -> Ite
                             },
                         )
     yield from close_all()
+
+
+
+# OpenAI Responses API 适配（muse 等仅支持 /responses 的免费模型）
+# Anthropic Messages <-> OpenAI Responses 双向翻译：请求走 /responses，响应转回
+# Anthropic Messages（整包 + SSE）。reasoning 摘要为加密/空时不透出，message 文本
+# 逐块翻译为 Anthropic text 块；usage 由 opencode.py 侧按原始响应采样，不在此。
+
+# 仅支持 Responses API（不支持 chat/completions）的模型前缀白名单
+_RESPONSES_ONLY_PREFIX = ("muse-spark-",)
+
+
+def uses_responses(model: str | None) -> bool:
+    """该模型仅支持 OpenAI Responses API（/responses），不走 chat/completions。
+
+
+    muse 系列免费模型实测 /chat/completions 必返 500，仅 /responses 可用，
+    故为其单独开 responses 路由。
+    """
+    ident = (model or "").strip().lower()
+    if not ident:
+        return False
+    return ident.startswith(_RESPONSES_ONLY_PREFIX)
+
+
+def _parse_json_obj(raw: Any) -> dict[str, Any]:
+    """安全地把 JSON 字符串/对象解析为 dict；非法输入返回空 dict。"""
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str):
+        try:
+            parsed = json.loads(raw)
+        except (json.JSONDecodeError, ValueError):
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
+
+
+def messages_to_responses(payload: dict[str, Any]) -> dict[str, Any]:
+    """Anthropic Messages 请求体 → OpenAI Responses 请求体。
+
+
+    上游 /responses 只认 model / input / instructions / max_output_tokens /
+    reasoning.effort / tools / tool_choice。input 支持字符串或消息数组；
+    system 映射为 instructions；max_tokens 映射为 max_output_tokens。
+
+    """
+    system = _system_to_text(payload.get("system"))
+    messages: list[dict[str, Any]] = []
+    for item in payload.get("messages") or []:
+        if not isinstance(item, dict):
+            continue
+        role = str(item.get("role") or "user")
+        if role not in ("user", "assistant"):
+            role = role.replace("assistant", "user") if role == "assistant" else "user"
+        content = item.get("content")
+        if isinstance(content, str):
+            messages.append({"role": role, "content": content})
+            continue
+        if not isinstance(content, list):
+            messages.append({"role": role, "content": _text_of(content)})
+            continue
+        # 块式 content：text / tool_result 合并为普通文本；assistant 的 tool_use 独立为 function_call 消息
+        text_parts: list[str] = []
+        fn_calls: list[dict[str, Any]] = []
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            btype = str(block.get("type") or "")
+            if btype == "text":
+                text_parts.append(str(block.get("text") or ""))
+            elif btype == "tool_result":
+                text_parts.append(_text_of(block.get("content")))
+            elif btype == "tool_use":
+                fn_calls.append(
+                    {
+                        "type": "function_call",
+                        "name": str(block.get("name") or ""),
+                        "arguments": json.dumps(block.get("input") or {}, ensure_ascii=False),
+                        "call_id": str(block.get("id") or ""),
+                    }
+                )
+        if role == "assistant":
+            if text_parts:
+                messages.append({"role": "assistant", "content": "".join(text_parts)})
+            for call in fn_calls:
+                messages.append(
+                    {
+                        "role": "assistant",
+                        "type": "function_call",
+                        "name": call["name"],
+                        "arguments": call["arguments"],
+                        "call_id": call["call_id"],
+                        "content": call,
+                    }
+                )
+        elif text_parts:
+            messages.append({"role": role, "content": "".join(text_parts)})
+    out: dict[str, Any] = {
+        "model": payload.get("model"),
+        "input": messages if messages else "",
+        "stream": bool(payload.get("stream")),
+    }
+    if system:
+        out["instructions"] = system
+    # 思考预算 → 推理档位；Responses 用 reasoning.effort（上游不认 max，钳制到合法档）
+    effort = effort_from_body(payload)
+    if effort and supports_reasoning(str(out.get("model") or "")):
+        # 上游 /responses 合法档：none/minimal/low/medium/high/xhigh；max 不认，映射 xhigh；未知档回退 high
+        _resp_eff_alias = {"max": "xhigh"}
+        _resp_eff = _resp_eff_alias.get(effort, effort)
+        if _resp_eff not in ("none", "minimal", "low", "medium", "high", "xhigh"):
+            _resp_eff = "high"
+        out["reasoning"] = {"effort": _resp_eff}
+    if payload.get("max_tokens") is not None:
+        out["max_output_tokens"] = payload.get("max_tokens")
+    if payload.get("temperature") is not None:
+        out["temperature"] = payload.get("temperature")
+    if payload.get("top_p") is not None:
+        out["top_p"] = payload.get("top_p")
+    tools = payload.get("tools")
+    if isinstance(tools, list) and tools:
+        converted = []
+        for tool in tools:
+            if not isinstance(tool, dict):
+                continue
+            converted.append(
+                {
+                    "type": "function",
+                    "name": tool.get("name"),
+                    "description": tool.get("description") or "",
+                    "parameters": tool.get("input_schema") or {"type": "object", "properties": {}},
+                }
+            )
+        if converted:
+            out["tools"] = converted
+    choice = payload.get("tool_choice")
+    if isinstance(choice, str):
+        if choice == "any":
+            out["tool_choice"] = "required"
+        elif choice in ("auto", "none"):
+            out["tool_choice"] = choice
+    elif isinstance(choice, dict):
+        name = choice.get("name")
+        ctype = choice.get("type")
+        if ctype == "tool" and name:
+            out["tool_choice"] = {"type": "function", "name": name}
+        elif ctype in ("auto", "required", "none"):
+            out["tool_choice"] = ctype
+    return out
+
+
+def responses_to_message(payload: dict[str, Any], model: str | None) -> dict[str, Any]:
+    """OpenAI Responses 整包响应 → Anthropic Messages。
+
+
+    提取 message.output_text 为 text 块，function_call 为 tool_use；
+    因上游该模型推理摘要加密/为空，不透出 thinking；usage 仅映射
+    input/output_tokens（reasoning_tokens 由原响应 usage 单独落库）。"""
+    content: list[dict[str, Any]] = []
+    stop = "end_turn"
+    incomplete = payload.get("incomplete_details")
+    if isinstance(incomplete, dict) and incomplete.get("reason") in (
+        "max_output_tokens",
+        "max_output_tokens_stream_suggested_rec",
+    ):
+        stop = "max_tokens"
+    for item in payload.get("output") or []:
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") == "message":
+            for part in item.get("content") or []:
+                if not isinstance(part, dict):
+                    continue
+                if part.get("type") in ("output_text", "text"):
+                    txt = str(part.get("text") or "")
+                    if txt:
+                        content.append({"type": "text", "text": txt})
+        elif item.get("type") == "function_call":
+            content.append(
+                {
+                    "type": "tool_use",
+                    "id": str(item.get("call_id") or ""),
+                    "name": str(item.get("name") or ""),
+                    "input": _parse_json_obj(item.get("arguments")),
+                }
+            )
+    if not content:
+        content.append({"type": "text", "text": ""})
+    usage = payload.get("usage") if isinstance(payload.get("usage"), dict) else {}
+    return {
+        "id": f"msg_{int(time.time())}",
+        "type": "message",
+        "role": "assistant",
+        "model": model or payload.get("model") or "",
+        "content": content,
+        "stop_reason": stop,
+        "stop_sequence": None,
+        "usage": {
+            "input_tokens": int(usage.get("input_tokens") or 0),
+            "output_tokens": int(usage.get("output_tokens") or 0),
+        },
+    }
+
+
+def iter_responses_sse(gen: Iterator[bytes], model: str | None) -> Iterator[bytes]:
+    """把 OpenAI Responses SSE 块转成 Anthropic Messages SSE。
+
+
+    本实现把 message 的 output_text 增量逐块转成 Anthropic text 块；
+    reasoning 摘要（上游为加密/空时不透出）一律不产生可见块，避免 Claude Code
+    拿到大片空白 thinking。usage 由调用侧对原始响应采样，不在此处理。"""
+    buf = b""
+    started = False
+    text_open = False
+    block_index = -1
+    msg_id = f"msg_{int(time.time() * 1000)}"
+    output_tokens = 0
+    stop = "end_turn"
+
+    def ensure_message() -> Iterator[bytes]:
+        nonlocal started
+        if started:
+            return
+        started = True
+        yield _sse(
+            "message_start",
+            {
+                "type": "message_start",
+                "message": {
+                    "id": msg_id,
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [],
+                    "model": model or "",
+                    "stop_reason": None,
+                    "stop_sequence": None,
+                    "usage": {"input_tokens": 0, "output_tokens": 0},
+                },
+            },
+        )
+
+    def open_text() -> Iterator[bytes]:
+        nonlocal text_open, block_index
+        if text_open:
+            return
+        yield from ensure_message()
+        block_index += 1
+        text_open = True
+        yield _sse(
+            "content_block_start",
+            {
+                "type": "content_block_start",
+                "index": block_index,
+                "content_block": {"type": "text", "text": ""},
+            },
+        )
+
+    def close_text() -> Iterator[bytes]:
+        nonlocal text_open
+        if not text_open:
+            return
+        text_open = False
+        yield _sse(
+            "content_block_stop",
+            {"type": "content_block_stop", "index": block_index},
+        )
+
+    def finish() -> Iterator[bytes]:
+        yield from close_text()
+        yield _sse(
+            "message_delta",
+            {
+                "type": "message_delta",
+                "delta": {"stop_reason": stop, "stop_sequence": None},
+                "usage": {"output_tokens": output_tokens},
+            },
+        )
+        yield _sse("message_stop", {"type": "message_stop"})
+
+    for chunk in gen:
+        if not chunk:
+            continue
+        buf += chunk
+        while b"\n\n" in buf:
+            part, buf = buf.split(b"\n\n", 1)
+            data_lines = []
+            for line in part.split(b"\n"):
+                if line.startswith(b"data:"):
+                    data_lines.append(line[5:].strip())
+            if not data_lines:
+                continue
+            data = b"\n".join(data_lines).decode("utf-8", "replace").strip()
+            if data == "[DONE]":
+                yield from finish()
+                return
+            try:
+                obj = json.loads(data)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(obj, dict):
+                continue
+            t = obj.get("type")
+            # 结束/进度事件携带 response 全量（含 usage / id / incomplete）
+            resp = obj.get("response")
+            if isinstance(resp, dict):
+                if resp.get("id"):
+                    msg_id = str(resp["id"])
+                u = resp.get("usage") if isinstance(resp.get("usage"), dict) else {}
+                if u.get("output_tokens"):
+                    output_tokens = int(u["output_tokens"])
+                inc = resp.get("incomplete_details")
+                if isinstance(inc, dict) and inc.get("reason") in (
+                    "max_output_tokens",
+                    "max_output_tokens_stream_suggested_rec",
+                ):
+                    stop = "max_tokens"
+            if t == "response.output_item.added":
+                pass  # 消息 item 边界；文本块在首个 text delta 时开启
+            elif t == "response.output_text.delta":
+                piece = obj.get("delta")
+                if isinstance(piece, str) and piece:
+                    yield from open_text()
+                    yield _sse(
+                        "content_block_delta",
+                        {
+                            "type": "content_block_delta",
+                            "index": block_index,
+                            "delta": {"type": "text_delta", "text": piece},
+                        },
+                    )
+            elif t == "response.reasoning_summary_text.delta":
+                pass  # 上游该模型不产出可见推理，忽略
+            elif t == "response.output_item.done":
+                if isinstance(obj.get("item"), dict) and obj["item"].get("type") == "message":
+                    yield from close_text()
+            elif t in ("response.completed", "response.incomplete"):
+                yield from finish()
+                return
+    yield from finish()  # 循环自然结束未收尾，补收尾

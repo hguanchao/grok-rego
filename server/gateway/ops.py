@@ -78,6 +78,7 @@ def _account_pool() -> dict[str, Any]:
     now_mono = time.monotonic()
     cooled_ids = {aid for aid, until in cooling_until.items() if until > now_mono}
     sticky = int(grok_gateway.snapshot().get("sticky_sessions") or 0)
+    sticky_ids = grok_gateway.sticky_bound_account_ids()
 
     rows: list[dict[str, Any]] = []
     active = 0
@@ -88,6 +89,7 @@ def _account_pool() -> dict[str, Any]:
         status = int(acc.get("status") or 1)
         is_cooling = int(acc["id"]) in cooled_ids
         is_disabled = status == STATUS_DISABLED
+        is_sticky = int(acc["id"]) in sticky_ids
         requests = per_account.get(int(acc["id"]), 0)
         if has_token and status == STATUS_ACTIVE:
             active += 1
@@ -104,6 +106,7 @@ def _account_pool() -> dict[str, Any]:
                 "status": status,
                 "disabled": is_disabled,
                 "cooling": is_cooling,
+                "sticky": is_sticky,
                 "requests_24h": requests,
             }
         )
