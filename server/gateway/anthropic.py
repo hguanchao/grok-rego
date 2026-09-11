@@ -639,9 +639,11 @@ def messages_to_responses(payload: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(content, list):
             messages.append({"role": role, "content": _text_of(content)})
             continue
-        # 块式 content：text / tool_result 合并为普通文本；assistant 的 tool_use 独立为 function_call 消息
+        # 块式 content：text 合并为普通消息；工具调用/输出必须走顶层
+        # function_call / function_call_output 项（上游按 call_id 校验配对，
+        # 拼进普通文本会 400 No tool output found）
         text_parts: list[str] = []
-        fn_calls: list[dict[str, Any]] = []
+        tool_items: list[dict[str, Any]] = []
         for block in content:
             if not isinstance(block, dict):
                 continue
@@ -649,9 +651,21 @@ def messages_to_responses(payload: dict[str, Any]) -> dict[str, Any]:
             if btype == "text":
                 text_parts.append(str(block.get("text") or ""))
             elif btype == "tool_result":
-                text_parts.append(_text_of(block.get("content")))
+                call_id = str(block.get("tool_use_id") or "")
+                output_text = _text_of(block.get("content"))
+                if call_id:
+                    tool_items.append(
+                        {
+                            "type": "function_call_output",
+                            "call_id": call_id,
+                            "output": output_text,
+                        }
+                    )
+                else:
+                    # 异常历史（缺 tool_use_id）：回退普通文本，保证请求可解析
+                    text_parts.append(output_text)
             elif btype == "tool_use":
-                fn_calls.append(
+                tool_items.append(
                     {
                         "type": "function_call",
                         "name": str(block.get("name") or ""),
@@ -659,22 +673,9 @@ def messages_to_responses(payload: dict[str, Any]) -> dict[str, Any]:
                         "call_id": str(block.get("id") or ""),
                     }
                 )
-        if role == "assistant":
-            if text_parts:
-                messages.append({"role": "assistant", "content": "".join(text_parts)})
-            for call in fn_calls:
-                messages.append(
-                    {
-                        "role": "assistant",
-                        "type": "function_call",
-                        "name": call["name"],
-                        "arguments": call["arguments"],
-                        "call_id": call["call_id"],
-                        "content": call,
-                    }
-                )
-        elif text_parts:
+        if text_parts:
             messages.append({"role": role, "content": "".join(text_parts)})
+        messages.extend(tool_items)
     out: dict[str, Any] = {
         "model": payload.get("model"),
         "input": messages if messages else "",
@@ -786,9 +787,11 @@ def iter_responses_sse(gen: Iterator[bytes], model: str | None) -> Iterator[byte
     """把 OpenAI Responses SSE 块转成 Anthropic Messages SSE。
 
 
-    本实现把 message 的 output_text 增量逐块转成 Anthropic text 块；
-    reasoning 摘要（上游为加密/空时不透出）一律不产生可见块，避免 Claude Code
-    拿到大片空白 thinking。usage 由调用侧对原始响应采样，不在此处理。"""
+    本实现把 message 的 output_text 增量逐块转成 Anthropic text 块，
+    function_call 增量转成 tool_use 块（stop_reason 相应收敛为 tool_use，
+    否则 CLI 拿不到工具调用而表现为空回复）；reasoning 摘要（上游为加密/
+    空时不透出）一律不产生可见块，避免 Claude Code 拿到大片空白 thinking。
+    usage 由调用侧对原始响应采样，不在此处理。"""
     buf = b""
     started = False
     text_open = False
@@ -796,6 +799,10 @@ def iter_responses_sse(gen: Iterator[bytes], model: str | None) -> Iterator[byte
     msg_id = f"msg_{int(time.time() * 1000)}"
     output_tokens = 0
     stop = "end_turn"
+    # 流终 stop_reason 收敛为 tool_use，CLI 才会执行工具并回传 tool_result
+    tool_seen = False
+    tool_open: int | None = None
+    tool_args = ""
 
     def ensure_message() -> Iterator[bytes]:
         nonlocal started
@@ -845,16 +852,55 @@ def iter_responses_sse(gen: Iterator[bytes], model: str | None) -> Iterator[byte
             {"type": "content_block_stop", "index": block_index},
         )
 
+    def close_tool() -> Iterator[bytes]:
+        nonlocal tool_open, tool_args
+        if tool_open is None:
+            return
+        yield _sse(
+            "content_block_stop",
+            {"type": "content_block_stop", "index": tool_open},
+        )
+        tool_open = None
+        tool_args = ""
+
+    def open_tool(call_id: str, name: str) -> Iterator[bytes]:
+        nonlocal block_index, tool_open, tool_seen, tool_args
+        yield from ensure_message()
+        yield from close_text()
+        yield from close_tool()
+        block_index += 1
+        tool_open = block_index
+        tool_seen = True
+        tool_args = ""
+        yield _sse(
+            "content_block_start",
+            {
+                "type": "content_block_start",
+                "index": block_index,
+                "content_block": {
+                    "type": "tool_use",
+                    # Anthropic 侧 id 用 call_id，tool_result 回传时按 id 对上 tool_use_id
+                    "id": call_id or f"toolu_{block_index}",
+                    "name": name or "",
+                    "input": {},
+                },
+            },
+        )
+
     def finish() -> Iterator[bytes]:
         # 先发 message_start：reasoning 耗尽预算等场景上游无任何文本增量，
         # 不补 start 会让 Claude Code 收到无头 SSE 而判定流式不完整
         yield from ensure_message()
         yield from close_text()
+        yield from close_tool()
+        final_stop = stop
+        if final_stop == "end_turn" and tool_seen:
+            final_stop = "tool_use"
         yield _sse(
             "message_delta",
             {
                 "type": "message_delta",
-                "delta": {"stop_reason": stop, "stop_sequence": None},
+                "delta": {"stop_reason": final_stop, "stop_sequence": None},
                 "usage": {"output_tokens": output_tokens},
             },
         )
@@ -883,6 +929,7 @@ def iter_responses_sse(gen: Iterator[bytes], model: str | None) -> Iterator[byte
             if not isinstance(obj, dict):
                 continue
             t = obj.get("type")
+            item = obj.get("item") if isinstance(obj.get("item"), dict) else {}
             # 结束/进度事件携带 response 全量（含 usage / id / incomplete）
             resp = obj.get("response")
             if isinstance(resp, dict):
@@ -898,7 +945,10 @@ def iter_responses_sse(gen: Iterator[bytes], model: str | None) -> Iterator[byte
                 ):
                     stop = "max_tokens"
             if t == "response.output_item.added":
-                pass  # 消息 item 边界；文本块在首个 text delta 时开启
+                # function_call item 在 added 已带 call_id/name，先开块才能接住后续参数增量
+                if item.get("type") == "function_call":
+                    call_id = str(item.get("call_id") or item.get("id") or "")
+                    yield from open_tool(call_id, str(item.get("name") or ""))
             elif t == "response.output_text.delta":
                 piece = obj.get("delta")
                 if isinstance(piece, str) and piece:
@@ -911,11 +961,42 @@ def iter_responses_sse(gen: Iterator[bytes], model: str | None) -> Iterator[byte
                             "delta": {"type": "text_delta", "text": piece},
                         },
                     )
+            elif t == "response.function_call_arguments.delta":
+                # 参数增量逐段转发 partial_json；上游该事件 delta 可能为空串，空串不落块
+                piece = obj.get("delta")
+                if isinstance(piece, str) and piece and tool_open is not None:
+                    tool_args += piece
+                    yield _sse(
+                        "content_block_delta",
+                        {
+                            "type": "content_block_delta",
+                            "index": tool_open,
+                            "delta": {"type": "input_json_delta", "partial_json": piece},
+                        },
+                    )
             elif t == "response.reasoning_summary_text.delta":
                 pass  # 上游该模型不产出可见推理，忽略
             elif t == "response.output_item.done":
-                if isinstance(obj.get("item"), dict) and obj["item"].get("type") == "message":
+                if item.get("type") == "message":
                     yield from close_text()
+                elif item.get("type") == "function_call":
+                    # 增量流为空时用 done 携带的全量 arguments 兜底（上游两种形态都出现过）
+                    raw = item.get("arguments")
+                    if (
+                        tool_open is not None
+                        and not tool_args
+                        and isinstance(raw, str)
+                        and raw
+                    ):
+                        yield _sse(
+                            "content_block_delta",
+                            {
+                                "type": "content_block_delta",
+                                "index": tool_open,
+                                "delta": {"type": "input_json_delta", "partial_json": raw},
+                            },
+                        )
+                    yield from close_tool()
             elif t in ("response.completed", "response.incomplete"):
                 yield from finish()
                 return

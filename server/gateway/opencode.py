@@ -431,13 +431,14 @@ def _anthropic_error(message: str, status: int = 502) -> bytes:
     ).encode("utf-8")
 
 
-def _wrap_upstream_error(raw: bytes, anthropic: bool) -> bytes:
+def _wrap_upstream_error(raw: bytes, anthropic: bool, status: int = 400) -> bytes:
     if not anthropic:
         return raw
+    text = (raw or b"").decode("utf-8", "replace")
     try:
-        obj = json.loads(raw.decode("utf-8"))
+        obj = json.loads(text)
     except (UnicodeDecodeError, json.JSONDecodeError):
-        return _anthropic_error((raw or b"").decode("utf-8", "replace")[:400] or "upstream error")
+        return _anthropic_error(text[:400] or "upstream error", status)
     if isinstance(obj, dict) and obj.get("type") == "error":
         return raw
     err = obj.get("error") if isinstance(obj, dict) else None
@@ -445,10 +446,11 @@ def _wrap_upstream_error(raw: bytes, anthropic: bool) -> bytes:
         # 保留上游真实错误语义（如 MissingSessionID），仅换 Anthropic 错误包络
         etype = str(err.get("type") or "").strip()
         msg = str(err.get("message") or err.get("type") or "upstream error")
-        return _anthropic_error(f"{etype}: {msg}" if etype else msg, 400)
+        return _anthropic_error(f"{etype}: {msg}" if etype else msg, status)
     if isinstance(err, str) and err:
-        return _anthropic_error(err, 400)
-    return _anthropic_error("upstream error", 400)
+        return _anthropic_error(err, status)
+    # 标准 error 结构缺失时透传原文片段，避免 CLI 只看到无信息的 "upstream error"
+    return _anthropic_error(text.strip()[:400] or "upstream error", status)
 
 
 def _proxy_kwargs() -> dict[str, Any]:
@@ -796,7 +798,7 @@ def proxy(handler: BaseHTTPRequestHandler, method: str, path: str) -> None:
                         ).encode("utf-8")
             elif status >= 400 and anthropic_client:
                 # 透传上游真实错误（仅转 Anthropic 错误包络，不吞错误信息）
-                payload = _wrap_upstream_error(payload, True)
+                payload = _wrap_upstream_error(payload, True, status)
             bytes_out = len(payload)
             ctype = "application/json; charset=utf-8"
             if not translate and not anthropic_client:
