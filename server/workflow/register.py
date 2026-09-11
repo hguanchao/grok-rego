@@ -882,37 +882,119 @@ def _pass_turnstile(page: Any) -> bool:
     return False
 
 
-def _check_marketing_opt_in(page: Any) -> None:
-    """勾选资料页「Receive email updates on new features and offers」。"""
+_MARKETING_LABEL = "Receive email updates on new features and offers"
+
+
+def _marketing_checked(page: Any) -> bool:
+    """读回营销勾选是否已勾上（原生 checkbox / aria-checked）。"""
     for frame in _frames(page):
         try:
-            loc = frame.locator("input[name='marketingOptIn']")
-            if loc.count() == 0:
-                loc = frame.get_by_role(
-                    "checkbox",
-                    name="Receive email updates on new features and offers",
-                )
-            if loc.count() == 0:
-                continue
-            box = loc.first
-            if box.is_checked():
-                logger.debug("[资料] 营销邮件勾选已勾上")
-                return
-            human_click_locator(page, box)
-            logger.info("[资料] 已勾选 Receive email updates")
-            return
+            loc = frame.locator("input[name='marketingOptIn']").first
+            if loc.count() > 0 and loc.is_checked():
+                return True
+        except Exception:
+            pass
+        try:
+            loc = frame.get_by_role("checkbox", name=_MARKETING_LABEL).first
+            if loc.count() > 0 and loc.is_checked():
+                return True
+        except Exception:
+            pass
+        try:
+            if frame.evaluate(
+                """() => {
+                    const input = document.querySelector("input[name='marketingOptIn']");
+                    if (input && input.checked) return true;
+                    const nodes = Array.from(document.querySelectorAll(
+                        '[role="checkbox"], label, button, [role="switch"]'
+                    ));
+                    for (const el of nodes) {
+                        const t = (
+                            (el.innerText || '') + ' ' +
+                            (el.getAttribute('aria-label') || '')
+                        ).toLowerCase();
+                        if (!t.includes('receive email updates')) continue;
+                        if (el.getAttribute('aria-checked') === 'true') return true;
+                        const inner = el.querySelector('input[type="checkbox"]');
+                        if (inner && inner.checked) return true;
+                    }
+                    return false;
+                }"""
+            ):
+                return True
         except Exception:
             continue
-    if click(
-        page,
-        "Receive email updates on new features and offers",
-        timeout=3000,
-        retries=0,
-        quiet=True,
-    ):
-        logger.info("[资料] 已勾选 Receive email updates（文案）")
+    return False
+
+
+def _check_marketing_opt_in(page: Any) -> None:
+    """勾选资料页营销邮件：点可见 label/checkbox，读回 checked 才算成功。"""
+    if _marketing_checked(page):
+        logger.debug("[资料] 营销邮件勾选已勾上")
         return
-    logger.debug("[资料] 未找到营销邮件勾选框，跳过")
+
+    for frame in _frames(page):
+        # 先点可见 label/文案，避免点到隐藏 native checkbox（圆点 UI 不跟着变）
+        targets: list[Any] = []
+        try:
+            loc = frame.locator("label").filter(has_text=_MARKETING_LABEL)
+            if loc.count() > 0:
+                targets.append(loc.first)
+        except Exception:
+            pass
+        try:
+            loc = frame.get_by_text(_MARKETING_LABEL, exact=False)
+            if loc.count() > 0:
+                targets.append(loc.first)
+        except Exception:
+            pass
+        try:
+            loc = frame.get_by_role("checkbox", name=_MARKETING_LABEL)
+            if loc.count() > 0:
+                targets.append(loc.first)
+        except Exception:
+            pass
+        for target in targets:
+            try:
+                try:
+                    target.check(timeout=2500)
+                except Exception:
+                    human_click_locator(page, target)
+                page.wait_for_timeout(350)
+                if _marketing_checked(page):
+                    logger.info("[资料] 已勾选 Receive email updates")
+                    return
+            except Exception:
+                continue
+
+    try:
+        clicked = page.evaluate(
+            """() => {
+                const label = Array.from(document.querySelectorAll('label')).find(
+                    (el) => (el.innerText || '').includes('Receive email updates')
+                );
+                if (label) { label.click(); return 'label'; }
+                const role = Array.from(document.querySelectorAll('[role="checkbox"]')).find(
+                    (el) => ((el.innerText || '') + ' ' + (el.getAttribute('aria-label') || ''))
+                        .includes('Receive email updates')
+                );
+                if (role) { role.click(); return 'role'; }
+                const input = document.querySelector("input[name='marketingOptIn']");
+                if (input) { input.click(); return 'input'; }
+                return '';
+            }"""
+        )
+        page.wait_for_timeout(350)
+        if clicked and _marketing_checked(page):
+            logger.info("[资料] 已勾选 Receive email updates（DOM）")
+            return
+    except Exception:
+        pass
+
+    if _marketing_checked(page):
+        logger.info("[资料] 已勾选 Receive email updates")
+        return
+    logger.warning("[资料] 营销邮件勾选未成功，提交前仍未勾上")
 
 
 def _fill_signup_form(page: Any, first_name: str, last_name: str, password: str) -> bool:
@@ -942,6 +1024,7 @@ def _fill_signup_form(page: Any, first_name: str, last_name: str, password: str)
         return False
 
     _check_marketing_opt_in(page)
+    _dump_page(page, "marketing-opt-in")
 
     # Turnstile / 填表期间 Cookie 横幅可能再次盖住提交按钮
     try_click_cookies(page)
