@@ -41,6 +41,8 @@ API_PORT: int = 8787
 # 网关模型别名：客户端请求模型名 → 上游真实模型（如 claude-sonnet-4-5 → big-pickle）
 # Zen 网关鉴权密钥：非空时客户端必须携带（Authorization: Bearer <key> 或 x-api-key）
 GATEWAY_API_KEY: str = ""
+# 打上游的 x-grok-client-version / User-Agent，对齐 grok-build（默认取其 crate 版本）
+GROK_VERSION: str = "1.0.16"
 # 号池探活：GET /billing 上游
 UPSTREAM_BASE: str = "https://cli-chat-proxy.grok.com/v1"
 
@@ -86,6 +88,7 @@ _PUBLIC_CONFIG_KEYS = (
     "cpa_base_url",
     "cpa_management_key",
     "gateway_api_key",
+    "grok_version",
 )
 
 
@@ -146,7 +149,7 @@ def _apply_config_data(data: dict[str, Any]) -> None:
     global CF_API_BASE, CF_DOMAINS, CF_API_KEY, CF_DOMAIN_MODE, PROXY, IS_AUTH
     global MAIL_PROVIDER, YYDS_API_BASE, YYDS_API_KEY
     global G2A_BASE_URL, G2A_USERNAME, G2A_PASSWORD, CPA_BASE_URL, CPA_MANAGEMENT_KEY
-    global GATEWAY_API_KEY
+    global GATEWAY_API_KEY, GROK_VERSION
 
     if data.get("cf_api_base") is not None:
         CF_API_BASE = str(data["cf_api_base"]).strip().rstrip("/")
@@ -187,6 +190,13 @@ def _apply_config_data(data: dict[str, Any]) -> None:
         CPA_MANAGEMENT_KEY = str(data["cpa_management_key"])
     if data.get("gateway_api_key") is not None:
         GATEWAY_API_KEY = str(data["gateway_api_key"]).strip()
+    raw_ver = data.get("grok_version")
+    if raw_ver is None:
+        raw_ver = data.get("grok_client_version")
+    if raw_ver is not None:
+        ver = str(raw_ver).strip()
+        if ver:
+            GROK_VERSION = ver
 
 
 def load_config() -> None:
@@ -197,6 +207,16 @@ def load_config() -> None:
             print("[config] 加载 config.json 失败或为空，使用默认配置")
         return
     _apply_config_data(data)
+    # grok_client_version → grok_version：读到旧键就落盘，避免运维页保存前两套并存
+    if "grok_client_version" in data and "grok_version" not in data:
+        ver = str(data.get("grok_client_version") or "").strip()
+        if ver:
+            data["grok_version"] = ver
+        data.pop("grok_client_version", None)
+        os.makedirs(os.path.dirname(CONFIG_PATH) or ".", exist_ok=True)
+        with open(CONFIG_PATH, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+            f.write("\n")
 
 
 def get_public_config() -> dict[str, Any]:
@@ -217,6 +237,7 @@ def get_public_config() -> dict[str, Any]:
         "cpa_base_url": CPA_BASE_URL,
         "cpa_management_key": CPA_MANAGEMENT_KEY,
         "gateway_api_key": GATEWAY_API_KEY,
+        "grok_version": GROK_VERSION,
     }
 
 
@@ -244,6 +265,12 @@ def update_public_config(patch: dict[str, Any]) -> dict[str, Any]:
             current[key] = provider
         elif key == "auth_enabled":
             current[key] = bool(value)
+        elif key == "grok_version":
+            ver = str(value or "").strip()
+            if not ver:
+                raise ValueError("grok_version 不能为空")
+            current[key] = ver
+            current.pop("grok_client_version", None)
         elif key in ("cf_api_base", "yyds_api_base", "g2a_base_url", "cpa_base_url"):
             current[key] = str(value or "").strip().rstrip("/")
         elif value is None:

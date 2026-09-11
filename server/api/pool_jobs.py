@@ -7,7 +7,7 @@ from __future__ import annotations
 
 - HTTP 直连 curl_cffi（Chrome TLS 指纹），代理走 config.PROXY
 - 巡检走 POST /v1/responses（推理题 + 流式），取思考链与可见输出吞吐
-- 无思考链且可见输出 > 50 token/s 判定为降智
+- 降智判定：reasoning_tokens=0 即上游未推理（降智），不再依赖 tps 猜测
 - 网络失败自动重试一次
 """
 
@@ -22,13 +22,13 @@ from core import config
 from core.config import UPSTREAM_BASE
 from core.logger import logger
 from core.mutex import acquire as mutex_acquire, release as mutex_release
+from gateway.grok import _identity_headers
 from gateway.usage import output_tps
 
 _PROBE_CONNECT_TIMEOUT = 20
 _PROBE_READ_TIMEOUT = 300
 _PROBE_RETRY_DELAY = 1.0
-_CLIENT_VERSION = "0.2.120"
-_DUMB_TPS_THRESHOLD = 50.0
+
 _INSPECT_MODEL = "grok-4.6"
 _INSPECT_QUESTION = (
     "A farmer needs to get a wolf, a goat, and a cabbage across a river. "
@@ -56,16 +56,11 @@ class ProbeClient:
 
     @staticmethod
     def _headers(account: dict[str, Any]) -> dict[str, str]:
-        return {
-            "Authorization": f"Bearer {account.get('access_token') or ''!s}",
-            "Content-Type": "application/json",
-            "Accept": "text/event-stream",
-            "X-XAI-Token-Auth": "xai-grok-cli",
-            "x-grok-client-version": _CLIENT_VERSION,
-            "x-grok-client-identifier": "grok-shell",
-            "x-authenticateresponse": "authenticate-response",
-            "User-Agent": f"xai-grok-workspace/{_CLIENT_VERSION}",
-        }
+        headers = _identity_headers()
+        headers["Authorization"] = f"Bearer {account.get('access_token') or ''!s}"
+        headers["Content-Type"] = "application/json"
+        headers["Accept"] = "text/event-stream"
+        return headers
 
     def probe(self, account: dict[str, Any], proxy: str = "") -> dict[str, Any]:
         """单账号巡检：POST /responses 推理题，返回探活 + 降智判定。
@@ -75,7 +70,7 @@ class ProbeClient:
           error           失败原因摘要
           has_thinking    响应是否含思考链（加密 blob / 摘要 / reasoning 事件）
           output_tps      可见输出 token/s（首字节后窗口）
-          dumbed          1=降智（无思考链且吞吐 > 50）
+          dumbed          1=降智（reasoning_tokens=0，上游未推理）
         """
         result: dict[str, Any] = {
             "status_code": 0,
@@ -151,22 +146,33 @@ class ProbeClient:
         parsed = _parse_responses_stream(raw)
         tps = output_tps(parsed["completion_tokens"], elapsed_ms, first_ms)
         has_thinking = parsed["has_thinking"]
-        dumbed = 0 if has_thinking else int(tps > _DUMB_TPS_THRESHOLD)
+        reasoning_tokens = parsed.get("reasoning_tokens", 0)
+        # 降智判定：reasoning_tokens=0 即上游未推理（降智），不再依赖 tps 猜测
+        dumbed = int(reasoning_tokens == 0)
         result["has_thinking"] = has_thinking
         result["output_tps"] = tps
         result["dumbed"] = dumbed
         result["error"] = "探活通过"
         logger.debug(
             f"[探活] {log_email} 探活通过 · HTTP {status} "
-            f"thinking={int(has_thinking)} tps={tps:.1f} dumbed={dumbed}"
+            f"thinking={int(has_thinking)} reasoning={reasoning_tokens} "
+            f"tps={tps:.1f} dumbed={dumbed}"
         )
         return result
 
 
 def _parse_responses_stream(raw: bytes) -> dict[str, Any]:
-    """从 /responses SSE 取出思考链有无与 completion token 数。"""
+    """从 SSE 取出思考链有无、completion token 数、reasoning_tokens。
+
+    兼容两种上游格式：
+    - Responses API (/responses)：response.output_item.done 里 item.type=reasoning
+      + encrypted_content；usage.output_tokens_details.reasoning_tokens
+    - Chat Completions (/chat/completions)：chat.completion.chunk，无 reasoning
+      item；usage.completion_tokens_details.reasoning_tokens（上游降智时为 0）
+    """
     has_thinking = False
     completion = 0
+    reasoning_tokens = 0
     text = raw.decode("utf-8", "replace")
     for block in text.split("\n\n"):
         data_lines = [
@@ -182,6 +188,7 @@ def _parse_responses_stream(raw: bytes) -> dict[str, Any]:
         if not isinstance(obj, dict):
             continue
         etype = str(obj.get("type") or "")
+        # Responses API：推理摘要增量
         if etype in (
             "response.reasoning_text.delta",
             "response.reasoning_summary_text.delta",
@@ -189,6 +196,7 @@ def _parse_responses_stream(raw: bytes) -> dict[str, Any]:
             delta = obj.get("delta")
             if isinstance(delta, str) and delta.strip():
                 has_thinking = True
+        # Responses API：reasoning item（encrypted_content / summary）
         item = obj.get("item") if etype in ("response.output_item.added", "response.output_item.done") else None
         if isinstance(item, dict) and item.get("type") == "reasoning":
             enc = item.get("encrypted_content")
@@ -202,17 +210,38 @@ def _parse_responses_stream(raw: bytes) -> dict[str, Any]:
                 has_thinking = True
             elif isinstance(summary, str) and summary.strip():
                 has_thinking = True
+        # Chat Completions：delta.content 增量（用于兜底 completion 估算）
+        if etype == "" and "choices" in obj:
+            choices = obj.get("choices")
+            if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+                delta = choices[0].get("delta") if isinstance(choices[0].get("delta"), dict) else {}
+                piece = delta.get("content") if isinstance(delta.get("content"), str) else ""
+                if piece:
+                    completion += max(1, (len(piece) + 3) // 4)
+        # 终止事件：统一从 usage 取 reasoning_tokens
         payload = obj.get("response") if etype == "response.completed" else obj
         if isinstance(payload, dict):
             usage = payload.get("usage")
             if isinstance(usage, dict):
-                total_out = int(usage.get("output_tokens") or usage.get("completion_tokens") or 0)
-                details = usage.get("output_tokens_details") or usage.get("completion_tokens_details")
-                reasoning = 0
+                total_out = int(
+                    usage.get("output_tokens")
+                    or usage.get("completion_tokens")
+                    or 0
+                )
+                details = (
+                    usage.get("output_tokens_details")
+                    or usage.get("completion_tokens_details")
+                )
+                rt = 0
                 if isinstance(details, dict):
-                    reasoning = int(details.get("reasoning_tokens") or 0)
-                # 可见输出 = 总输出 − 推理 token（Responses 把推理计入 output_tokens）
-                completion = max(0, total_out - reasoning)
+                    rt = int(details.get("reasoning_tokens") or 0)
+                reasoning_tokens = rt
+                # Responses API：可见输出 = 总输出 − 推理 token（推理计入 output_tokens）
+                # Chat Completions：completion_tokens 已是可见输出（不含推理），不扣减
+                if total_out > 0 and "choices" not in obj:
+                    completion = max(0, total_out - rt)
+                elif total_out > 0 and completion == 0:
+                    completion = max(0, total_out - rt)
             out_items = payload.get("output")
             if isinstance(out_items, list):
                 for out in out_items:
@@ -229,7 +258,11 @@ def _parse_responses_stream(raw: bytes) -> dict[str, Any]:
                         has_thinking = True
                     elif isinstance(summary, str) and summary.strip():
                         has_thinking = True
-    return {"has_thinking": has_thinking, "completion_tokens": completion}
+    return {
+        "has_thinking": has_thinking,
+        "completion_tokens": completion,
+        "reasoning_tokens": reasoning_tokens,
+    }
 
 
 def _simplify_error(status: int, body: str) -> str:
@@ -646,7 +679,7 @@ auto_refresher = AutoRefresher()
 kind=inspect  POST /responses 推理题探活：2xx 通过并回写降智判定 /
               401·403 恢复链（刷新后再探，仍失效标 REAUTH）/
               402·429 限流配额 / 网络与 5xx 不改状态只记原因
-              降智：响应体无思考链且可见输出 > 50 token/s
+              降智：reasoning_tokens=0（上游未推理）
 kind=reauth   重登闭环：有 refresh_token 先 OIDC 刷新；被拒或无刷新凭据
               降级为 device flow 重新授权（入认证池），远端交换 token
 """

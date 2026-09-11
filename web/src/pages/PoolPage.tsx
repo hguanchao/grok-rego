@@ -654,13 +654,12 @@ export function PoolPage() {
   /**
    * 页面刷新恢复执行中的后台任务：服务端快照免 taskId，日志按 last_log_id 续拉。
    * push / 巡检 / 重登完整恢复进度条与日志；自动认证池无任务快照，仅提示。
-   * 仅挂载后执行一次：依赖里的轮询函数随 load（分页等）变化，若不拦截会导致
-   * 每次分页都重跑恢复并重复弹出日志抽屉。
+   * 挂载后恢复一次即可：轮询函数随分页变化，不能放进「每次 effect 都恢复」。
+   * recovered 只能在异步恢复成功且未被卸载时置位（避免 Strict Mode 首轮被取消后永久跳过）。
    */
   const taskRecoveredRef = useRef(false);
   useEffect(() => {
     if (taskRecoveredRef.current) return;
-    taskRecoveredRef.current = true;
     let cancelled = false;
     (async () => {
       // 推送任务
@@ -749,6 +748,9 @@ export function PoolPage() {
       } catch {
         // 静默
       }
+      // 必须等本次恢复跑完再打标：React Strict Mode 会立刻卸载首轮 effect，
+      // 若提前把 recovered 置 true，重挂后会跳过恢复，进度条和日志都丢。
+      if (!cancelled) taskRecoveredRef.current = true;
     })();
     return () => {
       cancelled = true;
@@ -896,13 +898,26 @@ export function PoolPage() {
       } else if (action === "disable") {
         await updatePoolAccountStatus([id], 6, "已禁用");
         toast.success("已禁用");
+      } else if (action === "enable") {
+        await updatePoolAccountStatus([id], 1, "已解禁");
+        toast.success("已解禁");
       }
       await load(true);
     } catch (e) {
       const reason =
         e instanceof ApiError ? e.message : `${(e as Error)?.name ?? "Error"}: ${(e as Error)?.message ?? "未知"}`;
-      const type = action === "auth" ? "auth" : action === "reauth" ? "reauth" : "inspect";
-      const tag = action === "auth" ? "认证" : action === "reauth" ? "重登" : "任务";
+      const type =
+        action === "auth" ? "auth" : action === "reauth" ? "reauth" : "inspect";
+      const tag =
+        action === "auth"
+          ? "认证"
+          : action === "reauth"
+            ? "重登"
+            : action === "disable"
+              ? "禁用"
+              : action === "enable"
+                ? "解禁"
+                : "任务";
       appendLogs([
         {
           type,

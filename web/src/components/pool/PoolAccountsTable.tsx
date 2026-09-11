@@ -8,6 +8,7 @@ import {
   SearchX,
   ShieldCheck,
   Trash2,
+  Undo2,
 } from "lucide-react";
 import {
   Badge,
@@ -37,7 +38,7 @@ import {
   poolExpiryTone,
 } from "./PoolPageParts";
 
-export type PoolRowAction = "auth" | "reauth" | "disable" | "delete";
+export type PoolRowAction = "auth" | "reauth" | "disable" | "enable" | "delete";
 
 interface PoolAccountsTableProps {
   accounts: PoolAccount[];
@@ -111,13 +112,20 @@ function AccountActions({
         type="button"
         variant="ghost"
         size="icon"
-        className="row-action-btn text-warn"
-        title="禁用"
-        aria-label={`禁用 ${account.email}`}
+        className={cn(
+          "row-action-btn",
+          account.status === 6 ? "row-action-ok" : "row-action-warn",
+        )}
+        title={account.status === 6 ? "解禁" : "禁用"}
+        aria-label={`${account.status === 6 ? "解禁" : "禁用"} ${account.email}`}
         disabled={inspecting}
-        onClick={() => onAction("disable")}
+        onClick={() => onAction(account.status === 6 ? "enable" : "disable")}
       >
-        <Ban className="size-3.5" strokeWidth={1.8} aria-hidden />
+        {account.status === 6 ? (
+          <Undo2 className="size-3.5" strokeWidth={1.8} aria-hidden />
+        ) : (
+          <Ban className="size-3.5" strokeWidth={1.8} aria-hidden />
+        )}
       </Button>
       <Button
         type="button"

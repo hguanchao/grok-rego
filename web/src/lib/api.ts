@@ -21,6 +21,7 @@ export interface AppConfig {
   cpa_base_url: string;
   cpa_management_key: string;
   gateway_api_key: string;
+  grok_version: string;
 }
 
 export interface LogEntry {

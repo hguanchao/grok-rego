@@ -475,6 +475,12 @@
 .row-action-danger {
   color: var(--destructive) !important;
 }
+.row-action-warn {
+  color: var(--warn) !important;
+}
+.row-action-ok {
+  color: var(--ok) !important;
+}
 
 /* 首屏骨架 */
 .pool-skeleton-row [data-slot="table-cell"] {

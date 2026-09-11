@@ -125,14 +125,19 @@ def claude_code_model_entries() -> list[dict[str, Any]]:
 
 
 def is_messages_path(path: str) -> bool:
-    return path.rstrip("/") in (
-        "/zen/v1/messages",
-        "/zen/v1/messages/count_tokens",
-    ) or path.startswith("/zen/v1/messages/")
+    p = path.rstrip("/")
+    return (
+        p in ("/zen/v1/messages", "/zen/v1/messages/count_tokens")
+        or p.startswith("/zen/v1/messages/")
+        or p.endswith("/v1/messages")
+        or p.endswith("/v1/messages/count_tokens")
+        or "/v1/messages/" in p
+    )
 
 
 def is_count_tokens_path(path: str) -> bool:
-    return path.rstrip("/") == "/zen/v1/messages/count_tokens"
+    p = path.rstrip("/")
+    return p == "/zen/v1/messages/count_tokens" or p.endswith("/v1/messages/count_tokens")
 
 
 def uses_chat_completions(model: str | None) -> bool:
@@ -685,7 +690,7 @@ def messages_to_responses(payload: dict[str, Any]) -> dict[str, Any]:
         _resp_eff = _resp_eff_alias.get(effort, effort)
         if _resp_eff not in ("none", "minimal", "low", "medium", "high", "xhigh"):
             _resp_eff = "high"
-        out["reasoning"] = {"effort": _resp_eff}
+        out["reasoning"] = {"effort": _resp_eff, "summary": "concise"}
     if payload.get("max_tokens") is not None:
         out["max_output_tokens"] = payload.get("max_tokens")
     if payload.get("temperature") is not None:
@@ -841,6 +846,9 @@ def iter_responses_sse(gen: Iterator[bytes], model: str | None) -> Iterator[byte
         )
 
     def finish() -> Iterator[bytes]:
+        # 先发 message_start：reasoning 耗尽预算等场景上游无任何文本增量，
+        # 不补 start 会让 Claude Code 收到无头 SSE 而判定流式不完整
+        yield from ensure_message()
         yield from close_text()
         yield _sse(
             "message_delta",

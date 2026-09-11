@@ -1,7 +1,7 @@
 /**
  * 网关运维页（UI 结构对齐 acorn 参考项目）
  * 上：工具栏 + KPI 条
- * 左：网关配置（接入地址 · 鉴权密钥）
+ * 左：网关配置（接入地址 · 鉴权密钥 · Grok 客户端版本号）
  * 右：账号运行态
  */
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
@@ -96,7 +96,9 @@ export function GatewayPage() {
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [regenerating, setRegenerating] = useState(false);
+  const [savingVersion, setSavingVersion] = useState(false);
   const [apiKey, setApiKey] = useState("");
+  const [clientVersion, setClientVersion] = useState("");
   const [settingsLoaded, setSettingsLoaded] = useState(false);
   const [copied, setCopied] = useState<string | null>(null);
   const seq = useRef(0);
@@ -131,6 +133,7 @@ export function GatewayPage() {
     try {
       const raw: AppConfig = await fetchConfig();
       setApiKey(raw.gateway_api_key || "");
+      setClientVersion(raw.grok_version || "1.0.16");
       setSettingsLoaded(true);
     } catch (err) {
       toast.error(err instanceof ApiError ? err.message : "加载网关配置失败");
@@ -159,6 +162,25 @@ export function GatewayPage() {
       toast.error(err instanceof ApiError ? err.message : "生成失败，已保留原密钥");
     } finally {
       setRegenerating(false);
+    }
+  };
+
+  const handleSaveClientVersion = async () => {
+    if (savingVersion) return;
+    const ver = clientVersion.trim();
+    if (!ver) {
+      toast.error("Grok 客户端版本号不能为空");
+      return;
+    }
+    setSavingVersion(true);
+    try {
+      const next = await saveConfig({ grok_version: ver });
+      setClientVersion(next.grok_version || ver);
+      toast.success("Grok 客户端版本号已保存，立即用于上游请求头");
+    } catch (err) {
+      toast.error(err instanceof ApiError ? err.message : "保存 Grok 客户端版本号失败");
+    } finally {
+      setSavingVersion(false);
     }
   };
 
@@ -398,6 +420,54 @@ export function GatewayPage() {
                       )}
                     </Button>
                   </div>
+                </div>
+
+                <div className="gw-section">
+                  <div className="gw-editor-head">
+                    <div className="gw-editor-title">
+                      <Server className="size-3.5" strokeWidth={1.6} aria-hidden />
+                      <span>Grok客户端版本号</span>
+                      <LabelHelp
+                        tip={
+                          <>
+                            写入 config.json 的 grok_version，打上游时填
+                            x-grok-client-version 与 User-Agent（xai-grok-workspace/版本）。
+                            对齐 grok-build，Authorization 仍用号池 token。
+                          </>
+                        }
+                      />
+                    </div>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      disabled={savingVersion || !settingsLoaded}
+                      onClick={() => void handleSaveClientVersion()}
+                      title="保存到 config.json 并立即用于上游请求头"
+                      aria-busy={savingVersion}
+                    >
+                      {savingVersion ? (
+                        <LoaderCircle className="size-3.5 animate-spin" strokeWidth={1.6} />
+                      ) : null}
+                      保存
+                    </Button>
+                  </div>
+                  <Input
+                    className="gw-editor-input font-mono"
+                    value={clientVersion}
+                    onChange={(e) => setClientVersion(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") {
+                        e.preventDefault();
+                        void handleSaveClientVersion();
+                      }
+                    }}
+                    placeholder="1.0.16"
+                    aria-label="Grok客户端版本号"
+                    spellCheck={false}
+                    autoComplete="off"
+                    disabled={!settingsLoaded}
+                  />
                 </div>
 
               </section>

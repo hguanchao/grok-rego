@@ -422,27 +422,22 @@ export function RequestDetailTable({ rows }: { rows: UsageRow[] }) {
                 </span>
               </TableCell>
               <TableCell>
-                {row.effort || row.reasoning_tokens > 0 ? (
-                  <Tooltip>
-                    <TooltipTrigger asChild>
-                      <span
-                        className={cn(
-                          "usage-effort font-mono text-[11px]",
-                          effortTone(row.effort),
-                        )}
-                      >
-                        {row.effort || "—"}
-                      </span>
-                    </TooltipTrigger>
-                    <TooltipContent side="top" className="font-mono text-[11px] tabular-nums">
-                      {row.reasoning_tokens > 0
-                        ? `推理 Token ${fmtInt(row.reasoning_tokens)}`
-                        : "无推理 Token"}
-                    </TooltipContent>
-                  </Tooltip>
-                ) : (
-                  <span className="font-mono text-[11px] text-muted-foreground">—</span>
-                )}
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <span
+                      className={cn(
+                        "usage-effort font-mono text-[11px]",
+                        effortTone(row.effort),
+                        !row.effort && "text-muted-foreground",
+                      )}
+                    >
+                      {row.effort || "—"}
+                    </span>
+                  </TooltipTrigger>
+                  <TooltipContent side="top" className="font-mono text-[11px] tabular-nums">
+                    {`推理 ${fmtInt(row.reasoning_tokens)}`}
+                  </TooltipContent>
+                </Tooltip>
               </TableCell>
               <TableCell className="text-right font-mono text-[11px] tabular-nums whitespace-nowrap">
                 <div className="usage-token-block">

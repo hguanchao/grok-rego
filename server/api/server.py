@@ -572,10 +572,10 @@ class _ApiHandler(BaseHTTPRequestHandler):
         path = parsed.path.rstrip("/") or "/"
         query = parse_qs(parsed.query)
         try:
-            if path == "/zen/v1" or path.startswith("/zen/v1/"):
+            if path == "/zen" or path.startswith("/zen/"):
                 gateway_proxy(self, method, path)
                 return
-            if path == "/grok/v1" or path.startswith("/grok/v1/"):
+            if path == "/grok" or path.startswith("/grok/"):
                 grok_proxy(self, method, path)
                 return
             if _handle_api(method, path, query, self):

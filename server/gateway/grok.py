@@ -32,17 +32,28 @@ from core.util import (
 )
 from db import get_account_by_id, insert_usage, list_gateway_candidates
 from gateway import egress
+from gateway.paths import ensure_local_v1, resource_path, upstream_url
 from gateway.usage import StreamUsageAccumulator, extract_nonstream, output_tps
 
 GROK_BASE = UPSTREAM_BASE.rstrip("/")
-_CLIENT_VERSION = "0.2.120"  # 与 Grok CLI chat-proxy 期望的客户端版本保持同步（对齐 CLIProxyAPI 维护值）
-_GROK_HEADERS = {
-    "X-XAI-Token-Auth": "xai-grok-cli",
-    "x-grok-client-version": _CLIENT_VERSION,
-    "x-grok-client-identifier": "grok-shell",
-    "x-authenticateresponse": "authenticate-response",
-    "User-Agent": f"xai-grok-workspace/{_CLIENT_VERSION}",
-}
+_DEFAULT_CLIENT_VERSION = "1.0.16"
+
+
+def _client_version() -> str:
+    """运维页写入的 grok_version，空则回退 grok-build crate 版本。"""
+    return (config.GROK_VERSION or _DEFAULT_CLIENT_VERSION).strip() or _DEFAULT_CLIENT_VERSION
+
+
+def _identity_headers() -> dict[str, str]:
+    """对齐 grok-build build_proxy_headers（Authorization 由号池 token 另填）。"""
+    ver = _client_version()
+    return {
+        "X-XAI-Token-Auth": "xai-grok-cli",
+        "x-grok-client-version": ver,
+        "x-grok-client-identifier": "grok-shell",
+        "x-authenticateresponse": "authenticate-response",
+        "User-Agent": f"xai-grok-workspace/{ver}",
+    }
 
 _MAX_BODY = 32 * 1024 * 1024
 _LOG_CAP = 200
@@ -73,7 +84,7 @@ _rr_index = 0  # 自动选号轮询游标（跨请求共享，均匀分摊流量
 # 上游按状态码判定坏号后临时冻结，避免轮询反复命中坏号；到期自动解冻。
 _AUTH_COOLDOWN_SECONDS = 600     # token 无效 / 权限被拒
 _CHANNEL_COOLDOWN_SECONDS = 120  # 通道失效 / 风控拦截
-_RATE_COOLDOWN_SECONDS = 60      # 限流 / 配额
+_RATE_COOLDOWN_SECONDS = 120     # 限流 / 配额（429 冷却 2 分钟，避免粘性会话立刻再打同一号）
 _COOLDOWN_BY_STATUS = {
     401: _AUTH_COOLDOWN_SECONDS,
     403: _AUTH_COOLDOWN_SECONDS,
@@ -222,12 +233,8 @@ def snapshot() -> dict[str, Any]:
 
 
 def _upstream_url(path: str, query: str) -> str:
-    prefix = "/grok/v1"
-    suffix = path[len(prefix):] if path.startswith(prefix) else path
-    url = GROK_BASE + (suffix or "")
-    if query:
-        url = f"{url}?{query}"
-    return url
+    """拼 Grok 上游：base 已含 /v1，资源段再剥一层 /v1，避免 /v1/v1。"""
+    return upstream_url(GROK_BASE, path, "/grok", query)
 
 
 # ── 模型列表：本地清单文件（与 zen-models.json 同构的扁平 dict），由上游 /models 快照固化 ──
@@ -299,22 +306,21 @@ def _map_body_model(body: bytes) -> bytes:
     return json.dumps(payload, ensure_ascii=False).encode("utf-8")
 
 
-_SESSION_BODY_KEYS = ("conversation_id", "session_id", "previous_response_id", "prompt_cache_key")
+# 粘性选号：请求头 x-grok-session-id（会话稳定）。prompt_cache_key 只给上游缓存，不参与选号
+# （main turn 的 cache_key 是 conv-id，side-call 是 session-id，用体会跳号）
+_SESSION_BODY_KEYS = ("conversation_id", "session_id", "previous_response_id")
 _SESSION_HEADERS = (
+    "x-grok-session-id",
     "x-grok-conv-id",
-    "x-session-id",
-    "session-id",
-    "session_id",
-    "x-client-request-id",
-    "x-conversation-id",
 )
+_REASONING_SUMMARY = "concise"
+_DEFAULT_REASONING_EFFORT = "high"
 
 
 def _session_key(handler: BaseHTTPRequestHandler, body: bytes) -> str:
-    """解析粘性会话标识（空串=无会话，选号退化为纯轮询）。
+    """粘性选号键：优先请求头 x-grok-session-id（grok-build 会话稳定 id）。
 
-    对齐 CLIProxyAPI SessionAffinity 的优先级：
-    显式会话头 → 请求体会话 ID → 首条用户消息内容哈希兜底。
+    无 grok 头时才用体字段 / 首条用户消息哈希（非 CLI 客户端兜底）。
     """
     for name in _SESSION_HEADERS:
         value = (handler.headers.get(name) or "").strip()
@@ -343,6 +349,112 @@ def _session_key(handler: BaseHTTPRequestHandler, body: bytes) -> str:
     if digest:
         return f"c:{digest}"
     return ""
+
+
+def _header_value(handler: BaseHTTPRequestHandler, name: str) -> str:
+    value = (handler.headers.get(name) or "").strip()
+    if value.lower() in {"", "null", "undefined", "none"}:
+        return ""
+    return value
+
+
+def _stable_cache_key(handler: BaseHTTPRequestHandler, payload: dict[str, Any]) -> str:
+    """Responses 前缀缓存键：对齐 grok-build CreateResponse（已有 key，否则 conv-id）。"""
+    existing = payload.get("prompt_cache_key")
+    if isinstance(existing, str) and existing.strip():
+        return existing.strip()
+    for name in ("x-grok-conv-id", "x-grok-session-id", "x-conversation-id"):
+        value = _header_value(handler, name)
+        if value:
+            return value
+    for key in ("conversation_id", "session_id"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _looks_reasoning_model(model: Any) -> bool:
+    ident = str(model or "").strip().lower()
+    return ident.startswith("grok-3") or ident.startswith("grok-4")
+
+
+def _ensure_prompt_cache_and_reasoning(
+    body: bytes, handler: BaseHTTPRequestHandler, path: str
+) -> bytes:
+    """Responses 缺字段时按 grok-build 补缓存键、reasoning、store、include。"""
+    if not body or "/responses" not in path:
+        return body
+    try:
+        payload = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return body
+    if not isinstance(payload, dict):
+        return body
+
+    changed = False
+    cache_key = _stable_cache_key(handler, payload)
+    existing = payload.get("prompt_cache_key")
+    if cache_key and (not isinstance(existing, str) or not existing.strip()):
+        payload["prompt_cache_key"] = cache_key
+        changed = True
+
+    reasoning = payload.get("reasoning")
+    if not isinstance(reasoning, dict):
+        reasoning = {}
+        top = payload.get("reasoning_effort")
+        if isinstance(top, str) and top.strip():
+            reasoning["effort"] = top.strip()
+        payload["reasoning"] = reasoning
+        changed = True
+    if not str(reasoning.get("summary") or "").strip():
+        reasoning["summary"] = _REASONING_SUMMARY
+        changed = True
+    effort = reasoning.get("effort")
+    if not (isinstance(effort, str) and effort.strip()) and _looks_reasoning_model(
+        payload.get("model")
+    ):
+        # grok-build default_reasoning_effort=high；不填则上游可能不推理
+        reasoning["effort"] = _DEFAULT_REASONING_EFFORT
+        changed = True
+
+    # grok-build apply_response_defaults：store 默认 false（ZDR）；include 加密思考链
+    if payload.get("store") is None:
+        payload["store"] = False
+        changed = True
+    include = payload.get("include")
+    if not isinstance(include, list):
+        include = []
+        payload["include"] = include
+        changed = True
+    if "reasoning.encrypted_content" not in include:
+        include.append("reasoning.encrypted_content")
+        changed = True
+    if _patch_reasoning_text_types(payload):
+        changed = True
+
+    if not changed:
+        return body
+    return json.dumps(payload, ensure_ascii=False).encode("utf-8")
+
+
+def _patch_reasoning_text_types(payload: dict[str, Any]) -> bool:
+    """对齐 grok-build：reasoning input 的 content 补 type=reasoning_text，否则上游 400。"""
+    items = payload.get("input")
+    if not isinstance(items, list):
+        return False
+    changed = False
+    for item in items:
+        if not isinstance(item, dict) or item.get("type") != "reasoning":
+            continue
+        content = item.get("content")
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if isinstance(part, dict) and "type" not in part:
+                part["type"] = "reasoning_text"
+                changed = True
+    return changed
 
 
 def _first_user_hash(payload: dict[str, Any]) -> str:
@@ -500,7 +612,7 @@ def _forward_headers(incoming: Any, token: str) -> dict[str, str]:
         }:
             continue
         out[key] = value
-    out.update(_GROK_HEADERS)
+    out.update(_identity_headers())
     out["Authorization"] = f"Bearer {token}"
     return out
 
@@ -578,7 +690,7 @@ def probe(account_id: int) -> dict[str, Any]:
         return {"ok": False, "status": 0, "ms": 0, "error": "账号未认证"}
     t0 = time.monotonic()
     url = f"{GROK_BASE}/billing?format=credits"
-    headers = dict(_GROK_HEADERS)
+    headers = _identity_headers()
     headers["Authorization"] = f"Bearer {token}"
     headers["Accept"] = "application/json"
     try:
@@ -609,6 +721,7 @@ def probe(account_id: int) -> dict[str, Any]:
 def proxy(handler: BaseHTTPRequestHandler, method: str, path: str) -> None:
     """把当前请求用号池账号 token 转发到 Grok 上游（自动取号）。"""
     parsed = urlparse(handler.path)
+    path = ensure_local_v1(path, "/grok")
     try:
         body = _read_body(handler)
     except ValueError as exc:
@@ -622,9 +735,10 @@ def proxy(handler: BaseHTTPRequestHandler, method: str, path: str) -> None:
 
     # 模型映射：cli 传 model → grok-models.json 查 value 透传上游
     body = _map_body_model(body)
+    body = _ensure_prompt_cache_and_reasoning(body, handler, path)
 
     # ── 模型列表：读本地 grok-models.json（扁平 dict）转 OpenAI 列表，不请求上游 ──
-    if method in ("GET", "HEAD") and path.endswith("/models"):
+    if method in ("GET", "HEAD") and resource_path(path, "/grok") == "/models":
         payload = json.dumps(
             {"object": "list", "data": _local_model_entries()},
             ensure_ascii=False,

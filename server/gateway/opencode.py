@@ -26,6 +26,7 @@ from core.logger import logger
 from core.util import curl_error_code, now_iso_tz, proxy_endpoint_ready
 from db import insert_usage
 from gateway import egress
+from gateway.paths import ensure_local_v1, resource_path, upstream_url
 from gateway.anthropic import (
     chat_to_message,
     claude_code_model_entries,
@@ -49,9 +50,10 @@ ZEN_BASE = "https://opencode.ai/zen/v1"
 ZEN_KEY = "public"
 ZEN_HEADERS = {
     "Authorization": f"Bearer {ZEN_KEY}",
-    "HTTP-Referer": "https://opencode.ai",
-    "User-Agent": "opencode/1.18.16",
+    "User-Agent": "opencode/1.18.30",
+    "HTTP-Referer": "https://opencode.ai/",
     "X-Title": "opencode",
+    "X-Opencode-Session": "cliproxy-opencode-go-session",
 }
 
 _MAX_BODY = 32 * 1024 * 1024
@@ -298,11 +300,35 @@ def _filter_free_models(raw: bytes) -> bytes:
 
 
 def _upstream_url(path: str, query: str) -> str:
-    suffix = path[len("/zen/v1") :] if path.startswith("/zen/v1") else path
-    url = ZEN_BASE + suffix
-    if query:
-        url = f"{url}?{query}"
-    return url
+    """拼 Zen 上游：base 已含 /v1，资源段再剥一层 /v1，避免 /v1/v1。"""
+    return upstream_url(ZEN_BASE, path, "/zen", query)
+
+
+def _chat_to_responses(src: dict[str, Any]) -> dict[str, Any]:
+    """Chat Completions 体 → Responses 体（Muse 官方端点）。"""
+    out: dict[str, Any] = {
+        "model": src.get("model"),
+        "input": src.get("messages") or src.get("input") or "",
+        "stream": bool(src.get("stream")),
+    }
+    if src.get("max_tokens") is not None:
+        out["max_output_tokens"] = src.get("max_tokens")
+    if src.get("max_output_tokens") is not None:
+        out["max_output_tokens"] = src.get("max_output_tokens")
+    if src.get("temperature") is not None:
+        out["temperature"] = src.get("temperature")
+    if src.get("top_p") is not None:
+        out["top_p"] = src.get("top_p")
+    if src.get("tools") is not None:
+        out["tools"] = src.get("tools")
+    if src.get("tool_choice") is not None:
+        out["tool_choice"] = src.get("tool_choice")
+    reasoning = src.get("reasoning")
+    if isinstance(reasoning, dict):
+        out["reasoning"] = reasoning
+    elif isinstance(src.get("reasoning_effort"), str) and src["reasoning_effort"].strip():
+        out["reasoning"] = {"effort": src["reasoning_effort"].strip(), "summary": "concise"}
+    return out
 
 
 def _extract_meta(body: bytes) -> tuple[str | None, bool]:
@@ -340,6 +366,7 @@ def _forward_headers(incoming: Any) -> dict[str, str]:
             "referer",
             "user-agent",
             "x-title",
+            "x-opencode-session",
         }:
             continue
         out[key] = value
@@ -415,12 +442,13 @@ def _wrap_upstream_error(raw: bytes, anthropic: bool) -> bytes:
         return raw
     err = obj.get("error") if isinstance(obj, dict) else None
     if isinstance(err, dict):
+        # 保留上游真实错误语义（如 MissingSessionID），仅换 Anthropic 错误包络
+        etype = str(err.get("type") or "").strip()
         msg = str(err.get("message") or err.get("type") or "upstream error")
-    elif isinstance(err, str) and err:
-        msg = err
-    else:
-        msg = "upstream error"
-    return _anthropic_error(msg)
+        return _anthropic_error(f"{etype}: {msg}" if etype else msg, 400)
+    if isinstance(err, str) and err:
+        return _anthropic_error(err, 400)
+    return _anthropic_error("upstream error", 400)
 
 
 def _proxy_kwargs() -> dict[str, Any]:
@@ -483,7 +511,7 @@ def _client_api_key(handler: BaseHTTPRequestHandler) -> str:
 
 def _reject_unauthorized(handler: BaseHTTPRequestHandler, path: str) -> None:
     """按客户端协议风格返回 401（Anthropic Messages 走 error 包络）。"""
-    anthropic = path.startswith("/zen/v1/messages")
+    anthropic = is_messages_path(path)
     if anthropic:
         payload = _anthropic_error("invalid api key", 401)
     else:
@@ -500,6 +528,7 @@ def proxy(handler: BaseHTTPRequestHandler, method: str, path: str) -> None:
     """把当前 HTTP 请求转发到 Zen，流式响应逐块写出。"""
     parsed = urlparse(handler.path)
     query = parsed.query
+    path = ensure_local_v1(path, "/zen")
 
     # 鉴权：配置了 gateway_api_key 时，除预检外的所有请求必须携带匹配密钥
     if config.GATEWAY_API_KEY and method != "OPTIONS":
@@ -509,7 +538,7 @@ def proxy(handler: BaseHTTPRequestHandler, method: str, path: str) -> None:
             return
 
     # GET /zen/v1/models：固定返回本地清单（免费模型 + Claude Code 别名），不请求上游
-    if method in ("GET", "HEAD") and path.rstrip("/") == "/zen/v1/models":
+    if method in ("GET", "HEAD") and resource_path(path, "/zen") == "/models":
         payload = json.dumps(
             {
                 "object": "list",
@@ -575,6 +604,21 @@ def proxy(handler: BaseHTTPRequestHandler, method: str, path: str) -> None:
 
     forward_path = path
     forward_body = body
+    if use_responses and not translate and path.rstrip("/").endswith("/chat/completions"):
+        # @ai-sdk/openai-compatible 会打 /chat/completions；Muse 官方只认 /responses
+        try:
+            src = json.loads(body.decode("utf-8")) if body else {}
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            src = {}
+        if isinstance(src, dict):
+            resp = _chat_to_responses(src)
+            stream_flag = bool(resp.get("stream"))
+            forward_body = json.dumps(resp, ensure_ascii=False).encode("utf-8")
+            rr = resp.get("reasoning") if isinstance(resp.get("reasoning"), dict) else None
+            if isinstance(rr, dict) and isinstance(rr.get("effort"), str):
+                effort_flag = rr["effort"]
+        forward_path = "/zen/v1/responses"
+        query = ""
     if translate:
         try:
             src = json.loads(body.decode("utf-8")) if body else {}
@@ -733,7 +777,7 @@ def proxy(handler: BaseHTTPRequestHandler, method: str, path: str) -> None:
                 usage = acc.result()
         else:
             payload = upstream.content or b""
-            if status < 400 and path.rstrip("/") == "/zen/v1/models":
+            if status < 400 and resource_path(path, "/zen") == "/models":
                 payload = _filter_free_models(payload)
             elif status < 400 and translate:
                 try:
@@ -751,6 +795,7 @@ def proxy(handler: BaseHTTPRequestHandler, method: str, path: str) -> None:
                             chat_to_message(obj, model), ensure_ascii=False
                         ).encode("utf-8")
             elif status >= 400 and anthropic_client:
+                # 透传上游真实错误（仅转 Anthropic 错误包络，不吞错误信息）
                 payload = _wrap_upstream_error(payload, True)
             bytes_out = len(payload)
             ctype = "application/json; charset=utf-8"
