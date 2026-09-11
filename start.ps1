@@ -10,6 +10,17 @@ function Write-Fail([string]$Message) {
     Write-Host "[FAIL] $Message"
 }
 
+function Add-DirToPath([string]$Dir) {
+    if (-not $Dir -or -not (Test-Path -LiteralPath $Dir)) { return }
+    $parts = $env:Path -split ";" | Where-Object { $_ }
+    if ($parts -contains $Dir) { return }
+    $env:Path = "$Dir;" + $env:Path
+}
+
+# 双击 start.bat 时不会加载用户 profile，~/.local/bin 里的 uv 不在 PATH
+Add-DirToPath (Join-Path $env:USERPROFILE ".local\bin")
+Add-DirToPath (Join-Path $env:USERPROFILE ".cargo\bin")
+
 $fail = $false
 
 Write-Host ""

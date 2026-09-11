@@ -93,8 +93,8 @@ RISK_SCAN_TIMEOUT = 25  # 单次风控扫描轮询的最长时间（秒）
 RISK_SCAN_ATTEMPTS = 2  # 单轮体检最多跳转重试的次数
 MAX_ATTEMPTS = 3  # 邮箱/验证码/资料阶段失败允许重启浏览器的最大次数（邮箱与资料复用）
 POST_EMAIL_RETRIES = 2  # 仅 SSO 阶段失败：刷新页面重试的次数（不重启浏览器）
-EMAIL_PAGE_WAIT_SECS = 15  # 等待邮箱填写页出现的最长时间（秒）
-OTP_PAGE_WAIT_SECS = 20  # 等待验证码页出现的最长时间（秒）
+EMAIL_PAGE_WAIT_SECS = 25  # 等待邮箱填写页出现的最长时间（秒）
+OTP_PAGE_WAIT_SECS = 30  # 等待验证码页出现的最长时间（秒）
 OTP_MAIL_TIMEOUT = 120  # 轮询邮件取验证码超时（秒）
 OTP_MAIL_INTERVAL = 3  # 轮询邮件间隔（秒）
 FORM_READY_TIMEOUT = 25  # 填码后等待资料表单就绪的最长时间（秒）
@@ -116,19 +116,32 @@ FORM_LAST_SELECTORS = [
 ]
 
 # 填写邮箱提交后出现的风控提示关键字（命中则视为邮箱阶段失败，允许重启浏览器复用邮箱）
+# 不含 Turnstile 文案（verify you are human / complete the challenge），否则 widget 会被误判成风控
+# 「Something went wrong. Please try again.」走 PageFatalError，不放这里
 RISK_PROMPT_KEYWORDS = (
     "too many",
-    "please try again",
     "try again later",
-    "security check",
-    "complete the challenge",
-    "verify you are human",
     "suspicious",
     "automated access",
     "rate limit",
     "access denied",
     "blocked",
 )
+
+# 任一注册步骤出现即关浏览器、复用原账号开新会话重试
+PAGE_FATAL_MARKERS = (
+    "something went wrong. please try again",
+    "something went wrong",
+)
+
+
+class PageFatalError(Exception):
+    """页面出现 Something went wrong，需关闭浏览器并用原账号重开会话。"""
+EMAIL_INPUT_SELECTORS = [
+    "input[type='email']",
+    "input[name='email']",
+    "input[autocomplete='email']",
+]
 
 FIRST_NAMES = ["James", "John", "Robert", "Michael", "William", "David", "Richard", "Joseph", "Thomas", "Charles", "Christopher", "Daniel", "Matthew", "Anthony", "Mark", "Donald", "Steven", "Paul", "Andrew", "Joshua", "Kenneth", "Kevin", "Brian", "George", "Edward", "Ronald", "Timothy", "Jason", "Jeffrey", "Ryan", "Mary", "Patricia", "Jennifer", "Linda", "Elizabeth", "Barbara", "Susan", "Jessica", "Sarah", "Karen", "Nancy", "Lisa", "Betty", "Margaret", "Sandra", "Ashley", "Kimberly", "Emily", "Donna", "Michelle", "Carol", "Amanda", "Melissa", "Deborah", "Stephanie", "Rebecca", "Sharon", "Laura", "Cynthia", "Nicholas", "Tyler", "Samuel", "Benjamin", "Nathan", "Alexander", "Peter", "Henry", "Douglas", "Zachary", "Brandon", "Patrick", "Jeremy", "Rachel", "Laura", "Amber", "Crystal", "Morgan", "Jasmine", "Nicole", "Brittany", "Danielle", "Samantha", "Alexis", "Victoria", "Grace", "Faith", "Autumn", "Sophia", "Natalia", "Marcus", "Dominic", "Vincent", "Adrian", "Elias", "Tristan", "Donovan", "Gabriel", "Camille", "Beatrice", "Daisy", "Evelyn", "Iris", "Naomi", "Quinn", "Wyatt", "Cole", "Easton", "Landon", "Jace", "Maxwell", "Orion", "Silas", "Asher", "Jonah", "Micah", "Ezra", "Ezra", "Simon", "Felix", "Hugo"]
 LAST_NAMES = ["Smith", "Johnson", "Williams", "Brown", "Jones", "Garcia", "Miller", "Davis", "Rodriguez", "Martinez", "Hernandez", "Lopez", "Gonzalez", "Wilson", "Anderson", "Thomas", "Taylor", "Moore", "Jackson", "Martin", "Lee", "Perez", "Thompson", "White", "Harris", "Sanchez", "Clark", "Ramirez", "Lewis", "Robinson", "Walker", "Young", "Allen", "King", "Wright", "Scott", "Torres", "Nguyen", "Hill", "Flores", "Green", "Adams", "Nelson", "Baker", "Hall", "Rivera", "Campbell", "Mitchell", "Carter", "Roberts", "Phillips", "Evans", "Turner", "Diaz", "Parker", "Cruz", "Edwards", "Collins", "Reyes", "Stewart", "Morris", "Morales", "Murphy", "Cook", "Rogers", "Gutierrez", "Ortiz", "Watkins", "Fisher", "Bishop", "Wallace", "Simpson", "Daniels", "Gordon", "Austin", "Marshall", "Pierce", "Hawkins", "Jensen", "Crawford", "Bennett", "Robertson", "Boyd", "Mason", "Romero", "Robertson", "Fox", "Warren", "Burton", "Pierce", "Spencer", "Cole", "Holloway", "Brock", "Vasquez", "Montes", "Rhodes", "Cabrera", "Donovan", "Beck", "Sanford", "Kramer", "Whitfield", "Norris", "Townes", "Pemberton"]
@@ -225,15 +238,25 @@ def _on_form_page(page: Any) -> bool:
 def _camoufox_kwargs(headless: bool) -> dict[str, Any]:
     """Camoufox 启动参数：可视/无头 + 代理 + 反检测增强。
 
-    - humanize：鼠标轨迹拟人化（每次移动 0.5-1.5s 随机）
+    - humanize：拟人轨迹，上限 0.8s，避免用户动鼠标后无限等待
     - geoip：按代理 IP 自动匹配时区/语言/地理位置
     - locale：英语系 locale，与代理出口 IP 地理一致
     """
     kwargs: dict[str, Any] = {
         "headless": headless,
-        "humanize": True,
+        # 上限 0.8s：humanize 默认会等轨迹走完；用户动鼠标/最小化时无限等会卡死自动化
+        "humanize": 0.8,
         "geoip": True,
         "locale": ["en-US", "en"],
+        # 允许点击跨域 Turnstile iframe 内勾选框（Camoufox 官方 Turnstile 场景）
+        "disable_coop": True,
+        "i_know_what_im_doing": True,
+        # 最小化 / 被挡住时 Windows 会暂停 Firefox 绘制与定时器，导致点击永远等不到
+        "firefox_user_prefs": {
+            "widget.windows.window_occlusion_tracking.enabled": False,
+            "dom.min_background_timeout_value": 4,
+            "dom.min_background_timeout_value_without_budget": 4,
+        },
     }
     if config.PROXY:
         kwargs["proxy"] = {"server": config.PROXY}
@@ -314,24 +337,36 @@ def click(
 
     覆盖 button/a/input[type=submit]/role=button 多种标签，多匹配时取第一个（避免 strict 模式报错）。
     """
+    # 只用精确文本：has-text('Sign up') 会命中「Sign up with X」导致走错入口
     selectors = (
+        f'button:text-is("{text}")',
+        f'a:text-is("{text}")',
+        f'[role="button"]:text-is("{text}")',
         f'text="{text}"',
-        f"button:has-text('{text}')",
-        f"a:has-text('{text}')",
         f"input[type='submit'][value='{text}']",
-        f"[role='button']:has-text('{text}')",
     )
     for _ in range(retries + 1):
         if _is_closed(page):
             logger.debug(f"[注册] 页面已关闭，停止点击: {text}")
             return False
         for frame in _frames(page):
+            try:
+                role_btn = frame.get_by_role("button", name=text, exact=True).first
+                if role_btn.count() > 0 and role_btn.is_visible():
+                    human_click_locator(page, role_btn)
+                    return True
+            except Exception as e:
+                if "TargetClosed" in type(e).__name__:
+                    logger.debug(f"[注册] 页面已关闭，停止点击: {text}")
+                    return False
             for selector in selectors:
                 try:
                     locator = frame.locator(selector).first
                     if locator.count() == 0:
                         continue
                     locator.wait_for(state="visible", timeout=min(timeout, 3000))
+                    if not locator.is_visible():
+                        continue
                     human_click_locator(page, locator)
                     return True
                 except Exception as e:
@@ -404,23 +439,48 @@ def fill(page: Any, value: str, selectors: list[str], timeout: int = 20000) -> b
 
 
 def wait_until(
-    page: Any, targets: list[str], timeout: int, check_for_errors: bool = False
+    page: Any,
+    targets: list[str],
+    timeout: int,
+    check_for_errors: bool = False,
+    done_when: Callable[[], bool] | None = None,
 ) -> bool:
-    """轮询等待 URL/页面文本（含 iframe）出现任一目标，返回是否命中。"""
+    """轮询等待 URL/页面文本（含 iframe）出现任一目标，返回是否命中。
+
+    先检查再 sleep，避免「已进入下一步仍空等上一步」。
+    done_when：额外提前成功条件（例如已到资料表单）。
+    出现 Something went wrong 立即抛 PageFatalError（关浏览器复用账号重试）。
+    """
     deadline = time.time() + timeout
-    error_count = 0
     while time.time() < deadline:
-        time.sleep(2)
+        _ensure_no_page_fatal(page)
+        if done_when is not None:
+            try:
+                if done_when():
+                    return True
+            except PageFatalError:
+                raise
+            except Exception:
+                pass
         try:
             text = _page_text(page)
         except Exception:
+            time.sleep(0.5)
             continue
         if any(target.lower() in text for target in targets):
             return True
-        if check_for_errors and ("something went wrong" in text or "an error occurred" in text):
-            error_count += 1
-            if error_count >= 3:
-                return False
+        # check_for_errors 保留兼容；致命文案已由 _ensure_no_page_fatal 处理
+        if check_for_errors and "an error occurred" in text:
+            raise PageFatalError("An error occurred")
+        time.sleep(0.5)
+    _ensure_no_page_fatal(page)
+    if done_when is not None:
+        try:
+            return bool(done_when())
+        except PageFatalError:
+            raise
+        except Exception:
+            return False
     return False
 
 
@@ -567,12 +627,13 @@ def _enter_signup_page(page: Any) -> bool:
     # 落地页为社交登录入口时点「Sign up with email」；已是表单页则跳过
     if _has_input(page, "input[type='email']"):
         return True
-    if not click(page, "Sign up with email"):
-        # 部分落地页先需 Sign up 入口
-        if not click(page, "Sign up"):
-            return False
-        return click(page, "Sign up with email")
-    return True
+    for label in ("Sign up with email", "Continue with email", "Sign up with Email"):
+        if click(page, label):
+            _ensure_no_page_fatal(page)
+            return True
+    _ensure_no_page_fatal(page)
+    # 禁止回退点「Sign up」：has-text / 模糊匹配会点到 Sign up with X
+    return False
 
 
 def _ensure_email(
@@ -586,7 +647,9 @@ def _ensure_email(
     t0 = time.monotonic()
     deadline = time.time() + EMAIL_PAGE_WAIT_SECS
     while time.time() < deadline and not _has_input(page, "input[type='email']"):
+        _ensure_no_page_fatal(page)
         time.sleep(0.5)
+    _ensure_no_page_fatal(page)
     if not _has_input(page, "input[type='email']"):
         logger.warning(f"[邮箱] 填写页未就绪  · {elapsed_label(t0)}")
         return None
@@ -618,6 +681,26 @@ def _has_risk_prompt(page: Any) -> bool:
     return any(keyword in body for keyword in RISK_PROMPT_KEYWORDS)
 
 
+def _has_page_fatal_error(page: Any) -> bool:
+    """是否出现 Something went wrong 类致命页错。"""
+    try:
+        body = _page_text(page)
+    except Exception:
+        return False
+    return any(marker in body for marker in PAGE_FATAL_MARKERS)
+
+
+def _ensure_no_page_fatal(page: Any) -> None:
+    """命中致命页错则抛 PageFatalError，由 _run_attempt 关浏览器复用账号重试。"""
+    if _has_page_fatal_error(page):
+        logger.warning("[注册] 检测到页面错误: Something went wrong. Please try again.")
+        try:
+            _dump_page(page, "page-fatal-error")
+        except Exception:
+            pass
+        raise PageFatalError("Something went wrong. Please try again.")
+
+
 def _submit_email(page: Any, email: str) -> tuple[str, bool]:
     """填写邮箱并点击 Sign up。返回 (失败阶段, 是否成功)。
 
@@ -626,13 +709,14 @@ def _submit_email(page: Any, email: str) -> tuple[str, bool]:
     """
     t0 = time.monotonic()
     log_email = email
-    if not fill(page, email, ["input[type='email']", "input"]):
+    if not fill(page, email, EMAIL_INPUT_SELECTORS):
         logger.warning(f"[邮箱] 未找到输入框  {log_email}  · {elapsed_label(t0)}")
         return "email", False
-    if not click(page, "Sign up"):
+    if not click(page, "Sign up") and not click(page, "Continue"):
         logger.warning(f"[邮箱] 未找到 Sign up 按钮  {log_email}  · {elapsed_label(t0)}")
         return "email", False
     page.wait_for_timeout(1500)
+    _ensure_no_page_fatal(page)
     if _has_risk_prompt(page):
         logger.warning(f"[邮箱] 提交后触发风控  {log_email}  · {elapsed_label(t0)}")
         return "email", False
@@ -696,6 +780,7 @@ def _wait_form_ready(page: Any, timeout: int = FORM_READY_TIMEOUT) -> bool:
     while time.time() < deadline:
         if _is_closed(page):
             return False
+        _ensure_no_page_fatal(page)
         if _on_form_page(page):
             return True
         if time.time() - last_click >= 5:
@@ -705,7 +790,9 @@ def _wait_form_ready(page: Any, timeout: int = FORM_READY_TIMEOUT) -> bool:
                     break
             else:
                 last_click = time.time()
-        time.sleep(1)
+            _ensure_no_page_fatal(page)
+        time.sleep(0.5)
+    _ensure_no_page_fatal(page)
     return _on_form_page(page)
 
 
@@ -720,21 +807,38 @@ def _form_ready_skip(page: Any, email: str, t0: float) -> bool:
 
 
 def _verify_email(page: Any, email: str, jwt: str) -> bool:
-    """验证码阶段：等验证码页 → 取码 → 填码 → 等到资料表单。表单未出现视为失败。"""
+    """验证码阶段：等验证码页 → 取码 → 填码 → 等到资料表单。
+
+    任一等待中若已进入资料表单则立即成功，禁止空等上一步。
+    """
     t0 = time.monotonic()
     log_email = email
     if _form_ready_skip(page, email, t0):
         return True
-    if not wait_until(page, ["verify your email", "one-time code"], OTP_PAGE_WAIT_SECS, check_for_errors=True):
+    # 同时盯验证码页与资料表单，避免已到表单仍空等 OTP 文案
+    if not wait_until(
+        page,
+        ["verify your email", "one-time code"],
+        OTP_PAGE_WAIT_SECS,
+        check_for_errors=True,
+        done_when=lambda: _on_form_page(page),
+    ):
         if _form_ready_skip(page, email, t0):
             return True
         logger.warning(f"[邮件] 验证码页未就绪  {log_email}  · {elapsed_label(t0)}")
         _dump_page(page, "otp-page-missing")
         return False
-    code = poll_for_code(jwt, timeout=OTP_MAIL_TIMEOUT, interval=OTP_MAIL_INTERVAL)
+    if _form_ready_skip(page, email, t0):
+        return True
+    code = poll_for_code(
+        jwt,
+        timeout=OTP_MAIL_TIMEOUT,
+        interval=OTP_MAIL_INTERVAL,
+        stop_when=lambda: _on_form_page(page),
+    )
+    if _form_ready_skip(page, email, t0):
+        return True
     if not code:
-        if _form_ready_skip(page, email, t0):
-            return True
         logger.error(f"[邮件] 等待验证码超时  {log_email}  · {elapsed_label(t0)}")
         return False
     fill_t0 = time.monotonic()
@@ -745,6 +849,7 @@ def _verify_email(page: Any, email: str, jwt: str) -> bool:
         _dump_page(page, "otp-input-missing")
         return False
     logger.success(f"[邮件] 已填入验证码  · {elapsed_label(fill_t0)}")
+    _ensure_no_page_fatal(page)
     if not _wait_form_ready(page, timeout=FORM_READY_TIMEOUT):
         logger.warning(f"[资料] 填码后资料表单未就绪  {log_email}  · {elapsed_label(t0)}")
         _dump_page(page, "after-otp-no-form")
@@ -752,14 +857,77 @@ def _verify_email(page: Any, email: str, jwt: str) -> bool:
     return True
 
 
+def _pass_turnstile(page: Any) -> bool:
+    """资料页先过 Turnstile；失败且需刷新时重载后再验（此时尚未填表）。"""
+    t0 = time.monotonic()
+    for cf_round in range(3):
+        _ensure_no_page_fatal(page)
+        try_click_cookies(page)
+        result = handle_turnstile(page)
+        _ensure_no_page_fatal(page)
+        if result in ("passed", "skipped"):
+            return True
+        if result != "refresh" or cf_round >= 2:
+            break
+        logger.debug(f"[CF挑战] 刷新资料页重试（第 {cf_round + 1}/2 次）")
+        try:
+            page.reload(wait_until="domcontentloaded")
+            page.wait_for_timeout(2500)
+        except Exception:
+            break
+        if not _on_form_page(page) and not _wait_form_ready(page, timeout=15):
+            break
+    logger.warning(f"[CF挑战] Turnstile 未通过  · {elapsed_label(t0)}")
+    _dump_page(page, "turnstile-failed")
+    return False
+
+
+def _check_marketing_opt_in(page: Any) -> None:
+    """勾选资料页「Receive email updates on new features and offers」。"""
+    for frame in _frames(page):
+        try:
+            loc = frame.locator("input[name='marketingOptIn']")
+            if loc.count() == 0:
+                loc = frame.get_by_role(
+                    "checkbox",
+                    name="Receive email updates on new features and offers",
+                )
+            if loc.count() == 0:
+                continue
+            box = loc.first
+            if box.is_checked():
+                logger.debug("[资料] 营销邮件勾选已勾上")
+                return
+            human_click_locator(page, box)
+            logger.info("[资料] 已勾选 Receive email updates")
+            return
+        except Exception:
+            continue
+    if click(
+        page,
+        "Receive email updates on new features and offers",
+        timeout=3000,
+        retries=0,
+        quiet=True,
+    ):
+        logger.info("[资料] 已勾选 Receive email updates（文案）")
+        return
+    logger.debug("[资料] 未找到营销邮件勾选框，跳过")
+
+
 def _fill_signup_form(page: Any, first_name: str, last_name: str, password: str) -> bool:
-    """填写注册表单（姓名 + 密码）并提交，处理 Turnstile 验证。"""
+    """资料页：先过 Turnstile，再填姓名/密码并提交。"""
     t0 = time.monotonic()
     full_name = f"{first_name} {last_name}".strip()
+    _ensure_no_page_fatal(page)
     if not _on_form_page(page) and not _wait_form_ready(page, timeout=15):
         logger.warning(f"[资料] 资料表单未就绪  · {elapsed_label(t0)}")
         _dump_page(page, "form-not-ready")
         return False
+
+    if not _pass_turnstile(page):
+        return False
+
     if not fill(page, first_name, FORM_FIRST_SELECTORS):
         logger.warning(f"[资料] 未找到姓名框  {full_name}  · {elapsed_label(t0)}")
         _dump_page(page, "givenName-missing")
@@ -773,38 +941,16 @@ def _fill_signup_form(page: Any, first_name: str, last_name: str, password: str)
         _dump_page(page, "password-missing")
         return False
 
-    cf_ok = False
-    for cf_round in range(3):
-        result = handle_turnstile(page)
-        if result in ("passed", "skipped"):
-            cf_ok = True
-            break
-        # 仅「可见 Verification failed」才刷新；超时失败不刷新
-        if result != "refresh" or cf_round >= 2:
-            break
-        logger.debug(f"[CF挑战] 刷新资料页重试（第 {cf_round + 1}/2 次）")
-        try:
-            page.reload(wait_until="domcontentloaded")
-            page.wait_for_timeout(2500)
-        except Exception:
-            break
-        if not _on_form_page(page) and not _wait_form_ready(page, timeout=15):
-            break
-        if not (
-            fill(page, first_name, FORM_FIRST_SELECTORS)
-            and fill(page, last_name, FORM_LAST_SELECTORS)
-            and fill(page, password, ["input[type='password']"])
-        ):
-            break
-    if not cf_ok:
-        logger.warning(f"[CF挑战] Turnstile 未通过  · {elapsed_label(t0)}")
-        _dump_page(page, "turnstile-failed")
-        return False
+    _check_marketing_opt_in(page)
 
+    # Turnstile / 填表期间 Cookie 横幅可能再次盖住提交按钮
+    try_click_cookies(page)
     if not click(page, "Complete sign up") and not click(page, "Create account") and not click(page, "Continue"):
         logger.warning(f"[资料] 未找到提交按钮  {full_name}  · {elapsed_label(t0)}")
         _dump_page(page, "complete-signup-missing")
         return False
+    page.wait_for_timeout(800)
+    _ensure_no_page_fatal(page)
     logger.success(f"[资料] 已提交 {full_name}  · {elapsed_label(t0)}")
     return True
 
@@ -854,6 +1000,7 @@ def _wait_sso_ready(
     deadline = time.time() + SSO_WAIT_TIMEOUT
     last_continue = 0.0
     while time.time() < deadline:
+        _ensure_no_page_fatal(page)
         if _has_sso_cookie(page):
             return True
         if time.time() - last_continue >= SSO_CONTINUE_INTERVAL:
@@ -870,6 +1017,7 @@ def _wait_sso_ready(
                 else:
                     continue
                 break
+            _ensure_no_page_fatal(page)
         time.sleep(SSO_POLL_INTERVAL)
     who = email or ""
     logger.error(
@@ -1058,37 +1206,14 @@ def _run_attempt(
             logger.success(
                 f"[入池] {email}  · {elapsed_label(add_t0)}"
             )
-
-            if config.IS_AUTH:  # 浏览器仍开着，顺带 grok.com 风控体检（已登录）
-                risk_t0 = time.monotonic()
-                # 体检是落地后的可选增强：异常不阻断注册成功收尾，也不拖累浏览器关闭。
-                try:
-                    risk = check_account_risk(page)
-                except Exception as exc:
-                    if "TargetClosed" in type(exc).__name__ or "closed" in str(exc).lower():
-                        logger.debug(
-                            f"[风控] {email}  浏览器已关闭，跳过体检  · {elapsed_label(risk_t0)}"
-                        )
-                    else:
-                        logger.warning(
-                            f"[风控] {email}  体检异常，忽略  {type(exc).__name__}: "
-                            f"{str(exc)[:120]}  · {elapsed_label(risk_t0)}"
-                        )
-                    risk = (None, "")
-                bfs, details = risk
-                if bfs is None:
-                    logger.warning(
-                        f"[风控] {email}  未解析到风控字段，标记 unknown  · {elapsed_label(risk_t0)}"
-                    )
-                elif bfs in (1, 2):
-                    extra = f"  details={details}" if details else ""
-                    logger.warning(
-                        f"[风控] {email}  被标记  bfs={bfs}{extra}  · {elapsed_label(risk_t0)}"
-                    )
-                else:
-                    logger.success(
-                        f"[风控] {email}  正常  bfs={bfs}  · {elapsed_label(risk_t0)}"
-                    )
+            # 拿到 sso 立即结束本账号浏览器会话，不跳转 grok.com；风控留给后续认证/巡检
+    except PageFatalError as exc:
+        # with Camoufox 退出即关浏览器；返回可重启阶段，run_signup 复用原邮箱/资料重开
+        logger.warning(
+            f"[注册] 页面错误，关闭浏览器并用原账号重试: {exc}"
+            f"{f'  {email}' if email else ''}"
+        )
+        return fail("form" if email_submitted else "email")
     except Exception as exc:
         if "TargetClosed" in type(exc).__name__ or "closed" in str(exc).lower():
             logger.debug(f"[注册] 浏览器已关闭: {type(exc).__name__}: {str(exc)[:160]}")

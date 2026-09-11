@@ -6,6 +6,7 @@ import random
 import string
 import threading
 import time
+from collections.abc import Callable
 from typing import Any
 
 from curl_cffi import requests
@@ -93,8 +94,16 @@ def _cf_create_temp_email(local_part: str = "") -> tuple[str, str]:
     return address, jwt
 
 
-def _cf_poll_for_code(jwt: str, timeout: int = 120, interval: int = 3) -> str | None:
-    """轮询邮箱，提取验证码（格式如 ABC-XYZ 或纯数字）。"""
+def _cf_poll_for_code(
+    jwt: str,
+    timeout: int = 120,
+    interval: int = 3,
+    stop_when: Callable[[], bool] | None = None,
+) -> str | None:
+    """轮询邮箱，提取验证码（格式如 ABC-XYZ 或纯数字）。
+
+    stop_when：页面已进入下一步时返回 True，立即结束轮询避免空等。
+    """
     headers = {"Authorization": f"Bearer {jwt}"}
     t0 = time.monotonic()
     logger.debug(f"[邮件] 开始轮询，等待验证码邮件（最多 {timeout} 秒）...")
@@ -102,6 +111,9 @@ def _cf_poll_for_code(jwt: str, timeout: int = 120, interval: int = 3) -> str | 
     seen_ids: set[Any] = set()
     elapsed = 0
     while elapsed < timeout:
+        if stop_when is not None and stop_when():
+            logger.debug(f"[邮件] 页面已进入下一步，停止等验证码  · {elapsed_label(t0)}")
+            return None
         try:
             resp = requests.get(
                 f"{config.CF_API_BASE}/api/parsed_mails?limit=20&offset=0",
@@ -183,14 +195,25 @@ def _yyds_create_temp_email(local_part: str = "") -> tuple[str, str]:
     return address, data["token"]
 
 
-def _yyds_poll_for_code(temp_token: str, timeout: int = 120, interval: int = 3) -> str | None:
-    """长轮询 /v1/messages/next 取未读邮件，提取验证码（含服务端 verificationCode）。"""
+def _yyds_poll_for_code(
+    temp_token: str,
+    timeout: int = 120,
+    interval: int = 3,
+    stop_when: Callable[[], bool] | None = None,
+) -> str | None:
+    """长轮询 /v1/messages/next 取未读邮件，提取验证码（含服务端 verificationCode）。
+
+    stop_when：页面已进入下一步时返回 True，立即结束轮询避免空等。
+    """
     headers = {"Authorization": f"Bearer {temp_token}"}
     t0 = time.monotonic()
     logger.debug(f"[邮件] 开始轮询，等待验证码邮件（最多 {timeout} 秒）...")
 
     elapsed = 0
     while elapsed < timeout:
+        if stop_when is not None and stop_when():
+            logger.debug(f"[邮件] 页面已进入下一步，停止等验证码  · {elapsed_label(t0)}")
+            return None
         round_start = time.time()
         try:
             base = (config.YYDS_API_BASE or "").strip().rstrip("/")
@@ -251,16 +274,22 @@ def poll_for_code(
     token: str | None = None,
     timeout: int = 120,
     interval: int = 3,
+    stop_when: Callable[[], bool] | None = None,
 ) -> str | None:
     """按 MAIL_PROVIDER 轮询验证码。
 
     兼容两种调用（凭据均取 token，缺省回退第一参）：
     - cf：poll_for_code(jwt) 或 poll_for_code(email, jwt)（第二参为 jwt）
     - yyds：poll_for_code(temp_token) 或 poll_for_code(email, temp_token)
+    stop_when：页面已进入下一步时提前结束，避免空等上一步。
     """
     provider_name = (config.MAIL_PROVIDER or "cf").strip().lower()
     # 优先用 token（jwt / temp_token），否则 email_or_jwt 本身就是凭据
     credential = (token or email_or_jwt or "").strip()
     if provider_name == "yyds":
-        return _yyds_poll_for_code(credential, timeout=timeout, interval=interval)
-    return _cf_poll_for_code(credential, timeout=timeout, interval=interval)
+        return _yyds_poll_for_code(
+            credential, timeout=timeout, interval=interval, stop_when=stop_when
+        )
+    return _cf_poll_for_code(
+        credential, timeout=timeout, interval=interval, stop_when=stop_when
+    )
