@@ -49,11 +49,8 @@ import {
   AUTH_FILTER_OPTIONS,
   EXPIRY_FILTER_OPTIONS,
   PAGE_SIZE_OPTIONS,
-  INSPECT_VARIANT,
   STATUS_FILTER_OPTIONS,
   formatPoolExpiry,
-  inspectLabel,
-  inspectTitle,
   poolLogNow,
   type PoolLogEntry,
 } from "@/components/pool/PoolPageParts";
@@ -78,13 +75,11 @@ import {
   fetchPoolOpTaskStatus,
   reauthPoolAccounts,
   updatePoolAccountStatus,
-  fetchAutoRefreshStatus,
   fetchAuthPoolStatus,
   fetchTaskActive,
   STATUS_LABELS,
   ApiError,
   type AppConfig,
-  type AutoRefreshStatus,
   type PoolAccount,
   type PoolOpKind,
   type PoolOpTask,
@@ -96,6 +91,9 @@ import { toast } from "sonner";
 
 /** 刷新按钮旋转动效保底时长（本地请求过快时旋转至少可见） */
 const MIN_SPIN_MS = 450;
+
+/** 任务执行中的状态轮询间隔：任务期间状态变化频率低，3s 一次足够 */
+const TASK_POLL_MS = 3000;
 
 export function PoolPage() {
   const [config, setConfig] = useState<AppConfig | null>(null);
@@ -139,9 +137,6 @@ export function PoolPage() {
   const [globalTaskBusy, setGlobalTaskBusy] = useState(false);
   // 推送异步任务：running 时轮询状态，结束后清空；null 表示无任务
   const [pushTask, setPushTask] = useState<PoolPushTask | null>(null);
-  // 自动续期 daemon 状态（常驻轮询：进度条 + 增量日志；声明需在 activeTask 之前）
-  const [refreshState, setRefreshState] = useState<AutoRefreshStatus | null>(null);
-  const refreshAfterRef = useRef(0);
   const pushPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const pushAfterRef = useRef(0);
   const concurrencyRef = useRef<HTMLInputElement | null>(null);
@@ -373,7 +368,7 @@ export function PoolPage() {
           requestInFlight = false;
         }
       };
-      pushPollRef.current = setInterval(() => void tick(), 1000);
+      pushPollRef.current = setInterval(() => void tick(), TASK_POLL_MS);
       void tick();
     },
     [appendLogs, load, settleTask, stopPushPolling],
@@ -442,20 +437,6 @@ export function PoolPage() {
     if (pushTask) return pick(pushTask, "推送");
     if (poolTask?.kind === "reauth") return pick(poolTask, "重新登录");
     if (poolTask?.kind === "inspect") return pick(poolTask, "巡检探活");
-    // 自动续期后台扫描进行中时展示进度条（非手动任务，扫描结束自动隐藏）
-    if (refreshState?.running) {
-      const pct =
-        refreshState.total > 0
-          ? Math.min(100, Math.round((refreshState.done / refreshState.total) * 100))
-          : 0;
-      return {
-        name: "自动续期",
-        status: "执行中",
-        done: refreshState.done,
-        total: refreshState.total,
-        pct,
-      };
-    }
     return null;
   })();
 
@@ -498,7 +479,7 @@ export function PoolPage() {
           requestInFlight = false;
         }
       };
-      authPollRef.current = setInterval(() => void tick(), 1000);
+      authPollRef.current = setInterval(() => void tick(), TASK_POLL_MS);
       void tick();
     },
     [appendLogs, load, stopAuthPolling],
@@ -570,7 +551,7 @@ export function PoolPage() {
           requestInFlight = false;
         }
       };
-      poolPollRef.current = setInterval(() => void tick(), 1000);
+      poolPollRef.current = setInterval(() => void tick(), TASK_POLL_MS);
       void tick();
     },
     [appendLogs, appendPoolTaskLogs, load, settleTask, stopPoolPolling],
@@ -603,8 +584,6 @@ export function PoolPage() {
     load();
   }, [load]);
 
-  // 自动续期 daemon 轮询 effect（增量日志 + 进度，常驻 1s；声明见组件顶部）
-
   // 组件卸载：停止任务轮询、进度条保留定时器与尚未触发的搜索防抖回调
   useEffect(() => {
     return () => {
@@ -615,41 +594,6 @@ export function PoolPage() {
       if (keywordTimer.current) clearTimeout(keywordTimer.current);
     };
   }, [stopPoolPolling, stopPushPolling, stopAuthPolling]);
-
-  /** 自动续期轮询：常驻 1s，增量拉取扫描日志；轮询失败静默（服务重启等瞬态） */
-  useEffect(() => {
-    let stopped = false;
-    let inFlight = false;
-    const tick = async () => {
-      if (inFlight) return;
-      inFlight = true;
-      try {
-        const snap = await fetchAutoRefreshStatus(refreshAfterRef.current);
-        if (stopped) return;
-        refreshAfterRef.current = snap.last_log_id;
-        if (snap.logs.length > 0) {
-          appendLogs(
-            snap.logs.map((log) => ({
-              type: "refresh" as const,
-              level: log.level as PoolLogEntry["level"],
-              message: log.message,
-            })),
-          );
-        }
-        setRefreshState(snap);
-      } catch {
-        // 静默：不打断页面，下一轮再试
-      } finally {
-        inFlight = false;
-      }
-    };
-    void tick();
-    const timer = setInterval(tick, 1000);
-    return () => {
-      stopped = true;
-      clearInterval(timer);
-    };
-  }, [appendLogs]);
 
   /**
    * 页面刷新恢复执行中的后台任务：服务端快照免 taskId，日志按 last_log_id 续拉。
@@ -1188,7 +1132,7 @@ export function PoolPage() {
     const detail: Record<typeof kind, string> = {
       auth: "将对账号发起 SSO 认证并交换 Token，未认证账号才会被处理。",
       reauth: "将刷新账号登录态；无刷新凭据或刷新被拒时，任务内直接发起 SSO 重新认证。",
-      inspect: "将逐个推理巡检并回写降智判定与到期时间，产生真实上游请求。",
+      inspect: "将逐个 GET /billing 探活并临期续期 token，产生真实上游请求。",
       push: `将把账号同步到 ${[
         g2aConfigured ? "G2A" : null,
         cpaConfigured ? "CPA" : null,
@@ -1345,7 +1289,7 @@ export function PoolPage() {
               <Button
                 size="sm"
                 variant={logOpen ? "default" : "outline"}
-                className={cn("ops-log-trigger", (runningTask || refreshState?.running) && "is-live")}
+                className={cn("ops-log-trigger", runningTask && "is-live")}
                 onClick={() => {
                   if (logOpen) setLogOpen(false);
                   else showLogDrawer();
@@ -1358,7 +1302,7 @@ export function PoolPage() {
               >
                 <ScrollText className="size-3.5" strokeWidth={1.6} aria-hidden />
                 日志
-                {runningTask || refreshState?.running ? (
+                {runningTask ? (
                   <span className="ops-log-live-dot" aria-hidden />
                 ) : null}
               </Button>
@@ -1603,27 +1547,6 @@ export function PoolPage() {
                 <dd>
                   <Badge variant={ACCOUNT_STATUS_VARIANT[detailAccount.status] || "secondary"}>
                     {STATUS_LABELS[detailAccount.status] || "未知"}
-                  </Badge>
-                </dd>
-              </div>
-              <div>
-                <dt>巡检</dt>
-                <dd
-                  title={inspectTitle(
-                    detailAccount.dumbed,
-                    detailAccount.inspect_tps,
-                    detailAccount.inspect_thinking,
-                    detailAccount.inspected_at
-                      ? formatAccountTime(detailAccount.inspected_at)
-                      : null,
-                  )}
-                >
-                  <Badge
-                    variant={
-                      INSPECT_VARIANT[inspectLabel(detailAccount.dumbed)] || "secondary"
-                    }
-                  >
-                    {inspectLabel(detailAccount.dumbed)}
                   </Badge>
                 </dd>
               </div>

@@ -37,6 +37,14 @@ def now_iso_tz() -> str:
     return now_dt().isoformat(timespec="seconds")
 
 
+def iso_after_hours(hours: float) -> str:
+    """返回当前北京时间 + hours 小时的 ISO 字符串（与 now_iso_tz 同格式）。
+
+    同格式保证落库后可直接用字符串比较判断是否过期。
+    """
+    return (now_dt() + timedelta(hours=hours)).isoformat(timespec="seconds")
+
+
 def format_exp(ts: int | None) -> str:
     """Unix 秒时间戳 → 北京时间 YYYY-MM-DD HH:MM；无效返回「未知」。"""
     if not ts:

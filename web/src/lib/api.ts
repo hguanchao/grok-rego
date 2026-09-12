@@ -50,7 +50,6 @@ export interface RegisterJobState {
   mail_provider: string;
   success: number;
   failed: number;
-  denied: number;
   done: number;
   running: number;
   started_at: string | null;
@@ -188,14 +187,10 @@ export interface PoolAccount {
   expires_at: number | null;
   status: number;
   reason: string | null;
-  dumbed: number | null;
-  inspect_tps: number | null;
-  inspect_thinking: number | null;
   inspected_at: string | null;
   is_deleted: number;
   created_at: string;
   updated_at: string | null;
-  used: number;
 }
 
 export interface PoolQueryResult {
@@ -312,21 +307,6 @@ export async function reauthPoolAccounts(
   });
 }
 
-export interface AutoRefreshStatus {
-  running: boolean;
-  interval_min: number;
-  lead_min: number;
-  concurrency: number;
-  last_run_at: string;
-  last_result: string;
-  skip_reason: string;
-  done: number;
-  total: number;
-  progress: number;
-  logs: PoolPushLog[];
-  last_log_id: number;
-}
-
 export interface AuthPoolStatus {
   running: boolean;
   queue_size: number;
@@ -336,12 +316,6 @@ export interface AuthPoolStatus {
 
 export async function fetchAuthPoolStatus(afterLogId = 0): Promise<AuthPoolStatus> {
   return request<AuthPoolStatus>(`/api/pool/auth/status?after=${Math.max(0, afterLogId)}`);
-}
-
-export async function fetchAutoRefreshStatus(afterLogId: number): Promise<AutoRefreshStatus> {
-  return request<AutoRefreshStatus>(
-    `/api/pool/auto-refresh?after=${afterLogId}`,
-  );
 }
 
 /** 全局任务互斥状态：任一为 true 表示对应重任务正在执行（用于禁用其它任务按钮）。 */
@@ -533,7 +507,6 @@ export interface UsageRow {
   completion_tokens: number;
   cache_tokens: number;
   reasoning_tokens: number;
-  output_tps: number;
   created_at: string;
 }
 

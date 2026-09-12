@@ -15,11 +15,6 @@ export const ACCOUNT_STATUS_VARIANT: Record<number, BadgeVariant> = {
   6: "destructive",
 };
 
-export const INSPECT_VARIANT: Record<string, BadgeVariant> = {
-  正常: "success",
-  降智: "destructive",
-};
-
 export const STATUS_FILTER_OPTIONS: Array<{
   value: string;
   label: string;
@@ -81,37 +76,6 @@ export function poolExpiryTone(
 ): "expired" | "ok" | "none" {
   if (expiresAt == null) return "none"; // 无 JWT 时间戳时中性展示，不警告
   return isPoolExpired(expiresAt) ? "expired" : "ok";
-}
-
-/** 巡检降智徽章：未巡检=未知，dumbed=1=降智，否则正常 */
-export function inspectLabel(dumbed: number | null | undefined): string {
-  if (dumbed == null) return "未知";
-  return dumbed === 1 ? "降智" : "正常";
-}
-
-export function inspectTpsText(tps: number | null | undefined): string {
-  if (tps == null || !Number.isFinite(tps) || tps <= 0) return "—";
-  return tps >= 100 ? `${Math.round(tps)}/s` : `${tps.toFixed(1)}/s`;
-}
-
-export function inspectTitle(
-  dumbed: number | null | undefined,
-  inspectTps: number | null | undefined,
-  inspectThinking: number | null | undefined,
-  inspectedAt: string | null | undefined,
-): string {
-  const label = inspectLabel(dumbed);
-  const parts = [
-    label === "未知" ? "未巡检" : label,
-    inspectThinking === 1
-      ? "有思考链"
-      : inspectThinking === 0
-        ? "无思考链"
-        : null,
-    inspectTps != null && inspectTps > 0 ? inspectTpsText(inspectTps) : null,
-    inspectedAt ? `巡检于 ${inspectedAt}` : null,
-  ].filter(Boolean) as string[];
-  return parts.join(" · ") || "未巡检";
 }
 
 // ─── 号池操作日志 ───────────────────────────────────────────

@@ -51,12 +51,6 @@ export function fmtPct(n: number | null | undefined, digits = 1): string {
   return `${n.toFixed(digits)}%`;
 }
 
-/** 可见输出吞吐：token/s；0 / 缺失显示 — */
-export function fmtTps(n: number | null | undefined): string {
-  if (n == null || !Number.isFinite(n) || n <= 0) return "—";
-  return n >= 100 ? `${Math.round(n)}/s` : `${n.toFixed(1)}/s`;
-}
-
 export function shortClientUa(ua: string | null | undefined): string {
   const t = (ua || "").trim();
   if (!t) return "—";
@@ -370,7 +364,6 @@ export function RequestDetailTable({ rows }: { rows: UsageRow[] }) {
             <TableHead>流式</TableHead>
             <TableHead>推理等级</TableHead>
             <TableHead className="text-right">Token</TableHead>
-            <TableHead className="text-right">吞吐</TableHead>
             <TableHead>结果</TableHead>
             <TableHead className="usage-col-reason">原因</TableHead>
           </TableRow>
@@ -462,19 +455,6 @@ export function RequestDetailTable({ rows }: { rows: UsageRow[] }) {
                     promptTokens={row.prompt_tokens}
                   />
                 </div>
-              </TableCell>
-              <TableCell className="text-right font-mono text-[11px] tabular-nums">
-                <Tooltip>
-                  <TooltipTrigger asChild>
-                    <span>{fmtTps(row.output_tps)}</span>
-                  </TooltipTrigger>
-                  <TooltipContent side="top" className="font-mono text-[11px] tabular-nums">
-                    可见输出 {fmtTps(row.output_tps)}
-                    <span className="mt-1 block">
-                      流式按首字节后窗口，非流式按全程
-                    </span>
-                  </TooltipContent>
-                </Tooltip>
               </TableCell>
               <TableCell>
                 <Badge

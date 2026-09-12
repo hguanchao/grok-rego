@@ -74,7 +74,6 @@ const IDLE_JOB: RegisterJobState = {
   mail_provider: "",
   success: 0,
   failed: 0,
-  denied: 0,
   done: 0,
   running: 0,
   started_at: null,
@@ -741,11 +740,6 @@ export function RegisterPage() {
               <div className="metric-sub">
                 / {job.count || 0} · {successRate}
               </div>
-            </div>
-            <div className="metric">
-              <div className="metric-k">拒绝</div>
-              <div className={cn("metric-v", job.denied > 0 && "is-warn")}>{job.denied}</div>
-              <div className="metric-sub">风控拒绝</div>
             </div>
             <div className="metric">
               <div className="metric-k">失败</div>

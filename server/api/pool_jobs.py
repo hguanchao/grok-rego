@@ -1,4 +1,4 @@
-"""号池任务：探活、认证池消化、自动续期、巡检/重登。"""
+"""号池任务：探活、认证池消化、巡检/重登。"""
 
 from __future__ import annotations
 
@@ -6,14 +6,15 @@ from __future__ import annotations
 号池账号上游活体探测客户端。
 
 - HTTP 直连 curl_cffi（Chrome TLS 指纹），代理走 config.PROXY
-- 巡检走 POST /v1/responses（推理题 + 流式），取思考链与可见输出吞吐
-- 降智判定：reasoning_tokens=0 即上游未推理（降智），不再依赖 tps 猜测
+- 探活走 GET /billing 验证 token 有效性（不计费、不消耗生成额度）
+- 降智判定已移交网关被动审计（gateway/quality.py）：命中→冷却 12h→再犯长期排除
 - 网络失败自动重试一次
 """
 
 import json
 import threading
 import time
+from datetime import datetime
 from typing import Any
 
 from curl_cffi import requests
@@ -22,26 +23,54 @@ from core import config
 from core.config import UPSTREAM_BASE
 from core.logger import logger
 from core.mutex import acquire as mutex_acquire, release as mutex_release
+from core.util import (
+    ACCOUNT_WORKER_GAP_SEC,
+    ACCOUNT_WORKERS,
+    decode_jwt_exp,
+    elapsed_label,
+    now_str,
+    run_account_workers,
+)
+from db import (
+    LIMITED_HOLD_SECONDS,
+    STATUS_ACTIVE,
+    STATUS_DISABLED,
+    STATUS_LIMITED,
+    STATUS_REAUTH,
+    get_all_accounts,
+    touch_inspected,
+    update_account_status_by_ids,
+    update_account_tokens,
+)
 from gateway.grok import _identity_headers
-from gateway.usage import output_tps
+from workflow.oauth import auth_with_sso
+from workflow.oauth import refresh_token as oauth_refresh
+
+# 临期续期提前量：探活通过后 token 剩余寿命低于该值即续期
+_RENEW_LEAD_SEC = 10 * 60
 
 _PROBE_CONNECT_TIMEOUT = 20
-_PROBE_READ_TIMEOUT = 300
+_PROBE_READ_TIMEOUT = 60
 _PROBE_RETRY_DELAY = 1.0
-
-_INSPECT_MODEL = "grok-4.6"
-_INSPECT_QUESTION = (
-    "A farmer needs to get a wolf, a goat, and a cabbage across a river. "
-    "The boat holds the farmer plus at most one item. The wolf cannot be left "
-    "alone with the goat, and the goat cannot be left alone with the cabbage. "
-    "Give the shortest sequence of crossings. Think step by step before answering."
-)
 
 _thread_local = threading.local()
 
 
+def _limited_hold_expired(acc: dict[str, Any]) -> bool:
+    """限额账号是否已冻满 24h（以 updated_at 为冻结起点；空/非法视为已过期，放行探活）。"""
+    raw = str(acc.get("updated_at") or "").strip()
+    if not raw:
+        return True
+    try:
+        marked = datetime.fromisoformat(raw)
+    except ValueError:
+        return True
+    held = datetime.now(marked.tzinfo).timestamp() - marked.timestamp()
+    return held >= LIMITED_HOLD_SECONDS
+
+
 class ProbeClient:
-    """上游活体探测客户端（线程级 Session 复用，代理变更时重建）。"""
+    """上游探活客户端（线程级 Session 复用，代理变更时重建）。"""
 
     def __init__(self, *, base_url: str = "", model: str = "") -> None:
         self.base_url = str(base_url or UPSTREAM_BASE).rstrip("/")
@@ -54,215 +83,59 @@ class ProbeClient:
             _thread_local.session_pair = (proxy, session)
         return _thread_local.session_pair[1]
 
-    @staticmethod
-    def _headers(account: dict[str, Any]) -> dict[str, str]:
-        headers = _identity_headers()
-        headers["Authorization"] = f"Bearer {account.get('access_token') or ''!s}"
-        headers["Content-Type"] = "application/json"
-        headers["Accept"] = "text/event-stream"
-        return headers
-
     def probe(self, account: dict[str, Any], proxy: str = "") -> dict[str, Any]:
-        """单账号巡检：POST /responses 推理题，返回探活 + 降智判定。
+        """单账号探活：GET /billing 验证 token 有效性（不计费、不做降智判定）。
 
         返回 dict：
           status_code     200=有效 / 401·403=失效 / 402=配额 / 429=限流 / 0=网络异常
           error           失败原因摘要
-          has_thinking    响应是否含思考链（加密 blob / 摘要 / reasoning 事件）
-          output_tps      可见输出 token/s（首字节后窗口）
-          dumbed          1=降智（reasoning_tokens=0，上游未推理）
+          elapsed_ms      请求耗时（毫秒）
         """
-        result: dict[str, Any] = {
-            "status_code": 0,
-            "error": "",
-            "has_thinking": False,
-            "output_tps": 0.0,
-            "dumbed": 0,
-        }
+        result: dict[str, Any] = {"status_code": 0, "error": "", "elapsed_ms": 0}
         use_proxy = str(proxy or config.PROXY or "").strip()
         email = str(account.get("email") or "").strip()
-        log_email = email
         if not use_proxy:
             result["error"] = "探活强制走代理，未配置 proxy"
-            logger.error(f"[探活] {log_email} 未配置代理，跳过探活")
+            logger.error(f"[探活] {email} 未配置代理，跳过探活")
             return result
         session = self._session(use_proxy)
-        body = {
-            "model": _INSPECT_MODEL,
-            "input": [{"role": "user", "content": _INSPECT_QUESTION}],
-            "reasoning": {"effort": "high"},
-            "include": ["reasoning.encrypted_content"],
-            "store": False,
-            "stream": True,
-        }
-
+        headers = _identity_headers()
+        headers["Authorization"] = f"Bearer {account.get('access_token') or ''!s}"
+        headers["Accept"] = "application/json"
         t0 = time.monotonic()
         response = None
         for attempt in range(2):
             try:
-                logger.debug(f"[探活] {log_email} 请求 POST /responses · 尝试 {attempt + 1}/2")
-                response = session.post(
-                    f"{self.base_url}/responses",
-                    headers=self._headers(account),
-                    json=body,
+                logger.debug(f"[探活] {email} 请求 GET /billing · 尝试 {attempt + 1}/2")
+                response = session.get(
+                    f"{self.base_url}/billing?format=credits",
+                    headers=headers,
                     timeout=(_PROBE_CONNECT_TIMEOUT, _PROBE_READ_TIMEOUT),
-                    stream=True,
                 )
                 break
             except requests.RequestsError as exc:
                 if attempt == 0:
-                    logger.warning(f"[探活] {log_email} 请求异常（重试中）: {type(exc).__name__}: {exc}")
+                    logger.warning(f"[探活] {email} 请求异常（重试中）: {type(exc).__name__}: {exc}")
                     time.sleep(_PROBE_RETRY_DELAY)
                     continue
                 detail = str(exc)[:160]
                 if "timed out" in detail or "Timeout" in detail or "Connection" in detail:
                     detail = "网络无响应"
                 result["error"] = detail
-                logger.error(f"[探活] {log_email} 请求失败: {type(exc).__name__}: {detail}")
+                logger.error(f"[探活] {email} 请求失败: {type(exc).__name__}: {detail}")
                 return result
 
         status = int(response.status_code)
         result["status_code"] = status
-        raw = b""
-        t_first: float | None = None
-        try:
-            for chunk in response.iter_content(chunk_size=4096):
-                if not chunk:
-                    continue
-                if t_first is None:
-                    t_first = time.monotonic()
-                raw += chunk
-        finally:
-            response.close()
-        elapsed_ms = int((time.monotonic() - t0) * 1000)
-        first_ms = int((t_first - t0) * 1000) if t_first is not None else 0
-
+        result["elapsed_ms"] = int((time.monotonic() - t0) * 1000)
         if not (200 <= status < 300):
-            err = _simplify_error(status, raw.decode("utf-8", "replace"))
+            err = _simplify_error(status, response.text or "")
             result["error"] = err
-            logger.warning(f"[探活] {log_email} 探活失败 · HTTP {status} {err}")
+            logger.warning(f"[探活] {email} 探活失败 · HTTP {status} {err}")
             return result
-
-        parsed = _parse_responses_stream(raw)
-        tps = output_tps(parsed["completion_tokens"], elapsed_ms, first_ms)
-        has_thinking = parsed["has_thinking"]
-        reasoning_tokens = parsed.get("reasoning_tokens", 0)
-        # 降智判定：reasoning_tokens=0 即上游未推理（降智），不再依赖 tps 猜测
-        dumbed = int(reasoning_tokens == 0)
-        result["has_thinking"] = has_thinking
-        result["output_tps"] = tps
-        result["dumbed"] = dumbed
         result["error"] = "探活通过"
-        logger.debug(
-            f"[探活] {log_email} 探活通过 · HTTP {status} "
-            f"thinking={int(has_thinking)} reasoning={reasoning_tokens} "
-            f"tps={tps:.1f} dumbed={dumbed}"
-        )
+        logger.debug(f"[探活] {email} 探活通过 · HTTP {status} · {result['elapsed_ms']}ms")
         return result
-
-
-def _parse_responses_stream(raw: bytes) -> dict[str, Any]:
-    """从 SSE 取出思考链有无、completion token 数、reasoning_tokens。
-
-    兼容两种上游格式：
-    - Responses API (/responses)：response.output_item.done 里 item.type=reasoning
-      + encrypted_content；usage.output_tokens_details.reasoning_tokens
-    - Chat Completions (/chat/completions)：chat.completion.chunk，无 reasoning
-      item；usage.completion_tokens_details.reasoning_tokens（上游降智时为 0）
-    """
-    has_thinking = False
-    completion = 0
-    reasoning_tokens = 0
-    text = raw.decode("utf-8", "replace")
-    for block in text.split("\n\n"):
-        data_lines = [
-            line[5:].lstrip() for line in block.split("\n") if line.startswith("data:")
-        ]
-        data_raw = "\n".join(data_lines).strip()
-        if not data_raw or data_raw == "[DONE]":
-            continue
-        try:
-            obj = json.loads(data_raw)
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(obj, dict):
-            continue
-        etype = str(obj.get("type") or "")
-        # Responses API：推理摘要增量
-        if etype in (
-            "response.reasoning_text.delta",
-            "response.reasoning_summary_text.delta",
-        ):
-            delta = obj.get("delta")
-            if isinstance(delta, str) and delta.strip():
-                has_thinking = True
-        # Responses API：reasoning item（encrypted_content / summary）
-        item = obj.get("item") if etype in ("response.output_item.added", "response.output_item.done") else None
-        if isinstance(item, dict) and item.get("type") == "reasoning":
-            enc = item.get("encrypted_content")
-            if isinstance(enc, str) and enc.strip():
-                has_thinking = True
-            summary = item.get("summary")
-            if isinstance(summary, list) and any(
-                isinstance(part, dict) and str(part.get("text") or "").strip()
-                for part in summary
-            ):
-                has_thinking = True
-            elif isinstance(summary, str) and summary.strip():
-                has_thinking = True
-        # Chat Completions：delta.content 增量（用于兜底 completion 估算）
-        if etype == "" and "choices" in obj:
-            choices = obj.get("choices")
-            if isinstance(choices, list) and choices and isinstance(choices[0], dict):
-                delta = choices[0].get("delta") if isinstance(choices[0].get("delta"), dict) else {}
-                piece = delta.get("content") if isinstance(delta.get("content"), str) else ""
-                if piece:
-                    completion += max(1, (len(piece) + 3) // 4)
-        # 终止事件：统一从 usage 取 reasoning_tokens
-        payload = obj.get("response") if etype == "response.completed" else obj
-        if isinstance(payload, dict):
-            usage = payload.get("usage")
-            if isinstance(usage, dict):
-                total_out = int(
-                    usage.get("output_tokens")
-                    or usage.get("completion_tokens")
-                    or 0
-                )
-                details = (
-                    usage.get("output_tokens_details")
-                    or usage.get("completion_tokens_details")
-                )
-                rt = 0
-                if isinstance(details, dict):
-                    rt = int(details.get("reasoning_tokens") or 0)
-                reasoning_tokens = rt
-                # Responses API：可见输出 = 总输出 − 推理 token（推理计入 output_tokens）
-                # Chat Completions：completion_tokens 已是可见输出（不含推理），不扣减
-                if total_out > 0 and "choices" not in obj:
-                    completion = max(0, total_out - rt)
-                elif total_out > 0 and completion == 0:
-                    completion = max(0, total_out - rt)
-            out_items = payload.get("output")
-            if isinstance(out_items, list):
-                for out in out_items:
-                    if not isinstance(out, dict) or out.get("type") != "reasoning":
-                        continue
-                    enc = out.get("encrypted_content")
-                    if isinstance(enc, str) and enc.strip():
-                        has_thinking = True
-                    summary = out.get("summary")
-                    if isinstance(summary, list) and any(
-                        isinstance(part, dict) and str(part.get("text") or "").strip()
-                        for part in summary
-                    ):
-                        has_thinking = True
-                    elif isinstance(summary, str) and summary.strip():
-                        has_thinking = True
-    return {
-        "has_thinking": has_thinking,
-        "completion_tokens": completion,
-        "reasoning_tokens": reasoning_tokens,
-    }
 
 
 def _simplify_error(status: int, body: str) -> str:
@@ -377,295 +250,6 @@ def auth_pool_state(after_log_id: int = 0) -> dict[str, Any]:
         "last_log_id": last_log_id,
     }
 
-"""
-临期账号自动续期 daemon。
-
-借鉴 acorn 自动刷新思路（后台固定周期扫描临期账号并续期），按 grok-rego
-栈重写并定制：
-- 周期 30 分钟扫描，token 剩余 ≤10 分钟即续期（沿用参考参数）
-- 临期账号最多 4 个 worker 并发刷新，每个 worker 做完一个号再隔 1 秒接下一个
-- 失败分级：网络瞬时失败跳过本轮不判死；刷新凭据被拒标记 REAUTH
-- 与手动号池任务 / 推送任务互斥：任一进行中则跳过本轮
-- 状态只读暴露（GET /api/pool/auto-refresh），日志走统一 loguru
-"""
-
-import threading
-
-from core.util import (
-    ACCOUNT_WORKER_GAP_SEC,
-    ACCOUNT_WORKERS,
-    decode_jwt_exp,
-    elapsed_label,
-    format_exp,
-    now_str,
-    proxy_endpoint_ready,
-    run_account_workers,
-)
-from db import (
-    STATUS_ACTIVE,
-    STATUS_DISABLED,
-    STATUS_LIMITED,
-    STATUS_REAUTH,
-    get_all_accounts,
-    list_due_refresh_candidates,
-    update_account_inspect,
-    update_account_status_by_ids,
-    update_account_tokens,
-)
-from workflow.oauth import auth_with_sso
-from workflow.oauth import refresh_token as oauth_refresh
-
-# 固定参数：每 30 分钟检查一次，token 剩余 ≤10 分钟即续期
-INTERVAL_MIN = 30
-LEAD_MIN = 10
-# 续期并发限制为 4，避免代理恢复/切换时形成连接风暴。
-REFRESH_CONCURRENCY = min(4, ACCOUNT_WORKERS)
-# 轮询唤醒间隔（秒）
-_SCAN_WAKE_SEC = 30
-_PROXY_CHECK_TIMEOUT_SEC = 1.0
-# 任务日志内存环形保留条数
-_LOG_LIMIT = 200
-
-
-class AutoRefresher:
-    """后台 daemon 线程：按固定周期扫描临期账号并并发续期。"""
-
-    def __init__(self) -> None:
-        self._stop = threading.Event()
-        self._thread: threading.Thread | None = None
-        self._lock = threading.Lock()
-        self._scanning = False
-        self._last_run_at = ""
-        # 用 monotonic 做间隔节流，避免北京时间串 + mktime 受系统时区影响
-        self._last_run_mono = 0.0
-        self._last_result = ""
-        self._skip_reason = ""
-        # 日志与进度（供前端号池页展示）
-        self._logs: list[dict[str, Any]] = []
-        self._last_log_id = 0
-        self._done = 0
-        self._total = 0
-
-    def append_log(self, level: str, message: str) -> None:
-        """追加扫描日志（环形保留 _LOG_LIMIT 条，id 单调递增供增量轮询）。"""
-        with self._lock:
-            self._last_log_id += 1
-            self._logs.append({"id": self._last_log_id, "level": level, "message": message})
-            if len(self._logs) > _LOG_LIMIT:
-                self._logs = self._logs[-_LOG_LIMIT:]
-
-    # ─── 状态 / 生命周期 ─────────────────────────────────────
-
-    def state(self, after_log_id: int = 0) -> dict[str, Any]:
-        """只读状态：供 GET /api/pool/auto-refresh 展示。"""
-        with self._lock:
-            logs = [log for log in self._logs if log["id"] > after_log_id]
-            return {
-                "running": self._scanning,
-                "interval_min": INTERVAL_MIN,
-                "lead_min": LEAD_MIN,
-                "concurrency": REFRESH_CONCURRENCY,
-                "last_run_at": self._last_run_at,
-                "last_result": self._last_result,
-                "skip_reason": self._skip_reason,
-                "done": self._done,
-                "total": self._total,
-                "progress": round(self._done / self._total * 100, 2) if self._total else 0,
-                "logs": logs,
-                "last_log_id": self._last_log_id,
-            }
-
-    def start(self) -> None:
-        """启动 daemon 线程（幂等）。"""
-        if self._thread is not None:
-            return
-        self._thread = threading.Thread(
-            target=self._loop, daemon=True, name="auto-refresh"
-        )
-        self._thread.start()
-        logger.debug("自动续期后台线程已启动")
-
-    def stop(self) -> None:
-        """停止 daemon 线程（幂等）。"""
-        self._stop.set()
-        thread, self._thread = self._thread, None
-        if thread is not None:
-            thread.join(timeout=5)
-        logger.debug("自动续期后台线程已停止")
-
-    # ─── 主循环 ─────────────────────────────────────────────
-
-    def _loop(self) -> None:
-        while not self._stop.is_set():
-            try:
-                self._maybe_scan()
-            except Exception:
-                logger.exception("[续期] 扫描异常")
-            self._stop.wait(_SCAN_WAKE_SEC)
-
-    def _maybe_scan(self) -> None:
-        """间隔节流：距上次扫描不足 INTERVAL_MIN 则跳过。"""
-        with self._lock:
-            if self._scanning:
-                return
-            if (
-                self._last_run_mono > 0
-                and (time.monotonic() - self._last_run_mono) < INTERVAL_MIN * 60
-            ):
-                return
-        self._scan()
-
-    # ─── 扫描与续期 ─────────────────────────────────────────
-
-    def _task_busy(self) -> bool:
-        """任意手动重任务（推送 / 号池任务 / 认证 / 注册）进行中则本轮跳过。
-
-        自动续期是低优先级后台任务：不占用全局互斥，主动避让，
-        避免与手动任务并发刷同一批账号。
-        """
-        from core.mutex import active
-
-        return bool(active())
-
-    def _scan(self) -> None:
-        with self._lock:
-            self._scanning = True
-            self._skip_reason = ""
-        try:
-            proxy = str(config.PROXY or "").strip()
-            if proxy and not proxy_endpoint_ready(proxy, _PROXY_CHECK_TIMEOUT_SEC):
-                reason = "代理未就绪，延迟本轮续期"
-                self.append_log("WARNING", f"[续期] {reason}")
-                logger.warning(f"[续期] {reason}")
-                with self._lock:
-                    self._skip_reason = reason
-                return
-            if self._task_busy():
-                reason = "手动任务进行中，跳过本轮"
-                self.append_log("WARNING", f"[续期] {reason}")
-                with self._lock:
-                    self._skip_reason = reason
-                return
-            due = self._collect_due()
-            if not due:
-                with self._lock:
-                    self._last_run_at = now_str()
-                    self._last_run_mono = time.monotonic()
-                    self._last_result = "无临期账号"
-                self.append_log("INFO", "[续期] 本轮无临期账号")
-                return
-            t0 = time.monotonic()
-            with self._lock:
-                self._done = 0
-                self._total = len(due)
-            self.append_log(
-                "INFO",
-                f"[续期] 扫描开始 临期 {len(due)} 个 / {REFRESH_CONCURRENCY} 线程 "
-                f"每线程间隔 {ACCOUNT_WORKER_GAP_SEC:.0f}s",
-            )
-            refreshed, rejected, transient = self._refresh_all(due)
-            summary = (
-                f"[续期] 扫描结束 续期 {refreshed} 刷新被拒 {rejected} "
-                f"网络失败 {transient} · {elapsed_label(t0)}"
-            )
-            self.append_log(
-                "SUCCESS" if refreshed > 0 else "WARNING", summary
-            )
-            with self._lock:
-                self._last_run_at = now_str()
-                self._last_run_mono = time.monotonic()
-                self._last_result = (
-                    f"续期 {refreshed} 个，刷新被拒 {rejected} 个，"
-                    f"网络失败 {transient} 个"
-                )
-        finally:
-            with self._lock:
-                self._scanning = False
-
-    def _collect_due(self) -> list[dict[str, Any]]:
-        """收集临期账号：exp ≤ now + LEAD_MIN 且状态允许续期（查询收敛到 db 层）。"""
-        return list_due_refresh_candidates(
-            due_within_sec=int(LEAD_MIN * 60),
-            exclude_statuses=(STATUS_REAUTH, STATUS_DISABLED),
-        )
-
-    def _refresh_one(self, row: dict[str, Any]) -> str:
-        """单账号 OIDC 刷新。返回 refreshed / rejected / transient。"""
-        account_id = int(row["id"])
-        email = str(row["email"] or "")
-        log_email = email
-        data, http_status = oauth_refresh(str(row["refresh_token"] or ""))
-        if data and data.get("access_token"):
-            update_account_tokens(
-                account_id,
-                str(data["access_token"]),
-                str(data.get("refresh_token") or "") or None,
-                int(data.get("expires_in") or 0) or None,
-                reason="自动续期成功",
-            )
-            update_account_status_by_ids([account_id], STATUS_ACTIVE, "自动续期成功")
-            self.append_log("SUCCESS", f"{log_email}·续期成功")
-            logger.info(f"[续期] 已续期 {log_email}")
-            return "refreshed"
-        if http_status == 0:
-            self.append_log("WARNING", f"{log_email}·网络失败，下轮再试")
-            logger.warning(f"[续期] 网络失败跳过 {log_email}（瞬时，下轮再试）")
-            return "transient"
-        update_account_status_by_ids(
-            [account_id],
-            STATUS_REAUTH,
-            f"自动续期失败：刷新被拒（HTTP {http_status}）",
-        )
-        self.append_log("ERROR", f"{log_email}·刷新被拒（HTTP {http_status}），标记需重登")
-        logger.warning(f"[续期] 刷新被拒 {log_email} http={http_status}，标记需重登")
-        return "rejected"
-
-    def _refresh_all(self, due: list[dict[str, Any]]) -> tuple[int, int, int]:
-        """最多 4 个 worker 并发续期，每个 worker 做完一个号再隔 1 秒接下一个。
-
-        返回 (refreshed, rejected, transient)：
-        - 刷新成功 → 回写 token，状态恢复 ACTIVE
-        - 刷新凭据被拒（4xx）→ 标记 REAUTH，需人工重登
-        - 网络失败（http=0）→ 不动，下轮再试
-        """
-        refreshed = rejected = transient = 0
-        def on_complete(_index: int, row: dict[str, Any], kind: Any) -> None:
-            nonlocal refreshed, rejected, transient
-            email = str(row.get("email") or "")
-            log_email = email
-            if isinstance(kind, Exception):
-                self.append_log(
-                    "WARNING",
-                    f"{log_email}·续期异常 {type(kind).__name__}，下轮再试",
-                )
-                logger.warning(
-                    f"[续期] 异常跳过 {log_email}：{type(kind).__name__}: {kind}"
-                )
-                result_kind = "transient"
-            else:
-                result_kind = str(kind or "transient")
-            with self._lock:
-                if result_kind == "refreshed":
-                    refreshed += 1
-                elif result_kind == "rejected":
-                    rejected += 1
-                else:
-                    transient += 1
-                self._done += 1
-
-        run_account_workers(
-            due,
-            self._refresh_one,
-            workers=REFRESH_CONCURRENCY,
-            thread_name_prefix="续期",
-            should_stop=self._stop.is_set,
-            on_complete=on_complete,
-        )
-        return refreshed, rejected, transient
-
-
-# 进程内单例
-auto_refresher = AutoRefresher()
 
 """
 号池任务框架（进程内单例，镜像 push/manager.py 的任务惯例）。
@@ -676,10 +260,11 @@ auto_refresher = AutoRefresher()
 - 探活 / 刷新均为真实上游请求，账号间随机间隔防风控
 - 协作式取消：cancel 事件贯穿预筛 / 探活 / 刷新 / 重登降级各阶段
 
-kind=inspect  POST /responses 推理题探活：2xx 通过并回写降智判定 /
+kind=inspect  GET /billing 探活验证 token：2xx 恢复 ACTIVE，临期（≤10min）自动续期 /
               401·403 恢复链（刷新后再探，仍失效标 REAUTH）/
               402·429 限流配额 / 网络与 5xx 不改状态只记原因
-              降智：reasoning_tokens=0（上游未推理）
+              续期失败不判死（探活已通过，旧 token 仍可用，下轮重试）；
+              降智判定不在巡检：由网关被动审计（gateway/quality.py）负责
 kind=reauth   重登闭环：有 refresh_token 先 OIDC 刷新；被拒或无刷新凭据
               降级为 device flow 重新授权（入认证池），远端交换 token
 """
@@ -949,6 +534,14 @@ class PoolJobManager:
                 # 巡检排除需重登状态（探活无意义，待重登闭环处理）
                 skip_reason = "需重登"
             elif (
+                require_token
+                and int(acc.get("status") or 1) == STATUS_LIMITED
+                and not _limited_hold_expired(acc)
+            ):
+                # 限额账号 24h 冻结期内不探活：/billing 对额度耗尽仍返回 2xx，
+                # 提前捞回会让死号立刻回池再吃 429；冻满 24h 后正常探活恢复
+                skip_reason = "限额冻结中（未到 24h）"
+            elif (
                 reauth_all_only_pending
                 and int(acc.get("status") or 1) != 2
             ):
@@ -993,7 +586,7 @@ class PoolJobManager:
             return
 
         def work(acc: dict[str, Any]) -> dict[str, Any] | None:
-            """单账号探活：POST /responses 推理题，按状态码分流并回写降智。"""
+            """单账号探活：GET /billing 验证 token，按状态码分流并触发恢复链路。"""
             if job.cancel_event.is_set():
                 return None
             t0 = time.monotonic()
@@ -1003,41 +596,52 @@ class PoolJobManager:
             status = int(result.get("status_code") or 0)
             detail = str(result.get("error") or "").strip()
 
-            # 通过：恢复 ACTIVE，回写降智判定
+            # 通过：恢复 ACTIVE，刷新探活时间，并对临期 token 续期
+            # （降智判定已移交网关被动审计，续期已从自动续期 daemon 并入巡检）
             if _HTTP_OK_MIN <= status <= _HTTP_OK_MAX:
                 update_account_status_by_ids([aid], STATUS_ACTIVE, "")
-                tps = float(result.get("output_tps") or 0)
-                thinking = 1 if result.get("has_thinking") else 0
-                dumbed = int(result.get("dumbed") or 0)
-                update_account_inspect(
-                    aid, dumbed=dumbed, inspect_tps=tps, inspect_thinking=thinking
-                )
-                exp_str = format_exp(decode_jwt_exp(str(acc.get("access_token") or "")))
-                dumb_tag = "降智" if dumbed else "正常"
-                think_tag = "有思考链" if thinking else "无思考链"
-                msg = (
-                    f"{status} 探活通过 · {think_tag} · {tps:.1f} token/s · "
-                    f"{dumb_tag} · 到期 {exp_str}"
-                )
-                return {"aid": aid, "ok": True, "message": msg, "cost": elapsed_label(t0)}
+                touch_inspected(aid)
+                # 临期续期：剩余寿命 ≤ _RENEW_LEAD_SEC 且有刷新凭据时续期；
+                # 续期失败不判死（探活已通过，旧 token 仍可用），下轮巡检重试
+                renew_note = ""
+                refresh_token = str(acc.get("refresh_token") or "").strip()
+                exp = decode_jwt_exp(str(acc.get("access_token") or ""))
+                if refresh_token and exp is not None and exp - time.time() <= _RENEW_LEAD_SEC:
+                    data, http_status = oauth_refresh(refresh_token)
+                    if data and data.get("access_token"):
+                        update_account_tokens(
+                            aid,
+                            str(data["access_token"]),
+                            str(data.get("refresh_token") or "") or None,
+                            int(data.get("expires_in") or 0) or None,
+                            reason="巡检临期续期",
+                        )
+                        renew_note = " · 已续期"
+                        logger.info(f"[巡检] {_who(acc)} 临期续期成功")
+                    else:
+                        renew_note = f" · 续期失败({http_status or '网络'})"
+                        logger.warning(
+                            f"[巡检] {_who(acc)} 临期续期失败 http={http_status}"
+                            f"（token 仍可用，下轮重试）"
+                        )
+                return {
+                    "aid": aid,
+                    "ok": True,
+                    "message": f"探活通过{renew_note}",
+                    "cost": elapsed_label(t0),
+                }
 
             # 凭证失效（401/403）：刷新后再探
             if status in _HTTP_TOKEN_INVALID:
                 refreshed = self._refresh_and_reprobe(job, acc)
                 if refreshed:
-                    new_token, result = refreshed
                     update_account_status_by_ids([aid], STATUS_ACTIVE, "")
-                    exp_str = format_exp(decode_jwt_exp(new_token))
-                    tps = float(result.get("output_tps") or 0)
-                    thinking = 1 if result.get("has_thinking") else 0
-                    dumbed = int(result.get("dumbed") or 0)
-                    dumb_tag = "降智" if dumbed else "正常"
-                    think_tag = "有思考链" if thinking else "无思考链"
-                    msg = (
-                        f"{status} 刷新后探活通过 · {think_tag} · {tps:.1f} token/s · "
-                        f"{dumb_tag} · 到期 {exp_str}"
-                    )
-                    return {"aid": aid, "ok": True, "message": msg, "cost": elapsed_label(t0)}
+                    return {
+                        "aid": aid,
+                        "ok": True,
+                        "message": f"{status} 刷新后探活通过",
+                        "cost": elapsed_label(t0),
+                    }
                 update_account_status_by_ids(
                     [aid], STATUS_REAUTH, "探活失败，token 失效，需重新登录"
                 )
@@ -1094,15 +698,10 @@ class PoolJobManager:
         result = self._probe_client.probe(fresh, proxy=str(config.PROXY or "").strip())
         reprobe_status = int(result.get("status_code") or 0)
         if _HTTP_OK_MIN <= reprobe_status <= _HTTP_OK_MAX:
-            tps = float(result.get("output_tps") or 0)
-            thinking = 1 if result.get("has_thinking") else 0
-            dumbed = int(result.get("dumbed") or 0)
-            update_account_inspect(
-                aid, dumbed=dumbed, inspect_tps=tps, inspect_thinking=thinking
-            )
+            touch_inspected(aid)
             logger.success(
-                f"[巡检] {_who(acc)} 二次探活通过 · HTTP {reprobe_status} "
-                f"thinking={thinking} tps={tps:.1f} dumbed={dumbed}"
+                f"[巡检] {_who(acc)} 二次探活通过 · HTTP {reprobe_status} · "
+                f"{int(result.get('elapsed_ms') or 0)}ms"
             )
             return new_token, result
         logger.warning(f"[巡检] {_who(acc)} 二次探活失败 · HTTP {reprobe_status or 'N/A'}")

@@ -43,7 +43,7 @@ from gateway.anthropic import (
     uses_chat_completions,
     uses_responses,
 )
-from gateway.usage import StreamUsageAccumulator, extract_nonstream, output_tps
+from gateway.usage import StreamUsageAccumulator, extract_nonstream
 
 # 上游固定参数（产品约定，不走配置）
 ZEN_BASE = "https://opencode.ai/zen/v1"
@@ -118,7 +118,6 @@ def _record(
     effort: str | None = None,
     ip: str | None = None,
     client_ua: str | None = None,
-    first_ms: int = 0,
 ) -> None:
     """写入环形日志、累加计数，并落库一条用量记录。"""
     usage = usage or {"prompt_tokens": 0, "completion_tokens": 0, "cache_tokens": 0, "reasoning_tokens": 0}
@@ -168,11 +167,6 @@ def _record(
             completion_tokens=usage.get("completion_tokens", 0),
             cache_tokens=usage.get("cache_tokens", 0),
             reasoning_tokens=usage.get("reasoning_tokens", 0),
-            output_tps=output_tps(
-                usage.get("completion_tokens", 0),
-                ms,
-                first_ms if stream else 0,
-            ),
         )
     except Exception:
         # 落库失败绝不阻塞网关转发
@@ -659,7 +653,6 @@ def proxy(handler: BaseHTTPRequestHandler, method: str, path: str) -> None:
     url = _upstream_url(forward_path, query)
     headers = _forward_headers(handler.headers)
     t0 = time.monotonic()
-    t_first: float | None = None
     bytes_out = 0
     status = 502
     err: str | None = None
@@ -697,7 +690,6 @@ def proxy(handler: BaseHTTPRequestHandler, method: str, path: str) -> None:
                     for chunk in raw_chunks:
                         if chunk:
                             first_raw_chunk = chunk
-                            t_first = time.monotonic()
                             break
                 break
             except requests.RequestsError as exc:
@@ -837,7 +829,6 @@ def proxy(handler: BaseHTTPRequestHandler, method: str, path: str) -> None:
             except Exception:
                 pass
         ms = int((time.monotonic() - t0) * 1000)
-        first_ms = int((t_first - t0) * 1000) if t_first is not None else 0
         _record(
             method=method,
             path=path,
@@ -852,7 +843,6 @@ def proxy(handler: BaseHTTPRequestHandler, method: str, path: str) -> None:
             effort=effort_flag,
             ip=egress.current_ip(),
             client_ua=client_ua,
-            first_ms=first_ms,
         )
         if err != "client_disconnected":
             logger.info(

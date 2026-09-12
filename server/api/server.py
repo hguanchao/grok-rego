@@ -14,7 +14,6 @@ from urllib.parse import parse_qs, urlparse
 
 from api.pool_jobs import (
     auth_pool_state,
-    auto_refresher,
     kick_auth_pool,
     pool_job_manager,
 )
@@ -23,6 +22,7 @@ from core import config
 from core.config import API_HOST, API_PORT
 from core.logger import logger
 from db import (
+    clear_quality_flags,
     get_all_accounts,
     get_pool_stats,
     init_db,
@@ -322,6 +322,10 @@ def _handle_pool_operations_api(
             return True
         reason = body.get("reason") if isinstance(body.get("reason"), str) else None
         updated = update_account_status_by_ids([int(i) for i in ids], int(status), reason)
+        # 启用（恢复 ACTIVE）= 再给一次机会：同步复位网关质量审计标记
+        if int(status) == 1:
+            cleared = clear_quality_flags([int(i) for i in ids])
+            logger.info(f"[号池] 启用账号 {ids} 并复位质量标记 {cleared} 个")
         _send_json(handler, 200, {"ok": True, "data": {"updated": updated}})
         return True
     return False
@@ -427,10 +431,6 @@ def _handle_pool_maintenance_api(
         _send_json(
             handler, 200, {"ok": True, "data": auth_pool_state(after_log_id=after)}
         )
-        return True
-    if method == "GET" and path == "/api/pool/auto-refresh":
-        after = _after_log_id(query)
-        _send_json(handler, 200, {"ok": True, "data": auto_refresher.state(after_log_id=after)})
         return True
     return False
 
@@ -603,7 +603,6 @@ def serve(host: str | None = None, port: int | None = None) -> None:
     bind_port = port or API_PORT
     server = ThreadingHTTPServer((bind_host, bind_port), _ApiHandler)
     server.daemon_threads = True
-    auto_refresher.start()
     logger.success(f"[API] 服务启动: http://{bind_host}:{bind_port}")
     logger.info(
         "[API] 路由: /api/* （注册 / 号池 / 网关运维）  /zen/v1/* （Zen）  /grok/v1/* （号池 Grok）"

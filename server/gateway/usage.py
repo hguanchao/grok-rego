@@ -33,23 +33,6 @@ def _to_int(value: Any) -> int:
         return 0
 
 
-def output_tps(completion_tokens: int, elapsed_ms: int, first_ms: int = 0) -> float:
-    """可见输出 token/s（completion_tokens / 生成窗口）。
-
-    流式：窗口 = 首字节之后到结束（排除静默推理等待）；
-    非流式：窗口 = 全程。无法计算时返回 0。
-    """
-    tokens = _to_int(completion_tokens)
-    elapsed = _to_int(elapsed_ms)
-    first = _to_int(first_ms)
-    if tokens <= 0 or elapsed <= 0:
-        return 0.0
-    window = elapsed - first if first > 0 else elapsed
-    if window <= 0:
-        window = elapsed
-    return round(tokens * 1000.0 / window, 2)
-
-
 def _openai_usage(usage: Any) -> dict[str, int]:
     """OpenAI 风格 usage 字典 → (prompt, completion, cache, reasoning)。"""
     if not isinstance(usage, dict):

@@ -53,7 +53,6 @@ class RegisterJob:
     mail_provider: str = "cf"
     success: int = 0
     failed: int = 0
-    denied: int = 0  # 风控 bfs in (1,2)
     done: int = 0
     started_at: str | None = None
     finished_at: str | None = None
@@ -96,7 +95,6 @@ class RegisterJob:
                 "mail_provider": self.mail_provider,
                 "success": self.success,
                 "failed": self.failed,
-                "denied": self.denied,
                 "done": self.done,
                 "running": running,
                 "started_at": self.started_at,
@@ -133,7 +131,6 @@ class JobManager:
                 "mail_provider": "",
                 "success": 0,
                 "failed": 0,
-                "denied": 0,
                 "done": 0,
                 "running": 0,
                 "started_at": None,
@@ -257,13 +254,11 @@ class JobManager:
             f"[任务] 启动 {job.count} 账号 / {job.threads} 线程",
         )
 
-        def on_result(ok: bool, email: str | None, risk_bfs: int | None) -> None:
+        def on_result(ok: bool, email: str | None) -> None:
             with job._lock:
                 job.done += 1
                 if ok:
                     job.success += 1
-                    if risk_bfs in (1, 2):
-                        job.denied += 1
                 else:
                     job.failed += 1
 
@@ -294,7 +289,7 @@ class JobManager:
                 end_level = "ERROR"
             job.append_log(
                 end_level,
-                f"[任务] 结束 成功 {job.success} 失败 {job.failed} 拒绝 {job.denied}",
+                f"[任务] 结束 成功 {job.success} 失败 {job.failed}",
             )
         except Exception as e:
             with job._lock:

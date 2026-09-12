@@ -32,26 +32,39 @@ from datetime import date, timedelta
 from typing import Any
 
 from core.logger import logger
-from core.util import decode_jwt_exp, now_dt, now_iso_tz
+from core.util import decode_jwt_exp, iso_after_hours, now_dt, now_iso_tz
 
 # 兼容已有数据库：表已存在但缺少新字段时补加
 _ACCOUNT_MIGRATIONS = [
     ("access_token", "TEXT"),
     ("refresh_token", "TEXT"),
     ("expires_in", "INTEGER"),
-    ("bfs", "INTEGER"),
-    ("risk", "TEXT"),
-    ("checked_at", "TEXT"),
     ("status", "INTEGER DEFAULT 1"),
     ("reason", "TEXT"),
     ("is_deleted", "INTEGER DEFAULT 0"),
     ("updated_at", "TEXT"),
-    ("used", "INTEGER DEFAULT 500000"),
-    ("dumbed", "INTEGER"),
-    ("inspect_tps", "REAL"),
-    ("inspect_thinking", "INTEGER"),
     ("inspected_at", "TEXT"),
+    # 网关被动质量审计（对齐 grok2api missing_thinking 闭环）
+    ("quality_strikes", "INTEGER DEFAULT 0"),
+    ("quality_cooldown_until", "TEXT"),
+    ("quality_disabled", "INTEGER DEFAULT 0"),
 ]
+
+# 历史死字段清理：旧库存在即 DROP（降智展示由质量审计实时推导；
+# 注册风控检测已下线，bfs/risk/checked_at 与额度遗留列 used 均无业务）
+_ACCOUNT_DROPPED_COLUMNS = (
+    "dumbed",
+    "inspect_tps",
+    "inspect_thinking",
+    "bfs",
+    "risk",
+    "checked_at",
+    "used",
+    "quota_limit",
+    "quota_used",
+    "quota_percent",
+    "quota_synced_at",
+)
 
 # 账号状态码（整数，对齐前端 PoolPage 筛选）
 # 1  active             — 正常可用（含待 Token 交换）
@@ -66,6 +79,10 @@ STATUS_LIMITED = 3
 STATUS_PERMISSION_DENIED = 4
 STATUS_ABNORMAL = 5
 STATUS_DISABLED = 6
+
+# 限额（额度耗尽）账号的最短冻结时长：上游额度按日重置（24h），
+# 期间巡检不得凭 /billing 2xx 提前捞回（该接口对额度耗尽仍返回 2xx）
+LIMITED_HOLD_SECONDS = 24 * 3600
 
 
 def init_accounts_table() -> None:
@@ -99,14 +116,13 @@ def init_accounts_table() -> None:
         cursor.execute("UPDATE accounts SET is_deleted = 0 WHERE is_deleted IS NULL")
         # 兼容旧库：updated_at 补列后回填为创建时间（历史数据无更新时间）
         cursor.execute("UPDATE accounts SET updated_at = created_at WHERE updated_at IS NULL")
-        cursor.execute("UPDATE accounts SET used = 500000 WHERE used IS NULL")
-        # 兼容旧库：如果存在旧的 quota_* 列，把 quota_limit - quota_used 迁移到 used
-        existing = {row[1] for row in cursor.execute("PRAGMA table_info(accounts)").fetchall()}
-        if "quota_limit" in existing and "quota_used" in existing:
-            cursor.execute(
-                "UPDATE accounts SET used = MAX(0, COALESCE(quota_limit, 500000) - COALESCE(quota_used, 0)) "
-                "WHERE used = 500000 OR used IS NULL"
-            )
+        # 历史死字段清理（dumbed 展示值由质量审计字段实时推导，无需存量列）
+        for column in _ACCOUNT_DROPPED_COLUMNS:
+            if column in existing_cols:
+                try:
+                    cursor.execute(f"ALTER TABLE accounts DROP COLUMN {column}")
+                except sqlite3.OperationalError as exc:
+                    logger.warning(f"[数据库] 清理历史列 {column} 失败（忽略，不影响运行）: {exc}")
         # 兼容旧库：过往 created_at/updated_at 曾以裸北京时间串（无时区标记）写入，
         # 统一迁移为 ISO 带时区格式（YYYY-MM-DDTHH:MM:SS+08:00），保证含时区信息。
         # 分列独立判断，避免 created_at 已迁移而 updated_at 仍是裸串时漏迁；
@@ -132,8 +148,16 @@ def init_accounts_table() -> None:
 
 
 def _row_to_account(row: sqlite3.Row) -> dict[str, Any]:
-    """将查询行转为 dict。sso_cookie 为字符串（sso 会话凭证原值）。"""
-    return dict(row)
+    """将查询行转为 dict。sso_cookie 为字符串（sso 会话凭证原值）。
+
+    dumbed 为实时推导的展示值：质量冷却中或被长期排除 = 降智，其余 = 正常
+    （判定归属在网关被动审计，accounts 表不存该列）。
+    """
+    acc = dict(row)
+    cooldown_until = str(acc.get("quality_cooldown_until") or "")
+    in_cooldown = bool(cooldown_until) and cooldown_until > now_iso_tz()
+    acc["dumbed"] = 1 if (int(acc.get("quality_disabled") or 0) or in_cooldown) else 0
+    return acc
 
 
 def save_account(
@@ -201,11 +225,12 @@ def get_account_by_email(email: str) -> dict[str, Any] | None:
 
 
 def list_gateway_candidates() -> list[dict[str, Any]]:
-    """网关自动选号候选：ACTIVE、已认证、未降智的未删除账号（按 id 升序）。
+    """网关自动选号候选：ACTIVE、已认证、未处于质量冷却/长期排除的未删除账号（按 id 升序）。
 
-    dumbed=1 由推理巡检写入，转发会拿到无思考链的降智号，这里直接排除。
-    dumbed 为空（尚未巡检）仍可入选。只返回 id / email / access_token。
+    质量状态由网关被动审计写入：命中 missing_thinking 冷却 12h，冷却结束后
+    再犯长期排除（quality_disabled=1）。只返回 id / email / access_token。
     """
+    now = now_iso_tz()
     with connect() as conn:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
@@ -213,39 +238,91 @@ def list_gateway_candidates() -> list[dict[str, Any]]:
             "WHERE COALESCE(is_deleted, 0) = 0 "
             "AND COALESCE(status, 1) = ? "
             "AND COALESCE(access_token, '') != '' "
-            "AND COALESCE(dumbed, 0) = 0 "
+            "AND COALESCE(quality_disabled, 0) = 0 "
+            "AND COALESCE(quality_cooldown_until, '') <= ? "
             "ORDER BY id",
-            (STATUS_ACTIVE,),
+            (STATUS_ACTIVE, now),
         ).fetchall()
     return [dict(row) for row in rows]
 
 
-def list_due_refresh_candidates(
-    due_within_sec: int, exclude_statuses: tuple[int, ...]
-) -> list[dict[str, Any]]:
-    """收集临期需续期账号：token exp ≤ now + due_within_sec，且状态不在排除集。
+def mark_quality_hit(account_id: int, *, cooldown_hours: float = 12) -> str:
+    """网关被动审计命中降智（missing_thinking）：命中升级制。
 
-    为 AutoRefresher 服务；仅关注拥有 access_token + refresh_token 的账号，
-    JWT exp 解析失败的视为临期（交由刷新链路判断）。
+    agent 流量的工具调用轮次上游可能不计费推理，单轮命中不可靠——
+    第 1 次仅记 strike 观察；12h 内再次命中才冷却（cooldown_hours）；
+    冷却结束后第 3 次命中长期排除。
+
+    返回动作：observed（首次，仅记录不惩罚）/ cooled（冷却 12h）/
+    disabled（第 3 次，长期排除）/ unchanged（冷却中或已排除）。
     """
-    status_placeholders = ",".join("?" * len(exclude_statuses))
     with connect() as conn:
-        conn.row_factory = sqlite3.Row
-        rows = conn.execute(
-            "SELECT id, email, access_token, refresh_token FROM accounts "
-            "WHERE COALESCE(is_deleted, 0) = 0 AND access_token IS NOT NULL AND access_token != '' "
-            "AND refresh_token IS NOT NULL AND refresh_token != '' "
-            f"AND status NOT IN ({status_placeholders}) "
-            "ORDER BY created_at DESC",
-            tuple(exclude_statuses),
-        ).fetchall()
-    cutoff = time.time() + due_within_sec
-    due = []
-    for row in rows:
-        exp = decode_jwt_exp(str(row["access_token"] or ""))
-        if exp is None or exp <= cutoff:
-            due.append(dict(row))
-    return due
+        cursor = conn.cursor()
+        row = cursor.execute(
+            "SELECT COALESCE(quality_strikes, 0), COALESCE(quality_disabled, 0), "
+            "COALESCE(quality_cooldown_until, '') FROM accounts WHERE id=?",
+            (int(account_id),),
+        ).fetchone()
+        if row is None:
+            return "unchanged"
+        strikes, disabled, cooldown_until = int(row[0]), int(row[1]), str(row[2] or "")
+        now = now_iso_tz()
+        if disabled or cooldown_until > now:
+            return "unchanged"
+        strikes += 1
+        if strikes >= 3:
+            cursor.execute(
+                "UPDATE accounts SET quality_disabled=1, quality_cooldown_until='', "
+                "quality_strikes=?, updated_at=? "
+                "WHERE id=? AND COALESCE(is_deleted, 0) = 0",
+                (strikes, now, int(account_id)),
+            )
+            conn.commit()
+            logger.warning(
+                f"[数据库] 网关质量判定第 {strikes} 次命中 id={account_id} 长期排除"
+                f"（可通过手动启用或重置恢复）"
+            )
+            return "disabled"
+        if strikes >= 2:
+            cursor.execute(
+                "UPDATE accounts SET quality_strikes=?, quality_cooldown_until=?, "
+                "updated_at=? WHERE id=? AND COALESCE(is_deleted, 0) = 0",
+                (strikes, iso_after_hours(cooldown_hours), now, int(account_id)),
+            )
+            conn.commit()
+            logger.warning(
+                f"[数据库] 网关质量判定第 {strikes} 次命中 id={account_id} "
+                f"冷却 {cooldown_hours:g}h（冷却结束自动恢复选号资格）"
+            )
+            return "cooled"
+        cursor.execute(
+            "UPDATE accounts SET quality_strikes=?, updated_at=? "
+            "WHERE id=? AND COALESCE(is_deleted, 0) = 0",
+            (strikes, now, int(account_id)),
+        )
+        conn.commit()
+        logger.warning(
+            f"[数据库] 网关质量判定首次命中 id={account_id}（仅记录观察，"
+            f"再次命中才冷却）"
+        )
+        return "observed"
+
+
+def clear_quality_flags(account_ids: list[int]) -> int:
+    """复位网关质量审计标记（手动启用账号 / 恢复探针通过时调用）。"""
+    if not account_ids:
+        return 0
+    placeholders = ",".join("?" * len(account_ids))
+    with connect() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            f"UPDATE accounts SET quality_strikes=0, quality_cooldown_until='', "
+            f"quality_disabled=0, updated_at=? "
+            f"WHERE id IN ({placeholders}) AND COALESCE(is_deleted, 0) = 0",
+            [now_iso_tz(), *account_ids],
+        )
+        conn.commit()
+        return cursor.rowcount
 
 
 def get_account_by_id(account_id: int) -> dict[str, Any] | None:
@@ -259,55 +336,17 @@ def get_account_by_id(account_id: int) -> dict[str, Any] | None:
     return _row_to_account(row) if row else None
 
 
-def update_account_inspect(
-    account_id: int,
-    *,
-    dumbed: int,
-    inspect_tps: float,
-    inspect_thinking: int,
-) -> bool:
-    """回写巡检降智判定（dumbed / 吞吐 / 是否有思考链）。"""
+def touch_inspected(account_id: int) -> bool:
+    """刷新探活时间。降智判定已迁移至网关被动审计，巡检不再回写判定字段。"""
     with connect() as conn:
         cursor = conn.cursor()
         cursor.execute(
-            "UPDATE accounts SET dumbed=?, inspect_tps=?, inspect_thinking=?, "
-            "inspected_at=?, updated_at=? WHERE id=? AND COALESCE(is_deleted, 0) = 0",
-            (
-                int(dumbed),
-                float(inspect_tps),
-                int(inspect_thinking),
-                now_iso_tz(),
-                now_iso_tz(),
-                int(account_id),
-            ),
+            "UPDATE accounts SET inspected_at=?, updated_at=? "
+            "WHERE id=? AND COALESCE(is_deleted, 0) = 0",
+            (now_iso_tz(), now_iso_tz(), int(account_id)),
         )
         conn.commit()
-        ok = cursor.rowcount > 0
-    if ok:
-        logger.info(
-            f"[数据库] 巡检结果 id={account_id} dumbed={dumbed} "
-            f"tps={inspect_tps:.1f} thinking={inspect_thinking}"
-        )
-    return ok
-
-
-def update_risk(
-    email: str, bfs: int | None = None, risk: str | None = None, checked_at: str | None = None
-) -> bool:
-    """更新账号注册风控体检结果（bfs / risk / checked_at）。"""
-    with connect() as conn:
-        cursor = conn.cursor()
-        cursor.execute(
-            "UPDATE accounts SET bfs=?, risk=?, checked_at=?, updated_at=? WHERE email=?",
-            (bfs, risk, checked_at, now_iso_tz(), email),
-        )
-        conn.commit()
-        is_updated = cursor.rowcount > 0
-    if is_updated:
-        logger.success(f"[数据库] 已更新风控结果 (email: {email}, bfs: {bfs})")
-    else:
-        logger.warning(f"[数据库] 未找到账号，风控结果未更新: {email}")
-    return is_updated
+        return cursor.rowcount > 0
 
 
 def update_account_status(
@@ -443,8 +482,8 @@ _POOL_COLUMNS = (
     "id, email, password, first_name, last_name, "
     "access_token IS NOT NULL AND access_token != '' AS has_token, "
     "refresh_token IS NOT NULL AND refresh_token != '' AS has_refresh, "
-    "expires_in, status, reason, dumbed, inspect_tps, inspect_thinking, inspected_at, "
-    "is_deleted, created_at, updated_at, used"
+    "expires_in, status, reason, inspected_at, "
+    "is_deleted, created_at, updated_at"
 )
 
 
@@ -692,7 +731,6 @@ _USAGES_COLUMNS = (
     "completion_tokens",
     "cache_tokens",
     "reasoning_tokens",
-    "output_tps",
     "created_at",
 )
 _USAGES_TOKEN_COLUMNS = (
@@ -718,7 +756,6 @@ _USAGES_TYPES = {
     "completion_tokens": "INTEGER",
     "cache_tokens": "INTEGER",
     "reasoning_tokens": "INTEGER",
-    "output_tps": "REAL",
     "created_at": "TEXT",
 }
 
@@ -739,7 +776,6 @@ _USAGES_SCHEMA = """
         completion_tokens INTEGER NOT NULL DEFAULT 0,
         cache_tokens INTEGER NOT NULL DEFAULT 0,
         reasoning_tokens INTEGER NOT NULL DEFAULT 0,
-        output_tps REAL NOT NULL DEFAULT 0,
         created_at TEXT NOT NULL
     )
 """
@@ -753,7 +789,7 @@ def _usages_select_expr(name: str, old_types: dict[str, str]) -> str:
             "replace(datetime(created_at / 1000, 'unixepoch', '+8 hours'), ' ', 'T')"
             " || '+08:00'"
         )
-    if name in _USAGES_TOKEN_COLUMNS or name == "output_tps":
+    if name in _USAGES_TOKEN_COLUMNS:
         return f"COALESCE({name}, 0)"
     return name
 
@@ -821,13 +857,11 @@ def insert_usage(
     completion_tokens: int = 0,
     cache_tokens: int = 0,
     reasoning_tokens: int = 0,
-    output_tps: float = 0,
 ) -> None:
     """写入一条网关用量记录（每次请求一行，幂等可重复调用）。
 
     落库供前端用量统计（/api/usage）聚合展示；status=1 记成功，其余记失败。
     token 各列均为尽力而为：无法从上游解析时记 0，绝不阻塞转发。
-    output_tps 为可见输出 token/s（流式按首字节后窗口，非流式按全程）。
     """
     init_usages_table()
     with connect() as conn:
@@ -837,15 +871,14 @@ def insert_usage(
                 ip, client_ua, endpoint, model, effort, stream,
                 account_id, account_email, status, reason,
                 prompt_tokens, completion_tokens, cache_tokens, reasoning_tokens,
-                output_tps, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 ip, client_ua, endpoint, model, effort,
                 1 if stream else 0,
                 account_id, account_email, status, reason,
                 prompt_tokens, completion_tokens, cache_tokens, reasoning_tokens,
-                float(output_tps or 0),
                 now_iso_tz(),
             ),
         )

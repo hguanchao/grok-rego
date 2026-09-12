@@ -30,13 +30,37 @@ from core.util import (
     now_iso_tz,
     proxy_endpoint_ready,
 )
-from db import get_account_by_id, insert_usage, list_gateway_candidates
+from db import (
+    STATUS_LIMITED,
+    STATUS_REAUTH,
+    get_account_by_id,
+    insert_usage,
+    list_gateway_candidates,
+    mark_quality_hit,
+    update_account_status_by_ids,
+)
 from gateway import egress
 from gateway.paths import ensure_local_v1, resource_path, upstream_url
-from gateway.usage import StreamUsageAccumulator, extract_nonstream, output_tps
+from gateway.quality import (
+    DEGRADED,
+    HOLD_DELIVER,
+    HOLD_WITHHOLD,
+    QualityScanner,
+    classify_nonstream,
+)
+from gateway.usage import StreamUsageAccumulator, extract_nonstream
 
 GROK_BASE = UPSTREAM_BASE.rstrip("/")
 _DEFAULT_CLIENT_VERSION = "1.0.16"
+
+# 显式关闭推理的请求不参与质量审计（无思考是请求方的选择，不是账号降智）
+_QUALITY_SKIP_EFFORTS = {"none", "disabled"}
+# 扣流缓冲上限：超过即放弃重试直接放行（无法完整扣留的超大响应）
+_HOLD_MAX_BUFFER = 8 * 1024 * 1024
+# 会话级熔断：同一请求连续 withhold 达到该次数，说明降智与账号无关
+# （多为会话上下文过大触发的上游保护，即「128k status-loop drool」），
+# 继续换号只会把整个号池打进冷却——提前返回明确错误，让用户压缩会话
+_HOLD_MAX_CONSECUTIVE_WITHHOLDS = 6
 
 
 def _client_version() -> str:
@@ -84,15 +108,24 @@ _rr_index = 0  # 自动选号轮询游标（跨请求共享，均匀分摊流量
 # 上游按状态码判定坏号后临时冻结，避免轮询反复命中坏号；到期自动解冻。
 _AUTH_COOLDOWN_SECONDS = 600     # token 无效 / 权限被拒
 _CHANNEL_COOLDOWN_SECONDS = 120  # 通道失效 / 风控拦截
-_RATE_COOLDOWN_SECONDS = 120     # 限流 / 配额（429 冷却 2 分钟，避免粘性会话立刻再打同一号）
+_RATE_COOLDOWN_SECONDS = 120     # 限流（首次 429：瞬时突发解冻即恢复，避免粘性会话立刻再打同一号）
+_QUOTA_RECHECK_COOLDOWN_SECONDS = 600  # 连续第 2 次 429：复测窗口
+_QUOTA_RESET_SECONDS = 24 * 3600       # 额度耗尽：上游额度按日重置，冻满 24h 再回池
+_QUOTA_STREAK_WINDOW_SECONDS = 1800    # 距上次失败超过该窗口则重新从第 1 次计起
 _COOLDOWN_BY_STATUS = {
     401: _AUTH_COOLDOWN_SECONDS,
     403: _AUTH_COOLDOWN_SECONDS,
-    402: _RATE_COOLDOWN_SECONDS,
+    402: _QUOTA_RESET_SECONDS,
     404: _CHANNEL_COOLDOWN_SECONDS,
     429: _RATE_COOLDOWN_SECONDS,
 }
+# 扣流路径的账号级失败（限流/额度/凭据/上游错误）会换号重试（有上限，
+# 防止系统性 429 打光号池）；400/404 等请求级错误不重试
+_RETRYABLE_UPSTREAM_STATUS = {401, 402, 403, 408, 429, 500, 502, 503, 504}
+_MAX_UPSTREAM_FAIL_RETRIES = 6
 _cooldowns: dict[int, float] = {}  # account_id → 冷却解冻的 monotonic 时间
+_quota_streaks: dict[int, tuple[int, float]] = {}  # account_id → (连续 429 次数, 上次时刻)
+_auth_streaks: dict[int, tuple[int, float]] = {}  # account_id → (连续 401/403 次数, 上次时刻)
 
 # ── 粘性会话（对齐 CLIProxyAPI SessionAffinity）─────────────────
 # 会话标识 → (账号 id, 绑定时刻)。TTL 内同一会话固定同一账号，绑定失效自动故障切换。
@@ -138,7 +171,6 @@ def _record(
     usage: dict[str, int] | None = None,
     ip: str | None = None,
     client_ua: str | None = None,
-    first_ms: int = 0,
 ) -> None:
     """写入环形日志、累加计数，并落库一条用量记录（含号池账号归属）。"""
     usage = usage or {"prompt_tokens": 0, "completion_tokens": 0, "cache_tokens": 0, "reasoning_tokens": 0}
@@ -193,11 +225,6 @@ def _record(
             completion_tokens=usage.get("completion_tokens", 0),
             cache_tokens=usage.get("cache_tokens", 0),
             reasoning_tokens=usage.get("reasoning_tokens", 0),
-            output_tps=output_tps(
-                usage.get("completion_tokens", 0),
-                ms,
-                first_ms if stream else 0,
-            ),
         )
     except Exception:
         # 落库失败绝不阻塞网关转发
@@ -520,12 +547,16 @@ def _read_body(handler: BaseHTTPRequestHandler) -> bytes:
     return handler.rfile.read(length)
 
 
-def _pick_account(session_key: str = "") -> tuple[dict[str, Any] | None, str]:
+def _pick_account(
+    session_key: str = "", exclude_ids: set[int] | None = None
+) -> tuple[dict[str, Any] | None, str]:
     """从号池候选（ACTIVE + 已认证 + 未降智）按「粘性会话 + 轮询」挑选 token 未过期、未冷却的账号。
 
     - 过滤 JWT 已过期的账号（exp 解析失败的视为有效，交由上游判定）
     - 过滤冷却中的账号（上游判定坏号后临时冻结，到期自动解冻）
-    - 过滤 dumbed=1（推理巡检判定降智，候选查询已排除）
+    - 过滤质量冷却 / 长期排除的账号（候选查询已排除）
+    - exclude_ids：扣流重试时本请求已试过的账号，过滤后为空则放开限制
+      （无限重试语义：全部试过时允许复选，由 strike 升级制自然收敛）
     - 粘性会话（对齐 CLIProxyAPI SessionAffinity）：会话标识非空时，
       绑定账号在 TTL 内复用；绑定账号冷却 / 禁用 / 删除 / token 过期
       则自动解绑并故障切换到新号后重建绑定；无会话标识时退化为纯轮询
@@ -539,6 +570,9 @@ def _pick_account(session_key: str = "") -> tuple[dict[str, Any] | None, str]:
         for row in list_gateway_candidates()
         if (exp := decode_jwt_exp(row.get("access_token"))) is None or exp > now
     ]
+    if exclude_ids:
+        fresh = [row for row in candidates if int(row["id"]) not in exclude_ids]
+        candidates = fresh or candidates
     if not candidates:
         return None, "号池无可用账号（需 ACTIVE、已认证且未降智）"
     with _lock:
@@ -576,6 +610,71 @@ def _cooldown_account(account_id: int, seconds: float) -> None:
     """把账号临时冷却 seconds 秒；并发安全，重复写入覆盖为最新。"""
     with _lock:
         _cooldowns[int(account_id)] = time.monotonic() + seconds
+
+
+def _mark_account_ok(account_id: int) -> None:
+    """上游 2xx 说明该账号凭据与额度均可用，清零失败计数，避免半可用账号被落库处置。"""
+    with _lock:
+        _quota_streaks.pop(int(account_id), None)
+        _auth_streaks.pop(int(account_id), None)
+
+
+def _bump_streak(streaks: dict[int, tuple[int, float]], account_id: int) -> int:
+    """连续失败计数 +1；距上次失败超过窗口视为新一轮从 1 计起。"""
+    now = time.monotonic()
+    with _lock:
+        count, last_ts = streaks.get(int(account_id), (0, 0.0))
+        count = count + 1 if now - last_ts <= _QUOTA_STREAK_WINDOW_SECONDS else 1
+        streaks[int(account_id)] = (count, now)
+    return count
+
+
+def _apply_upstream_cooldown(account_id: int, who: str, status: int) -> None:
+    """按上游状态码处置账号：内存冻结，达到阈值时落库改状态并移出选号池。
+
+    - 429：连续命中逐级升级（120s → 10min 复测 → 24h）。额度按日重置，
+      连续 429 说明额度耗尽（实测同一账号 5 小时内连续 429 十余次零成功），
+      第 3 次起落库 STATUS_LIMITED，选号候选只取 ACTIVE，随即自动移出；
+    - 402：上游明确的配额不足信号，直接 24h + 落库 STATUS_LIMITED；
+    - 401/403：token 失效，首次仅 600s 冷却防瞬时抖动，窗口内再犯落库
+      STATUS_REAUTH，由重登任务刷新/重登恢复；
+    - 任一次 2xx 成功即清零计数（见 _mark_account_ok），半可用账号不受影响。
+    """
+    cool_secs = _COOLDOWN_BY_STATUS.get(status)
+    if cool_secs is None:
+        return
+    note = ""
+    mark_status: int | None = None
+    mark_reason = ""
+    if status == 429:
+        count = _bump_streak(_quota_streaks, account_id)
+        if count == 2:
+            cool_secs = _QUOTA_RECHECK_COOLDOWN_SECONDS
+            note = f"（连续第 {count} 次，复测）"
+        elif count >= 3:
+            cool_secs = _QUOTA_RESET_SECONDS
+            mark_status = STATUS_LIMITED
+            mark_reason = f"额度耗尽（连续 {count} 次 429，冻结 24h 待日额度重置）"
+            note = f"（连续第 {count} 次，疑似额度耗尽，冻结至日额度重置）"
+    elif status == 402:
+        mark_status = STATUS_LIMITED
+        mark_reason = "额度耗尽（上游 402 配额不足，冻结 24h 待日额度重置）"
+        note = "（配额不足，冻结至日额度重置）"
+    elif status in (401, 403):
+        count = _bump_streak(_auth_streaks, account_id)
+        if count >= 2:
+            mark_status = STATUS_REAUTH
+            mark_reason = f"token 失效（上游 {status}，待刷新或重登）"
+            note = f"（连续第 {count} 次，token 失效）"
+    _cooldown_account(account_id, cool_secs)
+    if mark_status is not None:
+        update_account_status_by_ids([int(account_id)], mark_status, mark_reason)
+        logger.warning(
+            f"[Grok网关] 账号冷却 {who} status={status} 冻结 {cool_secs}s{note}"
+            f" → 已落库状态 {mark_status}，移出选号池"
+        )
+    else:
+        logger.warning(f"[Grok网关] 账号冷却 {who} status={status} 冻结 {cool_secs}s{note}")
 
 
 def cooldown_until_map() -> dict[int, float]:
@@ -748,7 +847,44 @@ def proxy(handler: BaseHTTPRequestHandler, method: str, path: str) -> None:
         logger.info(f"[Grok网关] GET {path} model=- status=200 {int((time.monotonic() - t0) * 1000)}ms in=0 out={len(payload)}")
         return
 
-    acc, acc_err = _pick_account(_session_key(handler, body))
+    session_key = _session_key(handler, body)
+    model, stream_flag, effort_flag = _extract_meta(body)
+    # 质量门控：仅推理模型、未显式关闭推理的生成请求参与扣流降智判定与换号重试
+    quality_scan = (
+        method == "POST"
+        and _looks_reasoning_model(model)
+        and str(effort_flag or "").strip().lower() not in _QUALITY_SKIP_EFFORTS
+    )
+    url = _upstream_url(path, parsed.query)
+    client_ip = egress.current_ip()  # 出口 IP（经代理探测，带缓存）
+    client_ua = str(handler.headers.get("User-Agent") or "")[:255]
+
+    if quality_scan:
+        return _proxy_hold(
+            handler, method, path, body, model, effort_flag, session_key,
+            url, client_ip, client_ua,
+        )
+    return _proxy_direct(
+        handler, method, path, body, model, stream_flag, effort_flag, session_key,
+        url, client_ip, client_ua,
+    )
+
+
+def _proxy_direct(
+    handler: BaseHTTPRequestHandler,
+    method: str,
+    path: str,
+    body: bytes,
+    model: str | None,
+    stream_flag: bool,
+    effort_flag: str | None,
+    session_key: str,
+    url: str,
+    client_ip: str,
+    client_ua: str,
+) -> None:
+    """直通转发（不参与扣流判定）：单次选号 → 转发 → 记账。"""
+    acc, acc_err = _pick_account(session_key)
     if acc is None:
         _send_bytes(
             handler,
@@ -758,12 +894,9 @@ def proxy(handler: BaseHTTPRequestHandler, method: str, path: str) -> None:
         )
         return
 
-    model, stream_flag, effort_flag = _extract_meta(body)
-    url = _upstream_url(path, parsed.query)
     token = str(acc.get("access_token") or "")
     headers = _forward_headers(handler.headers, token)
     t0 = time.monotonic()
-    t_first: float | None = None
     bytes_out = 0
     status = 502
     err: str | None = None
@@ -775,8 +908,6 @@ def proxy(handler: BaseHTTPRequestHandler, method: str, path: str) -> None:
     # 用量采集：非流式整包解析 / 流式旁路累积
     usage: dict[str, int] = {"prompt_tokens": 0, "completion_tokens": 0, "cache_tokens": 0, "reasoning_tokens": 0}
     acc_us: StreamUsageAccumulator | None = None
-    client_ip = egress.current_ip()  # 出口 IP（经代理探测，带缓存）
-    client_ua = str(handler.headers.get("User-Agent") or "")[:255]
 
     try:
         is_stream = False
@@ -793,6 +924,8 @@ def proxy(handler: BaseHTTPRequestHandler, method: str, path: str) -> None:
                     **_proxy_kwargs(),
                 )
                 status = int(upstream.status_code)
+                if status < 400:
+                    _mark_account_ok(account_id)
                 content_type = (upstream.headers.get("Content-Type") or "").lower()
                 is_stream = stream_flag and status < 400 and (
                     "text/event-stream" in content_type or not content_type
@@ -802,7 +935,6 @@ def proxy(handler: BaseHTTPRequestHandler, method: str, path: str) -> None:
                     for chunk in raw_chunks:
                         if chunk:
                             first_raw_chunk = chunk
-                            t_first = time.monotonic()
                             break
                 break
             except requests.RequestsError as exc:
@@ -904,7 +1036,6 @@ def proxy(handler: BaseHTTPRequestHandler, method: str, path: str) -> None:
             except Exception:
                 pass
         ms = int((time.monotonic() - t0) * 1000)
-        first_ms = int((t_first - t0) * 1000) if t_first is not None else 0
         _record(
             method=method,
             path=path,
@@ -922,20 +1053,347 @@ def proxy(handler: BaseHTTPRequestHandler, method: str, path: str) -> None:
             usage=usage,
             ip=client_ip,
             client_ua=client_ua,
-            first_ms=first_ms,
         )
         # 上游明确判定的坏号进入临时冷却（网络异常 / 客户端断开不归咎账号）
-        if (
-            err is None
-            and status >= 400
-            and (cool_secs := _COOLDOWN_BY_STATUS.get(status)) is not None
-        ):
-            _cooldown_account(account_id, cool_secs)
-            logger.warning(
-                f"[Grok网关] 账号冷却 {who} status={status} 冻结 {cool_secs}s"
-            )
+        if err is None and status >= 400:
+            _apply_upstream_cooldown(account_id, who, status)
         if err != "client_disconnected":
             logger.info(
                 f"[Grok网关] {method} {path} {who} model={model or '-'} "
                 f"status={status} {ms}ms in={len(body)} out={bytes_out}"
             )
+
+
+def _proxy_hold(
+    handler: BaseHTTPRequestHandler,
+    method: str,
+    path: str,
+    body: bytes,
+    model: str | None,
+    effort_flag: str | None,
+    session_key: str,
+    url: str,
+    client_ip: str,
+    client_ua: str,
+) -> None:
+    """扣流重试（对齐 grok2api quality retry）：扣住上游流实时判定降智，命中即换号重发。
+
+    - 重试无上限：每次 withhold 都对当次账号记一次 strike（1 观察 / 2 冷却 12h /
+      3 长期排除），冷却中的账号自然退出候选，同一账号不会被本请求连续重试；
+    - 号池耗尽（全部冷却 / 无可用）→ 502（fail_closed）；
+    - 判定为正常 / 无法判定（输出过短、纯工具调用轮次、截断流）→ 回放已扣住的
+      内容并继续实时转发剩余部分，客户端拿到完整响应；
+    - 客户端断开 → 中止重试。
+    """
+    tried: set[int] = set()
+    attempt = 0
+    net_failures = 0
+    consecutive_withholds = 0
+    fail_retries = 0
+    while True:
+        attempt += 1
+        acc, acc_err = _pick_account(session_key, exclude_ids=tried)
+        if acc is None:
+            logger.warning(
+                f"[Grok网关] 扣流重试 {attempt - 1} 次后无可用账号（{acc_err}）"
+            )
+            _send_bytes(
+                handler,
+                502,
+                _openai_error(
+                    f"号池账号全部降智冷却中（已重试 {max(0, attempt - 1)} 次），请稍后重试",
+                    502,
+                ),
+                "application/json; charset=utf-8",
+            )
+            return
+
+        account_id = int(acc["id"])
+        email = str(acc.get("email") or "")
+        who = email
+        token = str(acc.get("access_token") or "")
+        usage: dict[str, int] = {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "cache_tokens": 0,
+            "reasoning_tokens": 0,
+        }
+        acc_us = StreamUsageAccumulator()
+        scanner = QualityScanner()
+        status = 502
+        err: str | None = None
+        upstream: requests.Response | None = None
+        response_started = False
+        ta = time.monotonic()
+        bytes_out = 0
+        try:
+            upstream = requests.request(
+                method,
+                url,
+                headers=_forward_headers(handler.headers, token),
+                data=body if body else None,
+                stream=True,
+                **_proxy_kwargs(),
+            )
+            status = int(upstream.status_code)
+            if status < 400:
+                _mark_account_ok(account_id)
+            content_type = (upstream.headers.get("Content-Type") or "").lower()
+            is_stream = status < 400 and (
+                "text/event-stream" in content_type or not content_type
+            )
+            extra = _response_headers(upstream)
+            net_failures = 0
+
+            if status >= 400 or not is_stream:
+                # 上游错误 / 非流式：整包读取（非流式降智同样换号重试）
+                payload = upstream.content or b""
+                bytes_out = len(payload)
+                ctype = upstream.headers.get("Content-Type") or "application/json; charset=utf-8"
+                if 200 <= status < 400:
+                    usage = extract_nonstream(payload)
+                    verdict, reason = classify_nonstream(payload)
+                    if verdict == DEGRADED:
+                        err = f"quality_degraded:{reason}"
+                        _record(
+                            method=method, path=path, model=model, stream=False,
+                            status=status, ms=int((time.monotonic() - ta) * 1000),
+                            bytes_in=len(body), bytes_out=bytes_out, error=err,
+                            effort=effort_flag, account_id=account_id, account=who,
+                            account_email=email or None, usage=usage,
+                            ip=client_ip, client_ua=client_ua,
+                        )
+                        action = mark_quality_hit(account_id)
+                        logger.warning(
+                            f"[Grok网关] 扣流命中降智 {who} reason={reason} "
+                            f"attempt={attempt} 处置={action} → 换号重试"
+                        )
+                        continue
+                    _send_bytes(handler, status, payload, ctype, extra)
+                    _record(
+                        method=method, path=path, model=model, stream=False,
+                        status=status, ms=int((time.monotonic() - ta) * 1000),
+                        bytes_in=len(body), bytes_out=bytes_out, error=None,
+                        effort=effort_flag, account_id=account_id, account=who,
+                        account_email=email or None, usage=usage,
+                        ip=client_ip, client_ua=client_ua,
+                    )
+                    return
+                # 错误响应：按状态码冷却该账号；账号级失败（限流/额度/凭据/5xx）
+                # 换号重试（有上限），重试耗尽或请求级错误（400/404 等）透传给客户端
+                _apply_upstream_cooldown(account_id, who, status)
+                if (
+                    status in _RETRYABLE_UPSTREAM_STATUS
+                    and fail_retries < _MAX_UPSTREAM_FAIL_RETRIES
+                ):
+                    fail_retries += 1
+                    err = f"upstream_{status}"
+                    _record(
+                        method=method, path=path, model=model, stream=False,
+                        status=status, ms=int((time.monotonic() - ta) * 1000),
+                        bytes_in=len(body), bytes_out=bytes_out, error=err,
+                        effort=effort_flag, account_id=account_id, account=who,
+                        account_email=email or None, usage=usage,
+                        ip=client_ip, client_ua=client_ua,
+                    )
+                    logger.warning(
+                        f"[Grok网关] 扣流上游失败 {who} status={status} "
+                        f"attempt={attempt} fail_retry={fail_retries} → 换号重试"
+                    )
+                    continue
+                _send_bytes(handler, status, payload, ctype, extra)
+                _record(
+                    method=method, path=path, model=model, stream=False,
+                    status=status, ms=int((time.monotonic() - ta) * 1000),
+                    bytes_in=len(body), bytes_out=bytes_out, error=None,
+                    effort=effort_flag, account_id=account_id, account=who,
+                    account_email=email or None, usage=usage,
+                    ip=client_ip, client_ua=client_ua,
+                )
+                return
+
+            # ── 流式扣流：缓冲 + 实时裁决 ──
+            held = bytearray()
+            deliver = False
+            withhold_reason = ""
+            raw_iter = upstream.iter_content(chunk_size=4096)
+            for chunk in raw_iter:
+                if not chunk:
+                    continue
+                scanner.feed(chunk)
+                acc_us.feed(chunk)
+                held.extend(chunk)
+                verdict, reason = scanner.live_verdict()
+                if verdict == HOLD_WITHHOLD:
+                    deliver = False
+                    withhold_reason = reason
+                    break
+                if verdict == HOLD_DELIVER:
+                    deliver = True
+                    break
+                if len(held) > _HOLD_MAX_BUFFER:
+                    # 超大响应放弃重试，直接放行（无法完整扣留）
+                    deliver = True
+                    break
+            else:
+                # 流自然结束仍未裁决：按终止态裁决（截断流放行，不重试）
+                verdict, withhold_reason = scanner.live_verdict()
+                deliver = verdict != HOLD_WITHHOLD
+
+            if not deliver:
+                # 降智：丢弃已扣内容，记 strike 后换号重试（客户端看不到本次响应）
+                usage = acc_us.result()
+                err = f"quality_degraded:{withhold_reason}"
+                _record(
+                    method=method, path=path, model=model, stream=True,
+                    status=status, ms=int((time.monotonic() - ta) * 1000),
+                    bytes_in=len(body), bytes_out=bytes_out, error=err,
+                    effort=effort_flag, account_id=account_id, account=who,
+                    account_email=email or None, usage=usage,
+                    ip=client_ip, client_ua=client_ua,
+                )
+                action = mark_quality_hit(account_id)
+                consecutive_withholds += 1
+                if consecutive_withholds >= _HOLD_MAX_CONSECUTIVE_WITHHOLDS:
+                    # 会话级熔断：连续多个账号都返回无思考响应，说明降智与账号无关
+                    # （典型为会话上下文过大触发的上游保护），换号已无意义——
+                    # 提前返回明确错误，避免把整个号池打进冷却
+                    logger.error(
+                        f"[Grok网关] 连续 {consecutive_withholds} 个账号返回无思考响应，"
+                        f"判定为会话级降智（疑上下文过大），熔断重试 {who}"
+                    )
+                    _send_bytes(
+                        handler,
+                        502,
+                        _openai_error(
+                            f"连续 {consecutive_withholds} 个账号返回无思考响应——"
+                            "多为会话上下文过大触发的上游降智保护，"
+                            "请压缩或重开会话后重试",
+                            502,
+                        ),
+                        "application/json; charset=utf-8",
+                    )
+                    return
+                logger.warning(
+                    f"[Grok网关] 扣流命中降智 {who} reason={withhold_reason} "
+                    f"attempt={attempt} 处置={action} → 换号重试"
+                )
+                continue
+
+            # ── 放行：回放已扣住的内容，再继续实时转发剩余部分 ──
+            handler.send_response(status)
+            if not any(k.lower() == "content-type" for k, _ in extra):
+                handler.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            handler.send_header("Cache-Control", "no-cache")
+            handler.send_header("Connection", "close")
+            handler.send_header("X-Accel-Buffering", "no")
+            _send_cors(handler)
+            for key, value in extra:
+                if key.lower() in {"content-type", "cache-control", "connection"}:
+                    if key.lower() == "content-type":
+                        handler.send_header(key, value)
+                    continue
+                handler.send_header(key, value)
+            handler.end_headers()
+            response_started = True
+            handler.wfile.write(bytes(held))
+            handler.wfile.flush()
+            bytes_out += len(held)
+            for chunk in raw_iter:
+                if not chunk:
+                    continue
+                scanner.feed(chunk)
+                acc_us.feed(chunk)
+                handler.wfile.write(chunk)
+                handler.wfile.flush()
+                bytes_out += len(chunk)
+            usage = acc_us.result()
+            ms = int((time.monotonic() - ta) * 1000)
+            _record(
+                method=method, path=path, model=model, stream=True,
+                status=status, ms=ms, bytes_in=len(body), bytes_out=bytes_out,
+                error=None, effort=effort_flag, account_id=account_id, account=who,
+                account_email=email or None, usage=usage,
+                ip=client_ip, client_ua=client_ua,
+            )
+            if attempt > 1:
+                logger.info(f"[Grok网关] 扣流重试成功 attempt={attempt} {who}")
+            return
+        except (BrokenPipeError, ConnectionError, ConnectionResetError, ConnectionAbortedError):
+            err = "client_disconnected"
+            if status < 400:
+                logger.info(
+                    f"[Grok网关] 客户端提前断开（上游已成功 HTTP {status}）{method} {path} {who}"
+                )
+            else:
+                logger.warning(f"[Grok网关] 客户端断开 {method} {path} {who} HTTP {status}")
+            _record(
+                method=method, path=path, model=model, stream=True,
+                status=status, ms=int((time.monotonic() - ta) * 1000),
+                bytes_in=len(body), bytes_out=bytes_out, error=err,
+                effort=effort_flag, account_id=account_id, account=who,
+                account_email=email or None, usage=usage,
+                ip=client_ip, client_ua=client_ua,
+            )
+            return
+        except requests.RequestsError as exc:
+            code = curl_error_code(exc)
+            net_failures += 1
+            logger.warning(
+                f"[Grok网关] 扣流上游异常 curl={code or 'unknown'} "
+                f"attempt={attempt} 连续网络失败={net_failures}"
+            )
+            if net_failures >= 5:
+                err = f"upstream_error:curl={code or 'unknown'}"
+                _send_bytes(
+                    handler,
+                    502,
+                    _openai_error(f"上游连续网络失败（已尝试 {attempt} 次），请稍后重试", 502),
+                    "application/json; charset=utf-8",
+                )
+                _record(
+                    method=method, path=path, model=model, stream=True,
+                    status=502, ms=int((time.monotonic() - ta) * 1000),
+                    bytes_in=len(body), bytes_out=bytes_out, error=err,
+                    effort=effort_flag, account_id=account_id, account=who,
+                    account_email=email or None, usage=usage,
+                    ip=client_ip, client_ua=client_ua,
+                )
+                return
+            time.sleep(_UPSTREAM_RETRY_DELAY)
+            continue
+        except Exception as exc:
+            code = curl_error_code(exc)
+            proxy = str(config.PROXY or "").strip()
+            proxy_ready = proxy_endpoint_ready(proxy, timeout=0.2) if proxy else True
+            err = (
+                f"{type(exc).__name__} curl={code or 'unknown'} "
+                f"proxy={'ready' if proxy_ready else 'down'} bytes_out={bytes_out}: {exc}"
+            )
+            logger.error(f"[Grok网关] 扣流转发失败 {method} {path} {who} {err}")
+            if not response_started and not handler.wfile.closed:
+                try:
+                    _send_bytes(
+                        handler,
+                        502,
+                        _openai_error(err, 502),
+                        "application/json; charset=utf-8",
+                    )
+                except Exception:
+                    pass
+            status = 502
+            _record(
+                method=method, path=path, model=model, stream=True,
+                status=502, ms=int((time.monotonic() - ta) * 1000),
+                bytes_in=len(body), bytes_out=bytes_out, error=err,
+                effort=effort_flag, account_id=account_id, account=who,
+                account_email=email or None, usage=usage,
+                ip=client_ip, client_ua=client_ua,
+            )
+            return
+        finally:
+            if upstream is not None:
+                try:
+                    upstream.close()
+                except Exception:
+                    pass

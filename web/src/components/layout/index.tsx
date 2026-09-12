@@ -117,8 +117,7 @@ function RegisterBreathStatus() {
   const status = job?.status ?? "idle";
   const live =
     status === "pending" || status === "running" || status === "stopping";
-  const finished =
-    (job?.success ?? 0) + (job?.failed ?? 0) + (job?.denied ?? 0);
+  const finished = (job?.success ?? 0) + (job?.failed ?? 0);
   const total = job?.count ?? 0;
 
   let value = "空闲";

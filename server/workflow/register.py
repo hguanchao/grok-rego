@@ -30,7 +30,6 @@ from core.util import (
     decode_jwt_exp,
     elapsed_label,
     format_exp,
-    now_str,
     run_account_workers,
 )
 from db import (
@@ -44,7 +43,6 @@ from db import (
     remove_from_auth_pool,
     save_account,
     update_account_status,
-    update_risk,
 )
 from workflow.browser import (
     extract_sso_cookies,
@@ -60,8 +58,8 @@ from workflow.mail import create_temp_email, poll_for_code
 # ─── 任务协作取消：API 停止时 set，run_signups 协作退出 ────────────────────
 _cancel_event = threading.Event()
 
-# 单次注册结果回调：(ok, email|None, risk_bfs|None)
-ResultCallback = Callable[[bool, str | None, int | None], None]
+# 单次注册结果回调：(ok, email|None)
+ResultCallback = Callable[[bool, str | None], None]
 
 
 def request_cancel() -> None:
@@ -483,141 +481,6 @@ def wait_until(
             return False
     return False
 
-
-# ---------------------------------------------------------------------------
-# 风控检查
-# ---------------------------------------------------------------------------
-
-def parse_grok_risk(html: str | None) -> dict[str, Any]:
-    """从 grok.com 主页 HTML（RSC 数据）解析风控字段。
-
-    botFlagSource 取值：
-      0 / null  → 无风控标记（正常）
-      1         → 中等风控
-      2         → 高风控
-    """
-    normalized = str(html or "").replace('\\"', '"')
-    source_match = re.search(r'botFlagSource"\s*:\s*(null|-?\d+)', normalized)
-    details_match = re.search(r'botFlagDetails"\s*:\s*(?:null|"([^"]*)")', normalized)
-
-    source: int | None = None
-    if source_match:
-        raw = source_match.group(1)
-        if raw != "null":
-            try:
-                source = int(raw)
-            except (TypeError, ValueError):
-                source = None
-        else:
-            # botFlagSource: null → 明确无风控标记，视为 0
-            source = 0
-    details = details_match.group(1) if details_match and details_match.group(1) else ""
-
-    return {
-        "found": bool(source_match or details_match),
-        "bot_flag_source": source,
-        "bot_flag_details": details,
-    }
-
-
-def _scan_grok_page(page: Any) -> tuple[int | None, str]:
-    """轮询等待 grok.com 页面出现 botFlag 字段，返回 (bfs, details) 或 (None, "")。
-
-    若连续 2 次检测到页面为未登录态（出现 Sign in / Sign up 入口且无 botFlag），
-    说明 grok.com 未完成登录，体检无意义，提前结束。
-    单次命中不退出：SPA 首屏渲染初期可能短暂包含 Sign up / Sign in 文案。
-    体检是落地后的可选增强：上限 RISK_SCAN_TIMEOUT（而非 CF_WAIT_TIMEOUT），
-    拿不到风控字段也要尽快收敛，避免注册完成后浏览器被拖住迟迟不关。
-    """
-    unauth_count = 0
-    idle_rounds = 0  # 连续无 botFlag 且无变化的轮数，稳定页面提前退出，不硬等满
-    for _ in range(int(RISK_SCAN_TIMEOUT / CF_POLL_INTERVAL)):
-        page.wait_for_timeout(CF_POLL_INTERVAL * 1000)
-        try:
-            html = page.content()
-        except Exception:
-            continue
-        if "botFlag" in html:
-            result = parse_grok_risk(html)
-            if result["found"]:
-                return result["bot_flag_source"], result["bot_flag_details"]
-        # 未登录态检测：连续 2 次才确认（避免 SPA 渲染初期误判）
-        if "Sign up" in html and "Sign in" in html:
-            unauth_count += 1
-            if unauth_count >= 2:
-                logger.debug("[风控] grok.com 连续 2 次显示未登录态，提前结束体检")
-                return None, ""
-        else:
-            unauth_count = 0
-        # 稳定无字段：连续 5 个轮询周期（约 10s）页面既无 botFlag 也未出现未登录态波动，
-        # 视为体检页拿不到风控字段，提前放弃（仍远短于原 90s 硬等）
-        idle_rounds += 1
-        if idle_rounds >= 5:
-            logger.debug(
-                f"[风控] grok.com 连续 {idle_rounds} 轮无 botFlag 字段，提前结束体检"
-            )
-            return None, ""
-    return None, ""
-
-
-def _seed_sso_for_grok(page: Any) -> None:
-    """把当前会话的 sso 值写入 grok.com，避免体检页落到未登录营销页。"""
-    try:
-        browser = page.context.browser if hasattr(page, "context") else page
-        cookies = extract_sso_cookies(browser)
-        from workflow.oauth import _extract_sso_value
-        value = _extract_sso_value(cookies) if cookies else None
-        if not value:
-            return
-        payload = []
-        for name in ("sso", "sso-rw"):
-            for domain in (".grok.com", "grok.com"):
-                payload.append({
-                    "name": name,
-                    "value": value,
-                    "domain": domain,
-                    "path": "/",
-                    "httpOnly": True,
-                    "secure": True,
-                    "sameSite": "Lax",
-                })
-        page.context.add_cookies(payload)
-        logger.debug("[风控] 已将 SSO cookie 注入 grok.com")
-    except Exception as exc:
-        logger.debug(f"[风控] 注入 grok.com cookie 失败: {type(exc).__name__}: {exc}")
-
-
-def check_account_risk(page: Any) -> tuple[int | None, str]:
-    """检查账号风控状态，返回 (bfs, risk_details)。
-
-    页面已位于 grok.com 则直接扫描，否则先跳转；解析失败自动重试一次，
-    仍失败返回 (None, "")，由调用方标记 unknown，不阻塞主流程。
-    体检是落地后的可选增强：最多跳转重试 RISK_SCAN_ATTEMPTS 次，
-    每次扫描上限 RISK_SCAN_TIMEOUT，确保拿到风控结果后尽快收敛、关闭浏览器。
-    """
-    _seed_sso_for_grok(page)
-    for attempt in range(1, RISK_SCAN_ATTEMPTS + 1):
-        try:
-            current_url = page.url
-        except Exception:
-            current_url = ""
-        if "grok.com" not in current_url or attempt == RISK_SCAN_ATTEMPTS:
-            logger.debug(f"[风控] 正在跳转 grok.com（第 {attempt}/{RISK_SCAN_ATTEMPTS} 次）")
-            safe_goto(page, config.GROK_URL)
-        else:
-            logger.debug(f"[风控] 已在 grok.com，直接扫描（第 {attempt}/{RISK_SCAN_ATTEMPTS} 次）")
-
-        bfs, details = _scan_grok_page(page)
-        if bfs is not None:
-            return bfs, details
-        logger.debug(f"[风控] 第 {attempt} 次未解析到风控字段，重试")
-
-    return None, ""
-
-
-# ---------------------------------------------------------------------------
-# 注册流程
-# ---------------------------------------------------------------------------
 
 def _enter_signup_page(page: Any) -> bool:
     """打开注册页并进入邮箱填写入口（落地页需点 Sign up with email）。"""
@@ -1144,7 +1007,6 @@ def _run_attempt(
     password: str,
     headless: bool = False,
 ) -> tuple[
-    tuple[int | None, str],
     int | None,
     str | None,
     str | None,
@@ -1154,7 +1016,7 @@ def _run_attempt(
 ]:
     """单次浏览器尝试：开页 → 邮箱 → 验证码 → 表单 → 等 SSO。
 
-    返回 (risk, account_id, email, jwt, first_name, last_name, stage)。
+    返回 (account_id, email, jwt, first_name, last_name, stage)。
 
     失败阶段 stage：
     - 'email'：邮箱填写页加载超时 / 未找到元素 / 填写后风控，调用方可重启浏览器复用邮箱重试。
@@ -1166,14 +1028,13 @@ def _run_attempt(
     SSO cookie 拿到后：save_account 入库（status=REAUTH，无 token）→ 入认证池待统一交换。
     OAuth 交换不在本步进行，由 run_auth_pool 统一 LIFO 消化。
     """
-    risk: tuple[int | None, str] = (None, "")
     account_id: int | None = None
     email_submitted = False
     sso_clock: list[float] = []
 
     def fail(stage: str) -> tuple[Any, ...]:
         """以指定失败阶段提前返回本次尝试结果（邮箱/资料在闭包中复用）。"""
-        return risk, account_id, email, jwt, first_name, last_name, stage
+        return account_id, email, jwt, first_name, last_name, stage
 
     try:
         with Camoufox(**_camoufox_kwargs(headless)) as browser:
@@ -1394,24 +1255,23 @@ def preflight_check() -> bool:
     return True
 
 
-def run_signup(headless: bool = False) -> tuple[bool, str | None, int | None]:
+def run_signup(headless: bool = False) -> tuple[bool, str | None]:
     """注册新账号：开页 → 邮箱 → 验证码 → 表单 → 等 SSO cookie → 入库（待认证）。
 
-    返回 (success, email, risk_bfs)。
+    返回 (success, email)。
     - 邮箱 / 验证码 / 资料表单阶段失败（加载超时/未找到元素/填写后风控/验证码与表单异常）：
       关闭当前浏览器重启重试，邮箱与资料姓名复用，最多 MAX_ATTEMPTS 次尝试。
     - 仅 SSO 阶段失败：刷新页面重试 POST_EMAIL_RETRIES 次，不重启浏览器。
     SSO cookie 拿到即入库（status=REAUTH，无 token），OAuth 交换由认证池统一 LIFO 消化。
     """
     if is_cancelled():
-        return False, None, None
+        return False, None
 
     init_db()
     first_name, last_name = None, None
     password = _generate_password()
     email, jwt = None, None
 
-    risk: tuple[int | None, str] = (None, "")
     account_id: int | None = None
     for attempt in range(1, MAX_ATTEMPTS + 1):
         if is_cancelled():
@@ -1423,7 +1283,7 @@ def run_signup(headless: bool = False) -> tuple[bool, str | None, int | None]:
                 f"[注册] 第 {attempt}/{MAX_ATTEMPTS} 次尝试"
                 f"{f'  {log_email}' if log_email else ''}"
             )
-        risk, account_id, email, jwt, first_name, last_name, stage = _run_attempt(
+        account_id, email, jwt, first_name, last_name, stage = _run_attempt(
             email, jwt, first_name, last_name, password, headless=headless
         )
         if account_id is not None:
@@ -1445,12 +1305,10 @@ def run_signup(headless: bool = False) -> tuple[bool, str | None, int | None]:
 
     if account_id and email:
         logger.debug(f"[SSO] 账号已入库，待认证池交换 Token: {email}")
-        if config.IS_AUTH and risk[0] is not None:
-            update_risk(email, risk[0], risk[1] or None, now_str())
-        return True, email, risk[0]
+        return True, email
 
     logger.error(f"[注册] 全部尝试失败，放弃: {email}")
-    return False, email, risk[0]
+    return False, email
 
 
 def run_signups(
@@ -1461,7 +1319,7 @@ def run_signups(
 ) -> int:
     """批量多线程注册，返回成功数量。
 
-    on_result: 每个账号结束时回调 (ok, email, risk_bfs)。
+    on_result: 每个账号结束时回调 (ok, email)。
     协作取消：request_cancel() 后不再提交新结果统计，已运行 worker 尽快退出。
     """
     init_db()
@@ -1472,7 +1330,7 @@ def run_signups(
     logger.info(f"[任务] 注册阶段开始: {total} 账号 / {worker_count} 线程")
     success_count = 0
 
-    def _delayed_signup(idx: int, hless: bool) -> tuple[bool, str | None, int | None]:
+    def _delayed_signup(idx: int, hless: bool) -> tuple[bool, str | None]:
         """带随机启动延迟的注册 worker，错开多浏览器并发窗口降低风控概率。"""
         if worker_count > 1:
             delay = random.uniform(3.0, 8.0) * idx
@@ -1488,15 +1346,15 @@ def run_signups(
         ]
         for future in as_completed(futures):
             try:
-                ok, email, risk_bfs = future.result()
+                ok, email = future.result()
             except Exception as e:
-                ok, email, risk_bfs = False, None, None
+                ok, email = False, None
                 logger.error(f"[注册] 线程任务异常: {type(e).__name__}: {e}")
             if ok:
                 success_count += 1
             if on_result is not None:
                 try:
-                    on_result(ok, email, risk_bfs)
+                    on_result(ok, email)
                 except Exception as cb_err:
                     logger.warning(f"[批量注册] on_result 回调异常: {cb_err}")
     logger.info(f"[任务] 注册阶段结束: 成功 {success_count}/{total}")

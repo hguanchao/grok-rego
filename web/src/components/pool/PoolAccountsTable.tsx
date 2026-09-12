@@ -27,14 +27,11 @@ import {
   TooltipTrigger,
 } from "@/components/ui";
 import type { PoolAccount } from "@/lib/api";
-import { STATUS_LABELS } from "@/lib/api";
+import { ACCOUNT_STATUS, STATUS_LABELS } from "@/lib/api";
 import { cn, formatAccountTime } from "@/lib/utils";
 import {
   ACCOUNT_STATUS_VARIANT,
-  INSPECT_VARIANT,
   formatPoolExpiry,
-  inspectLabel,
-  inspectTitle,
   poolExpiryTone,
 } from "./PoolPageParts";
 
@@ -171,9 +168,6 @@ function SkeletonRows() {
           <TableCell className="pool-col-status">
             <span className="pool-skel pool-skel-badge" />
           </TableCell>
-          <TableCell className="pool-col-inspect">
-            <span className="pool-skel pool-skel-badge" />
-          </TableCell>
           <TableCell className="pool-col-reason">
             <span className="pool-skel pool-skel-md" />
           </TableCell>
@@ -234,7 +228,6 @@ export function PoolAccountsTable({
             <TableHead className="pool-col-time">注册时间</TableHead>
             <TableHead className="pool-col-auth">认证状态</TableHead>
             <TableHead className="pool-col-status">账号状态</TableHead>
-            <TableHead className="pool-col-inspect">巡检</TableHead>
             <TableHead className="pool-col-reason">原因</TableHead>
             <TableHead className="pool-col-actions">操作</TableHead>
           </TableRow>
@@ -262,7 +255,6 @@ export function PoolAccountsTable({
           ) : (
             accounts.map((account) => {
               const passwordVisible = visiblePasswords.has(account.id);
-              const inspect = inspectLabel(account.dumbed);
               const expiryTone = poolExpiryTone(account.expires_at);
               return (
                 <TableRow
@@ -367,43 +359,24 @@ export function PoolAccountsTable({
                       {STATUS_LABELS[account.status] || "未知"}
                     </Badge>
                   </TableCell>
-                  <TableCell className="pool-col-inspect">
-                    <Tooltip>
-                      <TooltipTrigger asChild>
-                        <span>
-                          <Badge
-                            variant={INSPECT_VARIANT[inspect] || "secondary"}
-                          >
-                            {inspect}
-                          </Badge>
-                        </span>
-                      </TooltipTrigger>
-                      <TooltipContent side="top">
-                        {inspectTitle(
-                          account.dumbed,
-                          account.inspect_tps,
-                          account.inspect_thinking,
-                          account.inspected_at
-                            ? formatAccountTime(account.inspected_at)
-                            : null,
-                        )}
-                      </TooltipContent>
-                    </Tooltip>
-                  </TableCell>
                   <TableCell className="pool-col-reason">
-                    <Tooltip>
-                      <TooltipTrigger asChild>
-                        <span className="pool-cell-clip cursor-pointer">
-                          {account.reason || "—"}
-                        </span>
-                      </TooltipTrigger>
-                      <TooltipContent
-                        side="top"
-                        className="max-w-xs text-left leading-relaxed"
-                      >
-                        {account.reason || "无"}
-                      </TooltipContent>
-                    </Tooltip>
+                    {account.status === ACCOUNT_STATUS.active ? (
+                      <span className="pool-cell-clip" />
+                    ) : (
+                      <Tooltip>
+                        <TooltipTrigger asChild>
+                          <span className="pool-cell-clip cursor-pointer">
+                            {account.reason || "—"}
+                          </span>
+                        </TooltipTrigger>
+                        <TooltipContent
+                          side="top"
+                          className="max-w-xs text-left leading-relaxed"
+                        >
+                          {account.reason || "无"}
+                        </TooltipContent>
+                      </Tooltip>
+                    )}
                   </TableCell>
                   <TableCell className="pool-col-actions">
                     <AccountActions
