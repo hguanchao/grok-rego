@@ -77,6 +77,14 @@
   margin-left: auto;
 }
 
+.gw-proxy-meta {
+  margin: 6px 0 0;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.45;
+  color: var(--muted-foreground);
+}
+
 .gw-empty {
   padding: 28px 12px;
   font-size: 12px;

@@ -83,17 +83,13 @@ def is_cancelled() -> bool:
 
 
 def _proxies() -> dict[str, str] | None:
-    """按当前配置返回代理。"""
-    proxy = config.PROXY
+    """当前线程绑定（或池中挑一条）的代理。"""
+    from core import proxypool
+
+    proxy = proxypool.current()
     return {"http": proxy, "https": proxy} if proxy else None
 
 # ─── 超时与重试参数 ─────────────────────────────────────────────────────
-CF_WAIT_TIMEOUT = 90  # 等待 Cloudflare 挑战通过的最长时间（秒）
-CF_POLL_INTERVAL = 2  # 风控扫描轮询间隔（秒）
-# grok 风控体检是落地后的可选增强：单次扫描不再死等满 CF_WAIT_TIMEOUT。
-# 体检属于次要目标，必须快点收敛，避免注册完成后浏览器被拖住迟迟不关。
-RISK_SCAN_TIMEOUT = 25  # 单次风控扫描轮询的最长时间（秒）
-RISK_SCAN_ATTEMPTS = 2  # 单轮体检最多跳转重试的次数
 MAX_ATTEMPTS = 3  # 邮箱/验证码/资料阶段失败允许重启浏览器的最大次数（邮箱与资料复用）
 POST_EMAIL_RETRIES = 2  # 仅 SSO 阶段失败：刷新页面重试的次数（不重启浏览器）
 EMAIL_PAGE_WAIT_SECS = 25  # 等待邮箱填写页出现的最长时间（秒）
@@ -263,8 +259,11 @@ def _camoufox_kwargs(headless: bool) -> dict[str, Any]:
             "dom.min_background_timeout_value_without_budget": 4,
         },
     }
-    if config.PROXY:
-        kwargs["proxy"] = {"server": config.PROXY}
+    from core import proxypool
+
+    proxy = proxypool.current()
+    if proxy:
+        kwargs["proxy"] = {"server": proxy}
     return kwargs
 
 
@@ -1190,30 +1189,35 @@ def _run_attempt(
 # ---------------------------------------------------------------------------
 
 def _check_proxy() -> bool:
-    """检测代理是否可用：通过代理访问中立快速端点（gstatic generate_204）。"""
-    proxy = config.PROXY
+    """检测代理池：任一条可达即通过；全空跳过；全部失败则中止。"""
+    from core import proxypool
+
+    pool = proxypool.urls()
     t0 = time.monotonic()
-    if not proxy:
-        logger.debug("[预检] 未配置代理（PROXY 为空），跳过代理检测")
+    if not pool:
+        logger.debug("[预检] 未配置代理，跳过代理检测")
         return True
-    try:
-        resp = requests.get(
-            "https://www.gstatic.com/generate_204",
-            proxies=_proxies(),
-            timeout=15,
-            impersonate="chrome",
-        )
-    except Exception as e:
-        logger.error(
-            f"[预检] 代理不可达  {proxy}  {type(e).__name__}  · {elapsed_label(t0)}"
-        )
-        return False
-    if resp.status_code == 204:
-        logger.debug(f"[预检] 代理可用: {proxy}  · {elapsed_label(t0)}")
-        return True
-    logger.error(
-        f"[预检] 代理不可达  {proxy}  HTTP {resp.status_code}  · {elapsed_label(t0)}"
-    )
+    last_err = ""
+    for proxy in pool:
+        try:
+            resp = requests.get(
+                "https://www.gstatic.com/generate_204",
+                proxies={"http": proxy, "https": proxy},
+                timeout=15,
+                impersonate="chrome",
+            )
+        except Exception as e:
+            last_err = f"{proxypool.redact(proxy)} {type(e).__name__}"
+            logger.warning(f"[预检] 代理不可达  {last_err}  · {elapsed_label(t0)}")
+            continue
+        if resp.status_code == 204:
+            logger.debug(
+                f"[预检] 代理可用: {proxypool.redact(proxy)}  · {elapsed_label(t0)}"
+            )
+            return True
+        last_err = f"{proxypool.redact(proxy)} HTTP {resp.status_code}"
+        logger.warning(f"[预检] 代理不可达  {last_err}  · {elapsed_label(t0)}")
+    logger.error(f"[预检] 代理池全部不可达  {last_err}  · {elapsed_label(t0)}")
     return False
 
 
@@ -1286,6 +1290,17 @@ def run_signup(headless: bool = False) -> tuple[bool, str | None]:
     if is_cancelled():
         return False, None
 
+    from core import proxypool
+
+    proxypool.bind()
+    try:
+        return _run_signup_bound(headless)
+    finally:
+        proxypool.unbind()
+
+
+def _run_signup_bound(headless: bool = False) -> tuple[bool, str | None]:
+    """run_signup 在已 bind 代理后的本体。"""
     init_db()
     first_name, last_name = None, None
     password = _generate_password()
@@ -1392,8 +1407,6 @@ def run_auth_pool(
     stop_when: 可选，返回 True 时提前结束（用于任务取消）。
     on_result: 可选，单账号完成后立即回调完整邮箱、结果和原因。
     """
-    from workflow.oauth import auth_with_sso
-
     auth_entries = get_auth_pool()
     if not auth_entries:
         logger.info("[出池] 队列为空，无需消化")
@@ -1415,42 +1428,13 @@ def run_auth_pool(
             if on_result is not None:
                 on_result(log_email, False, "账号不存在")
             return False
-        # 禁用账号不参与自动认证：直接出队不认证（认证成功会回写 ACTIVE，避免复活禁用账号）
-        if int(account.get("status") or 1) == STATUS_DISABLED:
-            remove_from_auth_pool(email)
-            logger.warning(f"[出池] {log_email}  已禁用，跳过认证并入队移除")
-            if on_result is not None:
-                on_result(log_email, False, "账号已禁用")
-            return False
-        t0 = time.monotonic()
-        token, reason = auth_with_sso(account.get("sso_cookie"))
-        if token:
-            save_account(
-                account["email"],
-                account["password"],
-                account["first_name"],
-                account["last_name"],
-                account.get("sso_cookie"),
-                access_token=token.get("access_token"),
-                refresh_token=token.get("refresh_token"),
-                expires_in=token.get("expires_in"),
-                status=STATUS_ACTIVE,
-                reason=reason,
-            )
-            remove_from_auth_pool(email)
-            exp_txt = format_exp(decode_jwt_exp(token.get("access_token")))
-            logger.success(
-                f"[出池] {log_email}  认证成功  Token 到期 {exp_txt}  · {elapsed_label(t0)}"
-            )
-            if on_result is not None:
-                on_result(log_email, True, "Token 已入库")
-            return True
-        update_account_status(email, STATUS_REAUTH, f"0 {reason}")
-        remove_from_auth_pool(email)
-        logger.warning(f"[出池] {log_email}  认证失败：{reason}  · {elapsed_label(t0)}")
-        if on_result is not None:
-            on_result(log_email, False, reason)
-        return False
+        from core import proxypool
+
+        proxypool.bind()
+        try:
+            return _auth_pool_one(account, email, log_email, on_result)
+        finally:
+            proxypool.unbind()
 
     success_count = 0
     success_lock = threading.Lock()
@@ -1462,11 +1446,11 @@ def run_auth_pool(
                 success_count += 1
             return
         if isinstance(result, Exception):
-            email = str(entry.get("email") or "")
+            fail_email = str(entry.get("email") or "")
             reason = f"{type(result).__name__}: {result}"
-            logger.warning(f"[出池] {email}  认证异常：{reason}")
+            logger.warning(f"[出池] {fail_email}  认证异常：{reason}")
             if on_result is not None:
-                on_result(email, False, reason)
+                on_result(fail_email, False, reason)
 
     run_account_workers(
         auth_entries,
@@ -1478,3 +1462,50 @@ def run_auth_pool(
     )
     logger.info(f"[出池] 消化完成: 成功 {success_count}/{len(auth_entries)}")
     return success_count
+
+
+def _auth_pool_one(
+    account: dict[str, Any],
+    email: str,
+    log_email: str,
+    on_result: Callable[[str, bool, str], None] | None,
+) -> bool:
+    """认证池单条（已 bind 代理）。"""
+    from workflow.oauth import auth_with_sso
+
+    # 禁用账号不参与自动认证：直接出队不认证（认证成功会回写 ACTIVE，避免复活禁用账号）
+    if int(account.get("status") or 1) == STATUS_DISABLED:
+        remove_from_auth_pool(email)
+        logger.warning(f"[出池] {log_email}  已禁用，跳过认证并入队移除")
+        if on_result is not None:
+            on_result(log_email, False, "账号已禁用")
+        return False
+    t0 = time.monotonic()
+    token, reason = auth_with_sso(account.get("sso_cookie"))
+    if token:
+        save_account(
+            account["email"],
+            account["password"],
+            account["first_name"],
+            account["last_name"],
+            account.get("sso_cookie"),
+            access_token=token.get("access_token"),
+            refresh_token=token.get("refresh_token"),
+            expires_in=token.get("expires_in"),
+            status=STATUS_ACTIVE,
+            reason=reason,
+        )
+        remove_from_auth_pool(email)
+        exp_txt = format_exp(decode_jwt_exp(token.get("access_token")))
+        logger.success(
+            f"[出池] {log_email}  认证成功  Token 到期 {exp_txt}  · {elapsed_label(t0)}"
+        )
+        if on_result is not None:
+            on_result(log_email, True, "Token 已入库")
+        return True
+    update_account_status(email, STATUS_REAUTH, f"0 {reason}")
+    remove_from_auth_pool(email)
+    logger.warning(f"[出池] {log_email}  认证失败：{reason}  · {elapsed_label(t0)}")
+    if on_result is not None:
+        on_result(log_email, False, reason)
+    return False

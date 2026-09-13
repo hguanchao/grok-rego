@@ -65,7 +65,7 @@ import {
   type MailProvider,
   type RegisterJobState,
 } from "@/lib/api";
-import { cn, groupRegisterLogs } from "@/lib/utils";
+import { cn, groupRegisterLogs, proxiesToText, textToProxies } from "@/lib/utils";
 
 const IDLE_JOB: RegisterJobState = {
   id: null,
@@ -239,7 +239,7 @@ export function RegisterPage() {
   const applyConfig = useCallback((data: AppConfig) => {
     hasConfigRef.current = true;
     setMailProvider(data.mail_provider === "yyds" ? "yyds" : "cf");
-    setProxy(data.proxy || "");
+    setProxy(proxiesToText(data.proxies, data.proxy || ""));
     setAuthEnabled(Boolean(data.auth_enabled));
     setHumanSim(data.human_sim !== false);
     setHumanLevel(
@@ -263,7 +263,7 @@ export function RegisterPage() {
   const buildConfigPatch = useCallback((): Partial<AppConfig> => {
     return {
       mail_provider: mailProvider,
-      proxy: proxy.trim(),
+      proxies: textToProxies(proxy),
       auth_enabled: authEnabled,
       human_sim: humanSim,
       human_level: humanLevel,
@@ -728,15 +728,21 @@ export function RegisterPage() {
             <div className="field-block rail-more-body">
               <div className="field-block">
                 <div className="field-label">
-                  <b>本地代理</b>
+                  <b>代理池</b>
                 </div>
-                <Input
-                  type="text"
-                  placeholder="http://127.0.0.1:7890"
+                <textarea
+                  className={cn(
+                    "file:text-foreground placeholder:text-muted-foreground flex min-h-[88px] w-full min-w-0 resize-y rounded-md border border-input bg-background px-2.5 py-1.5 text-[12px] leading-relaxed outline-none font-mono",
+                    "focus-visible:border-primary/50 focus-visible:ring-1 focus-visible:ring-primary/20",
+                    "disabled:pointer-events-none disabled:cursor-not-allowed disabled:opacity-50",
+                  )}
+                  placeholder={"http://127.0.0.1:7890\nhttp://user:pass@host:port"}
                   value={proxy}
                   disabled={formDisabled}
+                  spellCheck={false}
                   onChange={(event) => setProxy(event.target.value)}
                 />
+                <p className="field-hint">一行一条。注册线程粘性绑定，网关请求轮询；失败冷却 60 秒。</p>
               </div>
               <div className="rail-btn-row">
                 <Button

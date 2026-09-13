@@ -22,6 +22,8 @@ CF_DOMAINS: list[str] = []
 CF_API_KEY: str = ""
 CF_DOMAIN_MODE: str = "random"
 PROXY: str = "http://127.0.0.1:7890"
+# 出口代理池；空则直连。默认与 PROXY 同条，读盘后以 proxies 或拆开的 proxy 为准。
+PROXIES: list[str] = ["http://127.0.0.1:7890"]
 
 # === 临时邮箱服务商（cf / yyds）===
 MAIL_PROVIDER: str = "cf"
@@ -58,7 +60,6 @@ OAUTH2_SCOPES: list[str] = [
 
 # === 浏览器自动化配置 ===
 GOTO_TIMEOUT: int = 60000
-ELEMENT_TIMEOUT: int = 15000
 
 # === 全局仿真人（防风控）===
 # human_sim=false 时关闭自研拟人引擎，行为与接入前一致（仅依赖 Camoufox humanize）
@@ -73,7 +74,6 @@ IS_AUTH: bool = True
 # === xAI 账号页面 ===
 # redirect=grok-com：注册完成后直接跳转 grok.com（不再停留账号页）
 SIGNUP_URL = "https://accounts.x.ai/sign-up?redirect=grok-com"
-GROK_URL = "https://grok.com/"
 
 # === JSON 配置加载（config.json 覆盖默认值）===
 CONFIG_PATH = os.path.join(SERVER_DIR, "config.json")
@@ -88,6 +88,7 @@ _PUBLIC_CONFIG_KEYS = (
     "yyds_api_base",
     "yyds_api_key",
     "proxy",
+    "proxies",
     "auth_enabled",
     "g2a_base_url",
     "g2a_username",
@@ -155,7 +156,7 @@ def _read_config_file() -> dict[str, Any]:
 
 def _apply_config_data(data: dict[str, Any]) -> None:
     """将 dict 应用到模块级运行时变量。"""
-    global CF_API_BASE, CF_DOMAINS, CF_API_KEY, CF_DOMAIN_MODE, PROXY, IS_AUTH
+    global CF_API_BASE, CF_DOMAINS, CF_API_KEY, CF_DOMAIN_MODE, PROXY, PROXIES, IS_AUTH
     global MAIL_PROVIDER, YYDS_API_BASE, YYDS_API_KEY
     global G2A_BASE_URL, G2A_USERNAME, G2A_PASSWORD, CPA_BASE_URL, CPA_MANAGEMENT_KEY
     global GATEWAY_API_KEY, GROK_VERSION
@@ -177,8 +178,16 @@ def _apply_config_data(data: dict[str, Any]) -> None:
                 f"仅支持 poll/random，已回退 random"
             )
             CF_DOMAIN_MODE = "random"
-    if data.get("proxy") is not None:
-        PROXY = str(data["proxy"])
+    if "proxies" in data:
+        from core.proxypool import parse_proxy_list
+
+        PROXIES = parse_proxy_list(data.get("proxies"))
+        PROXY = PROXIES[0] if PROXIES else ""
+    elif data.get("proxy") is not None:
+        from core.proxypool import parse_proxy_list
+
+        PROXIES = parse_proxy_list(data.get("proxy"))
+        PROXY = PROXIES[0] if PROXIES else str(data["proxy"] or "").strip()
     if data.get("mail_provider") is not None:
         provider = str(data["mail_provider"]).strip().lower()
         MAIL_PROVIDER = provider if provider in ("cf", "yyds") else "cf"
@@ -252,6 +261,7 @@ def get_public_config() -> dict[str, Any]:
         "yyds_api_base": YYDS_API_BASE,
         "yyds_api_key": YYDS_API_KEY,
         "proxy": PROXY,
+        "proxies": list(PROXIES),
         "auth_enabled": IS_AUTH,
         "g2a_base_url": G2A_BASE_URL,
         "g2a_username": G2A_USERNAME,
@@ -295,6 +305,19 @@ def update_public_config(patch: dict[str, Any]) -> dict[str, Any]:
                 raise ValueError("grok_version 不能为空")
             current[key] = ver
             current.pop("grok_client_version", None)
+        elif key == "proxies":
+            from core.proxypool import parse_proxy_list
+
+            parsed = parse_proxy_list(value)
+            current["proxies"] = parsed
+            current["proxy"] = parsed[0] if parsed else ""
+        elif key == "proxy":
+            from core.proxypool import parse_proxy_list
+
+            parsed = parse_proxy_list(value)
+            current["proxy"] = parsed[0] if parsed else str(value or "").strip()
+            if "proxies" not in patch:
+                current["proxies"] = parsed
         elif key == "human_sim":
             current[key] = bool(value)
         elif key == "human_level":

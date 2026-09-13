@@ -23,6 +23,7 @@ from urllib.parse import urlparse
 from curl_cffi import requests
 
 from core import config
+from core import proxypool
 from core.config import UPSTREAM_BASE
 from core.logger import logger
 from core.util import (
@@ -30,7 +31,6 @@ from core.util import (
     decode_jwt_exp,
     iso_after_hours,
     now_iso_tz,
-    proxy_endpoint_ready,
 )
 from db import (
     STATUS_LIMITED,
@@ -63,6 +63,34 @@ _HOLD_MAX_BUFFER = 8 * 1024 * 1024
 # （多为会话上下文过大触发的上游保护，即「128k status-loop drool」），
 # 继续换号只会把整个号池打进冷却——提前返回明确错误，让用户压缩会话
 _HOLD_MAX_CONSECUTIVE_WITHHOLDS = 6
+
+
+def _retry_quality_via_proxy(
+    account_id: int, used_proxy: str, swapped: set[int], who: str
+) -> bool:
+    """降智时先给出口 IP 记升级（观察→冷却→排除），能换代理则同号重试。
+
+    池里没有其它可用出口、或本号已经换过代理，返回 False，调用方再给账号记 strike。
+    """
+    action = proxypool.mark_quality_hit(used_proxy) if used_proxy else "unchanged"
+    if (
+        used_proxy
+        and proxypool.has_other(used_proxy)
+        and account_id not in swapped
+    ):
+        swapped.add(account_id)
+        nxt = proxypool.pick(exclude=used_proxy)
+        logger.warning(
+            f"[Grok网关] 降智代理 {proxypool.redact(used_proxy)} 处置={action} "
+            f"→ {proxypool.redact(nxt)} 同号重试 {who}"
+        )
+        return True
+    if used_proxy:
+        logger.warning(
+            f"[Grok网关] 降智代理 {proxypool.redact(used_proxy)} 处置={action}，"
+            f"无其它出口或已换过，改记账号 {who}"
+        )
+    return False
 
 
 def _client_version() -> str:
@@ -259,7 +287,8 @@ def snapshot() -> dict[str, Any]:
         "client_base": f"http://{config.API_HOST}:{config.API_PORT}/grok/v1",
         "base_path": "/grok/v1",
         "select": "自动取号（新注册/没降智优先 + 粘性会话 + 轮询）",
-        "proxy": str(config.PROXY or "").strip(),
+        "proxy": ", ".join(proxypool.redact(u) for u in proxypool.urls())
+        or str(config.PROXY or "").strip(),
         "stats": stats,
         "logs": logs,
         "cooled_accounts": cooled,
@@ -796,8 +825,8 @@ def _openai_error(message: str, status: int = 502) -> bytes:
     ).encode("utf-8")
 
 
-def _proxy_kwargs() -> dict[str, Any]:
-    proxy = str(config.PROXY or "").strip()
+def _proxy_kwargs(proxy: str | None = None) -> dict[str, Any]:
+    url = proxypool.current() if proxy is None else proxy
     kwargs: dict[str, Any] = {
         "timeout": (_CONNECT_TIMEOUT, _READ_TIMEOUT),
         "allow_redirects": False,
@@ -806,8 +835,8 @@ def _proxy_kwargs() -> dict[str, Any]:
         # 强制 HTTP/1.1：规避 HTTP/2 帧层兼容问题（curl 92 PROTOCOL_ERROR reset）
         "http_version": "v1",
     }
-    if proxy:
-        kwargs["proxy"] = proxy
+    if url:
+        kwargs["proxy"] = url
     return kwargs
 
 
@@ -941,6 +970,7 @@ def _proxy_direct(
     usage: dict[str, int] = {"prompt_tokens": 0, "completion_tokens": 0, "cache_tokens": 0, "reasoning_tokens": 0}
     acc_us: StreamUsageAccumulator | None = None
 
+    used_proxy = proxypool.pick()
     try:
         is_stream = False
         raw_chunks = None
@@ -953,7 +983,7 @@ def _proxy_direct(
                     headers=headers,
                     data=body if body else None,
                     stream=stream_flag,
-                    **_proxy_kwargs(),
+                    **_proxy_kwargs(used_proxy),
                 )
                 status = int(upstream.status_code)
                 if status < 400:
@@ -971,8 +1001,6 @@ def _proxy_direct(
                 break
             except requests.RequestsError as exc:
                 code = curl_error_code(exc)
-                proxy = str(config.PROXY or "").strip()
-                proxy_ready = proxy_endpoint_ready(proxy, timeout=0.2) if proxy else True
                 can_retry = (
                     request_attempt == 0
                     and bytes_out == 0
@@ -981,11 +1009,16 @@ def _proxy_direct(
                 )
                 logger.warning(
                     f"[Grok网关] 上游请求异常 curl={code or 'unknown'} "
-                    f"proxy={'ready' if proxy_ready else 'down'} "
+                    f"proxy={proxypool.status_label(used_proxy)} "
                     f"attempt={request_attempt + 1}/2 retry={can_retry}"
                 )
+                if used_proxy:
+                    proxypool.mark_fail(used_proxy)
                 if not can_retry:
                     raise
+                nxt = proxypool.pick(exclude=used_proxy)
+                if nxt:
+                    used_proxy = nxt
                 if upstream is not None:
                     upstream.close()
                     upstream = None
@@ -1043,11 +1076,9 @@ def _proxy_direct(
             logger.warning(f"[Grok网关] 客户端断开 {method} {path} {who} HTTP {status}")
     except Exception as exc:
         code = curl_error_code(exc)
-        proxy = str(config.PROXY or "").strip()
-        proxy_ready = proxy_endpoint_ready(proxy, timeout=0.2) if proxy else True
         err = (
             f"{type(exc).__name__} curl={code or 'unknown'} "
-            f"proxy={'ready' if proxy_ready else 'down'} bytes_out={bytes_out}: {exc}"
+            f"proxy={proxypool.status_label(used_proxy)} bytes_out={bytes_out}: {exc}"
         )
         logger.error(f"[Grok网关] 转发失败 {method} {path} {who} {err}")
         if not response_started and not handler.wfile.closed:
@@ -1118,6 +1149,7 @@ def _proxy_hold(
     - 客户端断开 → 中止重试。
     """
     tried: set[int] = set()
+    proxy_swapped: set[int] = set()
     attempt = 0
     net_failures = 0
     consecutive_withholds = 0
@@ -1158,6 +1190,7 @@ def _proxy_hold(
         response_started = False
         ta = time.monotonic()
         bytes_out = 0
+        used_proxy = proxypool.pick()
         try:
             upstream = requests.request(
                 method,
@@ -1165,7 +1198,7 @@ def _proxy_hold(
                 headers=_forward_headers(handler.headers, token),
                 data=body if body else None,
                 stream=True,
-                **_proxy_kwargs(),
+                **_proxy_kwargs(used_proxy),
             )
             status = int(upstream.status_code)
             if status < 400:
@@ -1195,6 +1228,11 @@ def _proxy_hold(
                             account_email=email or None, usage=usage,
                             ip=client_ip, client_ua=client_ua,
                         )
+                        if _retry_quality_via_proxy(
+                            account_id, used_proxy, proxy_swapped, who
+                        ):
+                            continue
+                        tried.add(account_id)
                         action = mark_quality_hit(account_id)
                         logger.warning(
                             f"[Grok网关] 扣流命中降智 {who} reason={reason} "
@@ -1273,7 +1311,7 @@ def _proxy_hold(
                 deliver = verdict != HOLD_WITHHOLD
 
             if not deliver:
-                # 降智：丢弃已扣内容，记 strike 后换号重试（客户端看不到本次响应）
+                # 降智：丢弃已扣内容。先换出口 IP 同号重试；确认不是 IP 再给账号记 strike。
                 usage = acc_us.result()
                 err = f"quality_degraded:{withhold_reason}"
                 _record(
@@ -1284,6 +1322,11 @@ def _proxy_hold(
                     account_email=email or None, usage=usage,
                     ip=client_ip, client_ua=client_ua,
                 )
+                if _retry_quality_via_proxy(
+                    account_id, used_proxy, proxy_swapped, who
+                ):
+                    continue
+                tried.add(account_id)
                 action = mark_quality_hit(account_id)
                 consecutive_withholds += 1
                 if consecutive_withholds >= _HOLD_MAX_CONSECUTIVE_WITHHOLDS:
@@ -1396,11 +1439,11 @@ def _proxy_hold(
             continue
         except Exception as exc:
             code = curl_error_code(exc)
-            proxy = str(config.PROXY or "").strip()
-            proxy_ready = proxy_endpoint_ready(proxy, timeout=0.2) if proxy else True
+            if used_proxy:
+                proxypool.mark_fail(used_proxy)
             err = (
                 f"{type(exc).__name__} curl={code or 'unknown'} "
-                f"proxy={'ready' if proxy_ready else 'down'} bytes_out={bytes_out}: {exc}"
+                f"proxy={proxypool.status_label(used_proxy)} bytes_out={bytes_out}: {exc}"
             )
             logger.error(f"[Grok网关] 扣流转发失败 {method} {path} {who} {err}")
             if not response_started and not handler.wfile.closed:

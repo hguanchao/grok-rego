@@ -131,7 +131,6 @@ _PROFILES: dict[str, _Profile] = {
     ),
 }
 
-LEVELS: tuple[str, ...] = ("light", "normal", "heavy")
 DEFAULT_LEVEL = "normal"
 
 # 键位相邻表：错字时敲成手滑键，再回删重打

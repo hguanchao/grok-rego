@@ -16,6 +16,7 @@ export interface AppConfig {
   yyds_api_base: string;
   yyds_api_key: string;
   proxy: string;
+  proxies?: string[];
   auth_enabled: boolean;
   g2a_base_url: string;
   g2a_username: string;
@@ -468,6 +469,20 @@ export interface GatewayOpsData {
   };
   config: {
     proxy: string;
+    proxy_pool?: {
+      total: number;
+      cooling: number;
+      disabled?: number;
+      items: {
+        display: string;
+        /** 本机出口（回环地址）：常驻可用，不参与冷却与降智排除 */
+        local?: boolean;
+        cooling: boolean;
+        cool_left_sec: number;
+        strikes?: number;
+        disabled?: boolean;
+      }[];
+    };
     free_models: string[];
     api_key: string;
     auth_enabled: boolean;

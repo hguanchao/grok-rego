@@ -18,6 +18,7 @@ from collections.abc import Callable
 from typing import Any
 
 from core import config
+from core import proxypool
 from core.util import now_iso_tz
 from db import (
     STATUS_ACTIVE,
@@ -135,6 +136,7 @@ def ops_snapshot() -> dict[str, Any]:
         "account_pool": _account_pool(),
         "config": {
             "proxy": str(config.PROXY or "").strip(),
+            "proxy_pool": proxypool.snapshot(),
             "free_models": free_models,
             # 鉴权密钥完整返回（仅本机管理面使用，与其它敏感配置同策）
             "api_key": config.GATEWAY_API_KEY,

@@ -20,7 +20,6 @@ from typing import Any
 
 from curl_cffi import requests
 
-from core import config
 from core.config import OAUTH2_CLIENT_ID, OAUTH2_ISSUER, OAUTH2_SCOPES
 from core.logger import logger
 from core.util import curl_error_code, proxy_endpoint_ready
@@ -280,7 +279,9 @@ def _poll_device_token(
     grace_deadline = started + grace
     poll_deadline = started + _POLL_DEADLINE
     interval = max(1, int(device.get("interval") or 2))
-    session = _chrome_session(str(config.PROXY or "").strip())
+    from core import proxypool
+
+    session = _chrome_session(proxypool.current())
     round_n = 0
 
     while time.time() < poll_deadline:
@@ -370,7 +371,9 @@ def auth_with_sso(sso_cookie: Any) -> tuple[dict[str, Any] | None, str]:
         return None, "缺少 sso cookie，无法自动认证（需重新注册获取 SSO）"
 
     logger.info("[认证] SSO 协议级自动认证开始")
-    session = _build_sso_session(sso_value, proxy=str(config.PROXY or "").strip())
+    from core import proxypool
+
+    session = _build_sso_session(sso_value, proxy=proxypool.current())
     if session is None:
         logger.error("[认证] sso 会话构建失败")
         return None, "sso 会话构建失败"
@@ -409,13 +412,15 @@ def refresh_token(token: str) -> tuple[dict[str, Any] | None, int]:
 
     网络异常时 http_status=0；成功时 http_status=200。
     """
-    proxy = str(config.PROXY or "").strip()
-    proxies = {"http": proxy, "https": proxy} if proxy else None
+    from core import proxypool
+
+    proxy = proxypool.current()
     if proxy and not proxy_endpoint_ready(proxy):
         logger.warning("[认证] token 刷新跳过：代理未就绪")
         return None, 0
 
     for attempt in range(len(_REFRESH_RETRY_DELAYS) + 1):
+        proxies = {"http": proxy, "https": proxy} if proxy else None
         try:
             resp = requests.post(
                 _TOKEN_ENDPOINT,
@@ -432,17 +437,21 @@ def refresh_token(token: str) -> tuple[dict[str, Any] | None, int]:
             )
         except requests.RequestsError as exc:
             code = curl_error_code(exc)
-            proxy_ready = proxy_endpoint_ready(proxy, timeout=0.2) if proxy else True
             can_retry = code in _SAFE_REFRESH_RETRY_CODES and attempt < len(
                 _REFRESH_RETRY_DELAYS
             )
             logger.warning(
                 f"[认证] token 刷新请求异常: {type(exc).__name__} "
-                f"curl={code or 'unknown'} proxy={'ready' if proxy_ready else 'down'} "
+                f"curl={code or 'unknown'} proxy={proxypool.status_label(proxy)} "
                 f"retry={can_retry}"
             )
+            if proxy:
+                proxypool.mark_fail(proxy)
             if not can_retry:
                 return None, 0
+            nxt = proxypool.pick(exclude=proxy)
+            if nxt:
+                proxy = nxt
             time.sleep(_REFRESH_RETRY_DELAYS[attempt])
             continue
         try:

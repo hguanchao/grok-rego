@@ -16,22 +16,25 @@ import time
 from collections import deque
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 from urllib.parse import urlparse
 
 from curl_cffi import requests
 
 from core import config
+from core import proxypool
 from core.logger import logger
-from core.util import curl_error_code, now_iso_tz, proxy_endpoint_ready
+from core.util import curl_error_code, now_iso_tz
 from db import insert_usage
 from gateway import egress
 from gateway.paths import ensure_local_v1, resource_path, upstream_url
-from gateway.aliases import RouteKind, resolve_body_model, resolve_model
+from gateway.aliases import RouteKind, resolve_model
 from gateway.anthropic import (
     chat_to_message,
     claude_code_model_entries,
     count_tokens,
+    flatten_tool_choice_for_responses,
+    flatten_tools_for_responses,
     is_count_tokens_path,
     is_messages_path,
     iter_anthropic_sse,
@@ -181,7 +184,8 @@ def snapshot() -> dict[str, Any]:
         "base_path": "/zen/v1",
         "key": ZEN_KEY,
         "headers": dict(ZEN_HEADERS),
-        "proxy": str(config.PROXY or "").strip(),
+        "proxy": ", ".join(proxypool.redact(u) for u in proxypool.urls())
+        or str(config.PROXY or "").strip(),
         "stats": stats,
         "logs": logs,
     }
@@ -283,9 +287,9 @@ def _chat_to_responses(src: dict[str, Any]) -> dict[str, Any]:
     if src.get("top_p") is not None:
         out["top_p"] = src.get("top_p")
     if src.get("tools") is not None:
-        out["tools"] = src.get("tools")
+        out["tools"] = flatten_tools_for_responses(src.get("tools"))
     if src.get("tool_choice") is not None:
-        out["tool_choice"] = src.get("tool_choice")
+        out["tool_choice"] = flatten_tool_choice_for_responses(src.get("tool_choice"))
     reasoning = src.get("reasoning")
     if isinstance(reasoning, dict):
         out["reasoning"] = reasoning
@@ -294,19 +298,64 @@ def _chat_to_responses(src: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
-def _extract_meta(body: bytes) -> tuple[str | None, bool]:
-    """从 JSON 体取出 model / stream，解析失败则忽略。"""
+class UpstreamPlan(NamedTuple):
+    """客户端 path + 模型路由 → 上游 path 与翻译方式。"""
+
+    forward_path: str
+    request_xform: str  # none | messages_to_chat | messages_to_responses | chat_to_responses
+    response_kind: str  # none | chat | responses
+
+
+def plan_upstream(path: str, route: RouteKind) -> UpstreamPlan:
+    """一张表决定转发目标，避免 translate/use_responses 两个 bool 互斥组合。
+
+    /messages + RESPONSES 必须译到 /responses（muse 打上游 /messages 必 500）。
+    """
+    if is_count_tokens_path(path):
+        return UpstreamPlan(path, "none", "none")
+    if is_messages_path(path):
+        if route == RouteKind.NATIVE:
+            return UpstreamPlan(path, "none", "none")
+        if route == RouteKind.RESPONSES:
+            return UpstreamPlan("/zen/v1/responses", "messages_to_responses", "responses")
+        return UpstreamPlan("/zen/v1/chat/completions", "messages_to_chat", "chat")
+    if route == RouteKind.RESPONSES and path.rstrip("/").endswith("/chat/completions"):
+        return UpstreamPlan("/zen/v1/responses", "chat_to_responses", "none")
+    return UpstreamPlan(path, "none", "none")
+
+
+def apply_request_xform(plan: UpstreamPlan, src: dict[str, Any]) -> dict[str, Any]:
+    """按 plan 把请求体译到上游协议；none 原样返回。"""
+    kind = plan.request_xform
+    if kind == "messages_to_chat":
+        return messages_to_chat(src)
+    if kind == "messages_to_responses":
+        return messages_to_responses(src)
+    if kind == "chat_to_responses":
+        return _chat_to_responses(src)
+    return src
+
+
+def _effort_of(plan: UpstreamPlan, payload: dict[str, Any]) -> str | None:
+    """从已译（或透传）的请求体取推理档位，供用量日志。"""
+    if plan.request_xform in ("messages_to_responses", "chat_to_responses"):
+        rr = payload.get("reasoning")
+        if isinstance(rr, dict) and isinstance(rr.get("effort"), str):
+            return rr["effort"]
+        return None
+    effort = payload.get("reasoning_effort")
+    return str(effort) if isinstance(effort, str) and effort else None
+
+
+def _json_object(body: bytes) -> dict[str, Any] | None:
+    """解析 JSON 对象；空体当 {}；非对象/坏 JSON 返回 None（原样透传字节）。"""
     if not body:
-        return None, False
+        return {}
     try:
-        payload = json.loads(body.decode("utf-8"))
+        obj = json.loads(body.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError):
-        return None, False
-    if not isinstance(payload, dict):
-        return None, False
-    model = payload.get("model")
-    model_s = str(model).strip() if isinstance(model, str) else None
-    return model_s or None, bool(payload.get("stream"))
+        return None
+    return obj if isinstance(obj, dict) else None
 
 
 def _read_body(handler: BaseHTTPRequestHandler) -> bytes:
@@ -401,7 +450,7 @@ def _wrap_upstream_error(raw: bytes, anthropic: bool, status: int = 400) -> byte
     try:
         obj = json.loads(text)
     except (UnicodeDecodeError, json.JSONDecodeError):
-        return _anthropic_error(text[:400] or "upstream error", status)
+        return _anthropic_error(text[:400] or f"upstream {status} (empty body)", status)
     if isinstance(obj, dict) and obj.get("type") == "error":
         return raw
     err = obj.get("error") if isinstance(obj, dict) else None
@@ -413,11 +462,11 @@ def _wrap_upstream_error(raw: bytes, anthropic: bool, status: int = 400) -> byte
     if isinstance(err, str) and err:
         return _anthropic_error(err, status)
     # 标准 error 结构缺失时透传原文片段，避免 CLI 只看到无信息的 "upstream error"
-    return _anthropic_error(text.strip()[:400] or "upstream error", status)
+    return _anthropic_error(text.strip()[:400] or f"upstream {status} (empty body)", status)
 
 
-def _proxy_kwargs() -> dict[str, Any]:
-    proxy = str(config.PROXY or "").strip()
+def _proxy_kwargs(proxy: str | None = None) -> dict[str, Any]:
+    url = proxypool.current() if proxy is None else proxy
     kwargs: dict[str, Any] = {
         "timeout": (_CONNECT_TIMEOUT, _READ_TIMEOUT),
         "allow_redirects": False,
@@ -425,8 +474,8 @@ def _proxy_kwargs() -> dict[str, Any]:
         # 强制 HTTP/1.1：规避 HTTP/2 帧层兼容问题（curl 92 PROTOCOL_ERROR reset）
         "http_version": "v1",
     }
-    if proxy:
-        kwargs["proxy"] = proxy
+    if url:
+        kwargs["proxy"] = url
     return kwargs
 
 
@@ -539,19 +588,26 @@ def proxy(handler: BaseHTTPRequestHandler, method: str, path: str) -> None:
         )
         return
 
-    # 单别名表（gateway.aliases）：一次查表同时确定上游模型 + 路由，
-    # 替代旧三层串行改名（_map_body_model → rewrite_body_model → rewrite_model_id）。
-    body = resolve_body_model(body)
-    model, stream_flag = _extract_meta(body)
-    model, route = resolve_model(model)
+    # JSON 只解一次：改名 + 路由 + 请求翻译都吃同一份 dict。
+    src = _json_object(body)
+    model: str | None = None
+    route = RouteKind.CHAT
+    stream_flag = False
+    rewritten = False
+    if src is not None:
+        raw_model = src["model"] if isinstance(src.get("model"), str) else None
+        model, route = resolve_model(raw_model)
+        if model is not None and src.get("model") != model:
+            src["model"] = model
+            rewritten = True
+        stream_flag = bool(src.get("stream"))
     anthropic_client = is_messages_path(path)
-    translate = anthropic_client and route == RouteKind.CHAT
-    use_responses = route == RouteKind.RESPONSES  # muse 等仅支持 /responses，单独走 responses 路由
-    # 推理档位：翻译路径取转换后 chat 体，直连路径读原始 reasoning_effort
     effort_flag: str | None = None
 
     if method in ("POST", "GET") and is_count_tokens_path(path):
-        payload = count_tokens(body)
+        payload = count_tokens(
+            json.dumps(src, ensure_ascii=False).encode("utf-8") if src is not None else body
+        )
         _send_bytes(handler, 200, payload, "application/json; charset=utf-8")
         _record(
             method=method,
@@ -568,57 +624,22 @@ def proxy(handler: BaseHTTPRequestHandler, method: str, path: str) -> None:
         )
         return
 
-    forward_path = path
-    forward_body = body
-    if use_responses and not translate and path.rstrip("/").endswith("/chat/completions"):
-        # @ai-sdk/openai-compatible 会打 /chat/completions；Muse 官方只认 /responses
-        try:
-            src = json.loads(body.decode("utf-8")) if body else {}
-        except (UnicodeDecodeError, json.JSONDecodeError):
-            src = {}
-        if isinstance(src, dict):
-            resp = _chat_to_responses(src)
-            stream_flag = bool(resp.get("stream"))
-            forward_body = json.dumps(resp, ensure_ascii=False).encode("utf-8")
-            rr = resp.get("reasoning") if isinstance(resp.get("reasoning"), dict) else None
-            if isinstance(rr, dict) and isinstance(rr.get("effort"), str):
-                effort_flag = rr["effort"]
-        forward_path = "/zen/v1/responses"
+    plan = plan_upstream(path, route)
+    forward_path = plan.forward_path
+    if forward_path != path:
         query = ""
-    if translate:
-        try:
-            src = json.loads(body.decode("utf-8")) if body else {}
-        except (UnicodeDecodeError, json.JSONDecodeError):
-            src = {}
-        if not isinstance(src, dict):
-            src = {}
-        if use_responses:
-            # muse 等仅支持 /responses：把 Anthropic Messages 译成 Responses 请求体
-            resp = messages_to_responses(src)
-            stream_flag = bool(resp.get("stream"))
-            forward_body = json.dumps(resp, ensure_ascii=False).encode("utf-8")
-            forward_path = "/zen/v1/responses"
-            query = ""
-            effort_flag = None
-            rr = resp.get("reasoning") if isinstance(resp.get("reasoning"), dict) else None
-            if isinstance(rr, dict) and isinstance(rr.get("effort"), str):
-                effort_flag = rr["effort"]
-        else:
-            chat = messages_to_chat(src)
-            stream_flag = bool(chat.get("stream"))
-            forward_body = json.dumps(chat, ensure_ascii=False).encode("utf-8")
-            forward_path = "/zen/v1/chat/completions"
-            query = ""
-            effort_flag = (
-                str(chat["reasoning_effort"]) if "reasoning_effort" in chat else None
-            )
+    if src is None:
+        forward_body = body
+    elif plan.request_xform != "none":
+        transformed = apply_request_xform(plan, src)
+        stream_flag = bool(transformed.get("stream"))
+        effort_flag = _effort_of(plan, transformed)
+        forward_body = json.dumps(transformed, ensure_ascii=False).encode("utf-8")
     else:
-        try:
-            raw_src = json.loads(body.decode("utf-8")) if body else {}
-        except (UnicodeDecodeError, json.JSONDecodeError):
-            raw_src = {}
-        if isinstance(raw_src, dict) and isinstance(raw_src.get("reasoning_effort"), str):
-            effort_flag = raw_src["reasoning_effort"] or None
+        effort_flag = _effort_of(plan, src)
+        forward_body = (
+            json.dumps(src, ensure_ascii=False).encode("utf-8") if rewritten else body
+        )
 
     url = _upstream_url(forward_path, query)
     headers = _forward_headers(handler.headers)
@@ -632,14 +653,16 @@ def proxy(handler: BaseHTTPRequestHandler, method: str, path: str) -> None:
     usage: dict[str, int] = {"prompt_tokens": 0, "completion_tokens": 0, "cache_tokens": 0, "reasoning_tokens": 0}
     acc: StreamUsageAccumulator | None = None
     client_ua = str(handler.headers.get("User-Agent") or "")[:255]
+    used_proxy = ""
 
     try:
         # 仅客户端声明 stream 时上游才开流；否则整包读取，避免 curl_cffi
         # stream=True 下 .content 为空、Content-Length=0 把 keep-alive 打乱。
-        upstream_method = method if not translate else "POST"
+        upstream_method = method if plan.response_kind == "none" else "POST"
         is_stream = False
         raw_chunks = None
         first_raw_chunk = b""
+        used_proxy = proxypool.pick()
         for request_attempt in range(2):
             try:
                 upstream = requests.request(
@@ -648,7 +671,7 @@ def proxy(handler: BaseHTTPRequestHandler, method: str, path: str) -> None:
                     headers=headers,
                     data=forward_body if forward_body else None,
                     stream=stream_flag,
-                    **_proxy_kwargs(),
+                    **_proxy_kwargs(used_proxy),
                 )
                 status = int(upstream.status_code)
                 content_type = (upstream.headers.get("Content-Type") or "").lower()
@@ -664,8 +687,6 @@ def proxy(handler: BaseHTTPRequestHandler, method: str, path: str) -> None:
                 break
             except requests.RequestsError as exc:
                 code = curl_error_code(exc)
-                proxy = str(config.PROXY or "").strip()
-                proxy_ready = proxy_endpoint_ready(proxy, timeout=0.2) if proxy else True
                 can_retry = (
                     request_attempt == 0
                     and bytes_out == 0
@@ -674,11 +695,16 @@ def proxy(handler: BaseHTTPRequestHandler, method: str, path: str) -> None:
                 )
                 logger.warning(
                     f"[网关] 上游请求异常 curl={code or 'unknown'} "
-                    f"proxy={'ready' if proxy_ready else 'down'} "
+                    f"proxy={proxypool.status_label(used_proxy)} "
                     f"attempt={request_attempt + 1}/2 retry={can_retry}"
                 )
+                if used_proxy:
+                    proxypool.mark_fail(used_proxy)
                 if not can_retry:
                     raise
+                nxt = proxypool.pick(exclude=used_proxy)
+                if nxt:
+                    used_proxy = nxt
                 if upstream is not None:
                     upstream.close()
                     upstream = None
@@ -706,34 +732,25 @@ def proxy(handler: BaseHTTPRequestHandler, method: str, path: str) -> None:
                         yield from raw_chunks
 
                 acc = StreamUsageAccumulator()
-                if translate:
-                    # 翻译模式下必须从「上游原始 OpenAI 块」采样 usage——
-                    # 转换后的 Anthropic SSE 只带 output_tokens，会丢 prompt/cache/reasoning
+                if plan.response_kind != "none":
+                    # 必须从「上游原始块」采样 usage——译完的 Anthropic SSE 会丢 prompt/cache
                     def _tee(gen):
                         for c in gen:
                             if c:
                                 acc.feed(c)
                             yield c
 
-                    if use_responses:
-                        chunks = iter_responses_sse(_tee(_with_first_chunk()), model)
+                    src_chunks = _tee(_with_first_chunk())
+                    if plan.response_kind == "responses":
+                        chunks_iter = iter_responses_sse(src_chunks, model)
                     else:
-                        chunks = iter_anthropic_sse(_tee(_with_first_chunk()), model)
-
-                    def _pass(gen):
-                        # 翻译后的块不再重复喂 acc，仅转发
-                        for c in gen:
-                            if c:
-                                yield c
-
-                    chunks_iter = _pass(chunks)
+                        chunks_iter = iter_anthropic_sse(src_chunks, model)
                 else:
                     chunks_iter = _with_first_chunk()
                 for chunk in chunks_iter:
                     if not chunk:
                         continue
-                    if not translate:
-                        # 直连 OpenAI 兼容客户端：旁路采样原始块
+                    if plan.response_kind == "none":
                         acc.feed(chunk)
                     handler.wfile.write(chunk)
                     handler.wfile.flush()
@@ -741,6 +758,9 @@ def proxy(handler: BaseHTTPRequestHandler, method: str, path: str) -> None:
                 usage = acc.result()
         else:
             payload = upstream.content or b""
+            if status >= 400 and not payload:
+                # stream=True 时部分栈上 4xx 的 .content 为空，把剩余块拼回来才能看到真实错误
+                payload = b"".join(upstream.iter_content(chunk_size=4096) or ())
             if status >= 400:
                 # 上游拒收（如超窗/坏工具对）：原文只透传给客户端，err 为空会导致
                 # 用量 reason=None、日志只有 status，事后无法定位。截断记入 err。
@@ -748,20 +768,19 @@ def proxy(handler: BaseHTTPRequestHandler, method: str, path: str) -> None:
                 snippet = " ".join(raw_text.split())[:240]
                 err = f"upstream_{status}:{snippet}" if snippet else f"upstream_{status}"
                 logger.warning(
-                    f"[网关] 上游拒收 {method} {path} model={model or '-'} "
-                    f"status={status} in={len(forward_body)} out={len(payload)} "
-                    f"effort={effort_flag or '-'} err={snippet or '-'}"
+                    f"[网关] 上游拒收 {method} {path} via={forward_path} "
+                    f"model={model or '-'} status={status} in={len(forward_body)} "
+                    f"out={len(payload)} effort={effort_flag or '-'} err={snippet or '-'}"
                 )
             if status < 400 and resource_path(path, "/zen") == "/models":
                 payload = _filter_free_models(payload)
-            elif status < 400 and translate:
+            elif status < 400 and plan.response_kind != "none":
                 try:
                     obj = json.loads(payload.decode("utf-8"))
                 except (UnicodeDecodeError, json.JSONDecodeError):
                     obj = {}
                 if isinstance(obj, dict):
-                    if use_responses:
-                        # Responses 整包响应 → Anthropic Messages
+                    if plan.response_kind == "responses":
                         payload = json.dumps(
                             responses_to_message(obj, model), ensure_ascii=False
                         ).encode("utf-8")
@@ -774,7 +793,7 @@ def proxy(handler: BaseHTTPRequestHandler, method: str, path: str) -> None:
                 payload = _wrap_upstream_error(payload, True, status)
             bytes_out = len(payload)
             ctype = "application/json; charset=utf-8"
-            if not translate and not anthropic_client:
+            if plan.response_kind == "none" and not anthropic_client:
                 ctype = upstream.headers.get("Content-Type") or ctype
             # 非流式：对原始上游响应解析 usage
             if status < 400:
@@ -789,11 +808,10 @@ def proxy(handler: BaseHTTPRequestHandler, method: str, path: str) -> None:
             logger.warning(f"[网关] 客户端断开 {method} {path} HTTP {status}")
     except Exception as exc:
         code = curl_error_code(exc)
-        proxy = str(config.PROXY or "").strip()
-        proxy_ready = proxy_endpoint_ready(proxy, timeout=0.2) if proxy else True
         err = (
             f"{type(exc).__name__} curl={code or 'unknown'} "
-            f"proxy={'ready' if proxy_ready else 'down'} bytes_out={bytes_out}: {exc}"
+            f"proxy={proxypool.status_label(used_proxy)} "
+            f"bytes_out={bytes_out}: {exc}"
         )
         logger.error(f"[网关] 转发失败 {method} {path} {err}")
         if not response_started and not handler.wfile.closed:
@@ -822,11 +840,11 @@ def proxy(handler: BaseHTTPRequestHandler, method: str, path: str) -> None:
             error=err,
             usage=usage,
             effort=effort_flag,
-            ip=egress.current_ip(),
+            ip=egress.current_ip(used_proxy),
             client_ua=client_ua,
         )
         if err != "client_disconnected":
             logger.info(
-                f"[网关] {method} {path} model={model or '-'} "
+                f"[网关] {method} {path} via={forward_path} model={model or '-'} "
                 f"status={status} {ms}ms in={len(body)} out={bytes_out} effort={effort_flag or '-'}"
             )

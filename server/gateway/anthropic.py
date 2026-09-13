@@ -1,8 +1,11 @@
 """
 Claude Code / Anthropic Messages 适配。
 
-Claude Code 固定打 `/zen/v1/messages`。Zen 免费模型只认 `/v1/chat/completions`，
-把 Messages 请求转成 Chat Completions，再把响应转回 Messages / SSE。
+Claude Code 固定打 `/zen/v1/messages`。按模型路由译到上游：
+CHAT → `/v1/chat/completions`，RESPONSES（muse）→ `/v1/responses`，
+NATIVE（claude-/qwen）原样透传。响应再转回 Messages / SSE。
+
+模型改名与路由判定在 ``gateway.aliases``，本模块只做协议翻译。
 """
 
 from __future__ import annotations
@@ -14,17 +17,7 @@ from typing import Any
 
 from core.logger import logger
 
-_NATIVE_MESSAGES_PREFIX = ("claude-", "qwen")
-_FREE_UPSTREAM = "big-pickle"
-# Claude Code 内置档位 / 全名 → 免费模型（Zen public 密钥打不了付费 Claude）
-_CLAUDE_CODE_ALIAS_PREFIX = (
-    "claude-haiku",
-    "claude-sonnet",
-    "claude-opus",
-    "claude-fable",
-    "claude-3",
-)
-_CLAUDE_CODE_SHORT = {"haiku", "sonnet", "opus", "fable"}
+# GET /models 注入的 Claude Code 可识别 id（Zen public 密钥打不了付费 Claude）
 _CLAUDE_CODE_MODELS = (
     ("claude-haiku-4-5", "Haiku"),
     ("claude-sonnet-4-5", "Sonnet"),
@@ -83,24 +76,6 @@ def effort_from_body(payload: dict[str, Any]) -> str | None:
     return "low" if budget > 0 else None
 
 
-# NOTE（方案 A 第一步）：改名逻辑已收敛到 gateway.aliases.resolve_model，
-# 此处旧函数 rewrite_model_id / rewrite_body_model 仅作兼容垫片保留，
-# 供单测冻结旧行为；opencode.proxy 已切单表。新代码一律用 aliases.resolve_model。
-def rewrite_model_id(model: str | None) -> str | None:
-    """[兼容垫片] 等价于 aliases.resolve_model(model)[0]，待调用方清零后删除。"""
-    from gateway.aliases import resolve_model
-
-    mapped, _ = resolve_model(model)
-    return mapped
-
-
-def rewrite_body_model(body: bytes) -> bytes:
-    """[兼容垫片] 等价于 aliases.resolve_body_model(body)，待调用方清零后删除。"""
-    from gateway.aliases import resolve_body_model
-
-    return resolve_body_model(body)
-
-
 def claude_code_model_entries() -> list[dict[str, Any]]:
     """注入 Claude Code 能识别的 id，供 GET /v1/models 发现。"""
     now = int(time.time())
@@ -130,14 +105,6 @@ def is_messages_path(path: str) -> bool:
 def is_count_tokens_path(path: str) -> bool:
     p = path.rstrip("/")
     return p == "/zen/v1/messages/count_tokens" or p.endswith("/v1/messages/count_tokens")
-
-
-def uses_chat_completions(model: str | None) -> bool:
-    """免费 / OpenAI-compat 模型走 chat/completions，不走原生 /messages。"""
-    ident = (model or "").strip().lower()
-    if not ident:
-        return True
-    return not ident.startswith(_NATIVE_MESSAGES_PREFIX)
 
 
 def _text_of(content: Any) -> str:
@@ -233,6 +200,59 @@ def _convert_tool_choice(choice: Any) -> Any:
     if ctype in ("auto", "any", "required", "none"):
         return "required" if ctype in ("any", "required") else ctype
     return None
+
+
+def flatten_tools_for_responses(tools: Any) -> list[dict[str, Any]]:
+    """Chat 嵌套 ``function`` 或 Anthropic tools → Responses 扁平 tools。
+
+    上游 /responses 要 ``tools[0].name``，不认 ``tools[0].function.name``，
+    否则 400 missing required field name。
+    """
+    out: list[dict[str, Any]] = []
+    if not isinstance(tools, list):
+        return out
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        fn = tool.get("function") if isinstance(tool.get("function"), dict) else None
+        if fn is not None:
+            name = fn.get("name")
+            desc = fn.get("description") or ""
+            params = fn.get("parameters") or {"type": "object", "properties": {}}
+        else:
+            name = tool.get("name")
+            desc = tool.get("description") or ""
+            params = tool.get("input_schema") or tool.get("parameters") or {
+                "type": "object",
+                "properties": {},
+            }
+        if not name:
+            continue
+        out.append(
+            {
+                "type": "function",
+                "name": name,
+                "description": desc,
+                "parameters": params,
+            }
+        )
+    return out
+
+
+def flatten_tool_choice_for_responses(choice: Any) -> Any:
+    """Chat ``{type:function, function:{name}}`` → Responses ``{type:function, name}``。"""
+    if isinstance(choice, dict):
+        fn = choice.get("function") if isinstance(choice.get("function"), dict) else None
+        if fn and fn.get("name"):
+            return {"type": "function", "name": fn["name"]}
+        if str(choice.get("type") or "") == "function" and choice.get("name"):
+            return {"type": "function", "name": choice["name"]}
+    converted = _convert_tool_choice(choice)
+    if isinstance(converted, dict):
+        fn = converted.get("function") if isinstance(converted.get("function"), dict) else None
+        if fn and fn.get("name"):
+            return {"type": "function", "name": fn["name"]}
+    return converted
 
 
 def _convert_sampling(payload: dict[str, Any], out: dict[str, Any]) -> None:
@@ -666,23 +686,6 @@ def iter_anthropic_sse(openai_chunks: Iterator[bytes], model: str | None) -> Ite
 # Anthropic Messages（整包 + SSE）。reasoning 摘要为加密/空时不透出，message 文本
 # 逐块翻译为 Anthropic text 块；usage 由 opencode.py 侧按原始响应采样，不在此。
 
-# 仅支持 Responses API（不支持 chat/completions）的模型前缀白名单
-_RESPONSES_ONLY_PREFIX = ("muse-spark-",)
-
-
-def uses_responses(model: str | None) -> bool:
-    """该模型仅支持 OpenAI Responses API（/responses），不走 chat/completions。
-
-
-    muse 系列免费模型实测 /chat/completions 必返 500，仅 /responses 可用，
-    故为其单独开 responses 路由。
-    """
-    ident = (model or "").strip().lower()
-    if not ident:
-        return False
-    return ident.startswith(_RESPONSES_ONLY_PREFIX)
-
-
 def _parse_json_obj(raw: Any) -> dict[str, Any]:
     """安全地把 JSON 字符串/对象解析为 dict；非法输入返回空 dict。"""
     if isinstance(raw, dict):
@@ -797,14 +800,17 @@ def messages_to_responses(payload: dict[str, Any]) -> dict[str, Any]:
         if _resp_eff not in ("none", "minimal", "low", "medium", "high", "xhigh"):
             _resp_eff = "high"
         out["reasoning"] = {"effort": _resp_eff, "summary": "concise"}
-    _convert_sampling(payload, out)
-    # Responses 的 max_tokens 语义是输出上限，同步一份 max_output_tokens
+    # 不调用 _convert_sampling：chat 的 max_tokens / stop 对 /responses 是 unknown parameter，必 400
+    if payload.get("temperature") is not None:
+        out["temperature"] = payload.get("temperature")
+    if payload.get("top_p") is not None:
+        out["top_p"] = payload.get("top_p")
     if payload.get("max_tokens") is not None:
         out["max_output_tokens"] = payload.get("max_tokens")
-    converted = _convert_tools(payload.get("tools"))
+    converted = flatten_tools_for_responses(payload.get("tools"))
     if converted:
         out["tools"] = converted
-    tool_choice = _convert_tool_choice(payload.get("tool_choice"))
+    tool_choice = flatten_tool_choice_for_responses(payload.get("tool_choice"))
     if tool_choice is not None:
         out["tool_choice"] = tool_choice
     return out

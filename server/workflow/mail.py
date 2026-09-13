@@ -21,7 +21,10 @@ _domain_index = 0
 
 def _proxies() -> dict[str, str] | None:
     """按当前配置返回 curl_cffi proxies；避免 from-import 快照过期。"""
-    return {"http": config.PROXY, "https": config.PROXY} if config.PROXY else None
+    from core import proxypool
+
+    proxy = proxypool.current()
+    return {"http": proxy, "https": proxy} if proxy else None
 
 
 def _pick_domain() -> str:

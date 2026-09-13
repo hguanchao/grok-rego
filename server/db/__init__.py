@@ -441,32 +441,6 @@ def update_account_tokens(
         return cursor.rowcount > 0
 
 
-def update_account_sso_cookie(
-    account_id: int,
-    sso_cookie: str,
-    reason: str | None = None,
-) -> bool:
-    """按 id 回写 sso_cookie（补 cookie / 重登会话），不改动 token。"""
-    value = str(sso_cookie or "").strip()
-    if not value:
-        return False
-    with connect() as conn:
-        cursor = conn.cursor()
-        cursor.execute(
-            "UPDATE accounts SET sso_cookie=?, "
-            "reason=COALESCE(?, reason), updated_at=? "
-            "WHERE id=? AND COALESCE(is_deleted, 0) = 0",
-            (value, reason, now_iso_tz(), account_id),
-        )
-        conn.commit()
-        ok = cursor.rowcount > 0
-    if ok:
-        logger.success(f"[数据库] 已更新 SSO cookie (ID: {account_id})")
-    else:
-        logger.warning(f"[数据库] 未更新 SSO cookie (ID: {account_id})")
-    return ok
-
-
 def get_all_accounts() -> list[dict[str, Any]]:
     """获取所有账号列表。"""
     with connect() as conn:

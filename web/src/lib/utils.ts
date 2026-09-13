@@ -228,3 +228,24 @@ export function groupLogsByWorker(entries: LogEntry[]): ThreadLogGroup[] {
   const { main, auth, workers } = groupRegisterLogs(entries);
   return [main, auth, ...workers].filter((g): g is ThreadLogGroup => g != null);
 }
+
+/** 配置里的代理列表 ↔ 文本框（一行一条，# 开头忽略）。 */
+export function proxiesToText(list: string[] | undefined, fallback = ""): string {
+  if (Array.isArray(list) && list.length > 0) {
+    return list.join("\n");
+  }
+  return fallback;
+}
+
+export function textToProxies(text: string): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const line of text.replace(/[;,]/g, "\n").split("\n")) {
+    const url = line.trim();
+    if (!url || url.startsWith("#")) continue;
+    if (seen.has(url)) continue;
+    seen.add(url);
+    out.push(url);
+  }
+  return out;
+}

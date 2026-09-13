@@ -5,7 +5,7 @@ from __future__ import annotations
 """
 号池账号上游活体探测客户端。
 
-- HTTP 直连 curl_cffi（Chrome TLS 指纹），代理走 config.PROXY
+- HTTP 直连 curl_cffi（Chrome TLS 指纹），代理走代理池
 - 探活走 GET /billing 验证 token 有效性（不计费、不消耗生成额度）
 - 降智判定已移交网关被动审计（gateway/quality.py）：命中→冷却 12h→再犯长期排除
 - 网络失败自动重试一次
@@ -19,7 +19,6 @@ from typing import Any
 
 from curl_cffi import requests
 
-from core import config
 from core.config import UPSTREAM_BASE
 from core.logger import logger
 from core.mutex import acquire as mutex_acquire, release as mutex_release
@@ -92,7 +91,9 @@ class ProbeClient:
           elapsed_ms      请求耗时（毫秒）
         """
         result: dict[str, Any] = {"status_code": 0, "error": "", "elapsed_ms": 0}
-        use_proxy = str(proxy or config.PROXY or "").strip()
+        from core import proxypool
+
+        use_proxy = str(proxy or proxypool.pick() or "").strip()
         email = str(account.get("email") or "").strip()
         if not use_proxy:
             result["error"] = "探活强制走代理，未配置 proxy"
@@ -592,7 +593,9 @@ class PoolJobManager:
             t0 = time.monotonic()
             aid = int(acc.get("id") or 0)
             logger.info(f"[巡检] {_who(acc)} 开始探活")
-            result = self._probe_client.probe(acc, proxy=str(config.PROXY or "").strip())
+            from core import proxypool
+
+            result = self._probe_client.probe(acc, proxy=proxypool.pick())
             status = int(result.get("status_code") or 0)
             detail = str(result.get("error") or "").strip()
 
@@ -695,7 +698,9 @@ class PoolJobManager:
         fresh["access_token"] = new_token
         if new_refresh:
             fresh["refresh_token"] = new_refresh
-        result = self._probe_client.probe(fresh, proxy=str(config.PROXY or "").strip())
+        from core import proxypool
+
+        result = self._probe_client.probe(fresh, proxy=proxypool.pick())
         reprobe_status = int(result.get("status_code") or 0)
         if _HTTP_OK_MIN <= reprobe_status <= _HTTP_OK_MAX:
             touch_inspected(aid)

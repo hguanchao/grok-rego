@@ -7,6 +7,7 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import {
   Activity,
+  Cable,
   Check,
   CircleHelp,
   Copy,
@@ -30,7 +31,7 @@ import {
   type AppConfig,
   type GatewayOpsData,
 } from "@/lib/api";
-import { cn } from "@/lib/utils";
+import { cn, proxiesToText, textToProxies } from "@/lib/utils";
 
 /** 自动刷新间隔 / 手感最短转圈时长 */
 const AUTO_REFRESH_MS = 15_000;
@@ -97,8 +98,10 @@ export function GatewayPage() {
   const [refreshing, setRefreshing] = useState(false);
   const [regenerating, setRegenerating] = useState(false);
   const [savingVersion, setSavingVersion] = useState(false);
+  const [savingProxies, setSavingProxies] = useState(false);
   const [apiKey, setApiKey] = useState("");
   const [clientVersion, setClientVersion] = useState("");
+  const [proxyText, setProxyText] = useState("");
   const [settingsLoaded, setSettingsLoaded] = useState(false);
   const [copied, setCopied] = useState<string | null>(null);
   const seq = useRef(0);
@@ -134,6 +137,7 @@ export function GatewayPage() {
       const raw: AppConfig = await fetchConfig();
       setApiKey(raw.gateway_api_key || "");
       setClientVersion(raw.grok_version || "1.0.16");
+      setProxyText(proxiesToText(raw.proxies, raw.proxy || ""));
       setSettingsLoaded(true);
     } catch (err) {
       toast.error(err instanceof ApiError ? err.message : "加载网关配置失败");
@@ -181,6 +185,22 @@ export function GatewayPage() {
       toast.error(err instanceof ApiError ? err.message : "保存 Grok 客户端版本号失败");
     } finally {
       setSavingVersion(false);
+    }
+  };
+
+  const handleSaveProxies = async () => {
+    if (savingProxies) return;
+    setSavingProxies(true);
+    try {
+      const list = textToProxies(proxyText);
+      const next = await saveConfig({ proxies: list });
+      setProxyText(proxiesToText(next.proxies, next.proxy || ""));
+      toast.success(list.length ? `代理池已保存（${list.length} 条）` : "代理池已清空，将直连");
+      await loadOps(true);
+    } catch (err) {
+      toast.error(err instanceof ApiError ? err.message : "保存代理池失败");
+    } finally {
+      setSavingProxies(false);
     }
   };
 
@@ -468,6 +488,74 @@ export function GatewayPage() {
                     autoComplete="off"
                     disabled={!settingsLoaded}
                   />
+                </div>
+
+                <div className="gw-section">
+                  <div className="gw-editor-head">
+                    <div className="gw-editor-title">
+                      <Cable className="size-3.5" strokeWidth={1.6} aria-hidden />
+                      <span>代理池</span>
+                      <LabelHelp tip="一行一条 HTTP/SOCKS 代理。注册线程粘性绑定同一条；网关每次请求轮询，失败冷却 60 秒后换下一条。" />
+                    </div>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      disabled={savingProxies || !settingsLoaded}
+                      onClick={() => void handleSaveProxies()}
+                      title="保存到 config.json，立即用于注册与网关"
+                      aria-busy={savingProxies}
+                    >
+                      {savingProxies ? (
+                        <LoaderCircle className="size-3.5 animate-spin" strokeWidth={1.6} />
+                      ) : null}
+                      保存
+                    </Button>
+                  </div>
+                  <textarea
+                    className={cn(
+                      "gw-editor-input font-mono min-h-[88px] w-full resize-y rounded-md border border-input bg-background px-2.5 py-1.5 text-[12px] leading-relaxed outline-none",
+                      "focus-visible:border-primary/50 focus-visible:ring-1 focus-visible:ring-primary/20",
+                      "disabled:pointer-events-none disabled:cursor-not-allowed disabled:opacity-50",
+                    )}
+                    value={proxyText}
+                    onChange={(e) => setProxyText(e.target.value)}
+                    placeholder={"http://127.0.0.1:7890\nhttp://user:pass@host:port"}
+                    aria-label="代理池"
+                    spellCheck={false}
+                    autoComplete="off"
+                    disabled={!settingsLoaded}
+                  />
+                  {data?.config.proxy_pool ? (
+                    <p className="gw-proxy-meta">
+                      {data.config.proxy_pool.total} 条
+                      {data.config.proxy_pool.cooling
+                        ? ` · 冷却 ${data.config.proxy_pool.cooling}`
+                        : ""}
+                      {data.config.proxy_pool.disabled
+                        ? ` · 排除 ${data.config.proxy_pool.disabled}`
+                        : ""}
+                      {data.config.proxy_pool.items.some((i) => i.local)
+                        ? ` · 本机出口 ${
+                            data.config.proxy_pool.items.filter((i) => i.local).length
+                          }（不冷却）`
+                        : ""}
+                      {data.config.proxy_pool.items.some(
+                        (i) => i.cooling || i.disabled || (i.strikes ?? 0) > 0,
+                      )
+                        ? `（${data.config.proxy_pool.items
+                            .filter(
+                              (i) => i.cooling || i.disabled || (i.strikes ?? 0) > 0,
+                            )
+                            .map((i) => {
+                              if (i.disabled) return `${i.display} 排除`;
+                              if (i.cooling) return `${i.display} 冷却 ${i.cool_left_sec}s`;
+                              return `${i.display} 观察`;
+                            })
+                            .join(" · ")}）`
+                        : ""}
+                    </p>
+                  ) : null}
                 </div>
 
               </section>
