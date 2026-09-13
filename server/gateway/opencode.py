@@ -27,6 +27,7 @@ from core.util import curl_error_code, now_iso_tz, proxy_endpoint_ready
 from db import insert_usage
 from gateway import egress
 from gateway.paths import ensure_local_v1, resource_path, upstream_url
+from gateway.aliases import RouteKind, resolve_body_model, resolve_model
 from gateway.anthropic import (
     chat_to_message,
     claude_code_model_entries,
@@ -38,10 +39,6 @@ from gateway.anthropic import (
     messages_to_chat,
     messages_to_responses,
     responses_to_message,
-    rewrite_body_model,
-    rewrite_model_id,
-    uses_chat_completions,
-    uses_responses,
 )
 from gateway.usage import StreamUsageAccumulator, extract_nonstream
 
@@ -227,34 +224,6 @@ def local_model_entries() -> list[dict[str, Any]]:
     ]
     _models_cache = (stat.st_mtime, stat.st_size, items)
     return items
-
-
-def _zen_models_dict() -> dict[str, str]:
-    """读 zen-models.json 扁平映射表（key=cli 模型 id，value=实际上游模型 id）。"""
-    try:
-        data = json.loads(_MODELS_JSON.read_text(encoding="utf-8"))
-        return data if isinstance(data, dict) else {}
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-        return {}
-
-
-def _map_body_model(body: bytes) -> bytes:
-    """请求体 model 查表透传：cli 传 key → zen-models.json 命中则替换为 value，未命中原样。"""
-    if not body:
-        return body
-    try:
-        payload = json.loads(body.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError):
-        return body
-    if not isinstance(payload, dict) or not isinstance(payload.get("model"), str):
-        return body
-    ident = payload["model"].strip()
-    mapping = _zen_models_dict()
-    mapped = mapping.get(ident)
-    if mapped is None or str(mapped) == ident:
-        return body
-    payload["model"] = str(mapped)
-    return json.dumps(payload, ensure_ascii=False).encode("utf-8")
 
 
 def _is_free_model(model_id: str) -> bool:
@@ -570,13 +539,14 @@ def proxy(handler: BaseHTTPRequestHandler, method: str, path: str) -> None:
         )
         return
 
-    body = _map_body_model(body)  # zen-models.json 查表映射：cli 传 key → value 透传上游
-    body = rewrite_body_model(body)  # 未命中时 Claude Code 档位/别名改写到免费模型兜底
+    # 单别名表（gateway.aliases）：一次查表同时确定上游模型 + 路由，
+    # 替代旧三层串行改名（_map_body_model → rewrite_body_model → rewrite_model_id）。
+    body = resolve_body_model(body)
     model, stream_flag = _extract_meta(body)
-    model = rewrite_model_id(model)
+    model, route = resolve_model(model)
     anthropic_client = is_messages_path(path)
-    translate = anthropic_client and uses_chat_completions(model)
-    use_responses = uses_responses(model)  # muse 等仅支持 /responses，单独走 responses 路由
+    translate = anthropic_client and route == RouteKind.CHAT
+    use_responses = route == RouteKind.RESPONSES  # muse 等仅支持 /responses，单独走 responses 路由
     # 推理档位：翻译路径取转换后 chat 体，直连路径读原始 reasoning_effort
     effort_flag: str | None = None
 

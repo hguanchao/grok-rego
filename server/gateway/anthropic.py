@@ -81,32 +81,22 @@ def effort_from_body(payload: dict[str, Any]) -> str | None:
     return "low" if budget > 0 else None
 
 
+# NOTE（方案 A 第一步）：改名逻辑已收敛到 gateway.aliases.resolve_model，
+# 此处旧函数 rewrite_model_id / rewrite_body_model 仅作兼容垫片保留，
+# 供单测冻结旧行为；opencode.proxy 已切单表。新代码一律用 aliases.resolve_model。
 def rewrite_model_id(model: str | None) -> str | None:
-    """Claude Code 档位名改写到免费上游模型；其它 id 原样。"""
-    ident = (model or "").strip()
-    if not ident:
-        return model
-    low = ident.lower()
-    if low in _CLAUDE_CODE_SHORT or low.startswith(_CLAUDE_CODE_ALIAS_PREFIX):
-        return _FREE_UPSTREAM
-    return ident
+    """[兼容垫片] 等价于 aliases.resolve_model(model)[0]，待调用方清零后删除。"""
+    from gateway.aliases import resolve_model
+
+    mapped, _ = resolve_model(model)
+    return mapped
 
 
 def rewrite_body_model(body: bytes) -> bytes:
-    """请求 JSON 的 model 字段按 Claude Code 别名改写。"""
-    if not body:
-        return body
-    try:
-        payload = json.loads(body.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError):
-        return body
-    if not isinstance(payload, dict) or not isinstance(payload.get("model"), str):
-        return body
-    mapped = rewrite_model_id(payload["model"])
-    if mapped == payload["model"]:
-        return body
-    payload["model"] = mapped
-    return json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    """[兼容垫片] 等价于 aliases.resolve_body_model(body)，待调用方清零后删除。"""
+    from gateway.aliases import resolve_body_model
+
+    return resolve_body_model(body)
 
 
 def claude_code_model_entries() -> list[dict[str, Any]]:

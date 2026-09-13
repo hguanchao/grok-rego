@@ -19,3 +19,8 @@ package = false
 # - S112 / S110：轮询循环中异常继续、元素缺失静默跳过
 # - TRY004：配置/模型校验异常统一抛 ValueError，调用方按此捕获（API 映射 400）
 ignore = ["BLE001", "S112", "S110", "TRY004"]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
