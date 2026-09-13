@@ -95,6 +95,35 @@ const MIN_SPIN_MS = 450;
 /** 任务执行中的状态轮询间隔：任务期间状态变化频率低，3s 一次足够 */
 const TASK_POLL_MS = 3000;
 
+/** 任务进入终态后进度条保留展示时长（毫秒），展示完成结果后消失 */
+const DONE_KEEP_MS = 10_000;
+
+/**
+ * 后端任务 finished_at（北京时间 "YYYY-MM-DD HH:MM:SS"）→ 毫秒时间戳；
+ * 缺失/非法返回 0（调用方回退 taskDoneUntil 窗口逻辑）。
+ */
+function poolTaskFinishedMs(finishedAt: string | null | undefined): number {
+  if (!finishedAt) return 0;
+  const text = finishedAt.trim();
+  if (!text) return 0;
+  const m = /^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2}):(\d{2})/.exec(text);
+  const ts = m
+    ? Date.parse(`${m[1]}-${m[2]}-${m[3]}T${m[4]}:${m[5]}:${m[6]}+08:00`)
+    : Date.parse(text);
+  return Number.isFinite(ts) ? ts : 0;
+}
+
+/**
+ * 终态任务是否仍在展示窗口内：完成后 DONE_KEEP_MS 内展示，超时不再复活进度条。
+ * 后端常驻上次任务快照（终态 finished_at 可能是几小时前），没有此门禁，
+ * 每次挂载恢复都会把陈旧的"已完成"进度条复活出来。
+ */
+function isTerminalFresh(finishedAt: string | null | undefined): boolean {
+  const finishedMs = poolTaskFinishedMs(finishedAt);
+  if (finishedMs <= 0) return false;
+  return Date.now() - finishedMs < DONE_KEEP_MS;
+}
+
 export function PoolPage() {
   const [config, setConfig] = useState<AppConfig | null>(null);
   // ── 以下状态走页面缓存：路由切走再回来，数据/筛选/页码保留，秒开 + 静默刷新 ──
@@ -172,8 +201,6 @@ export function PoolPage() {
     });
   }, []);
 
-  /** 任务进入终态后进度条保留展示时长（毫秒），展示完成结果后消失 */
-  const DONE_KEEP_MS = 10_000;
   const [taskDoneUntil, setTaskDoneUntil] = useState(0);
   const taskDoneTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -424,7 +451,16 @@ export function PoolPage() {
     ): { name: string; status: string; done: number; total: number; pct: number } | null => {
       if (!t) return null;
       const terminal = t.status === "done" || t.status === "cancelled";
-      if (terminal && Date.now() >= taskDoneUntil) return null;
+      // 终态展示双门禁：必须仍在保留窗口内（taskDoneUntil，本会话内刚结算），
+      // 且非陈旧快照（finished_at 在 DONE_KEEP_MS 内；为空/不可解析时信任会话
+      // 内结算，覆盖"发起即完成"的快任务）。后端常驻上次任务快照，无此门禁时
+      // 路由切回/轮询 setPushTask/setPoolTask 会把陈旧终态反复复活出来，
+      // 形成"已完成进度条消失后又反复出现"。
+      if (terminal) {
+        if (Date.now() >= taskDoneUntil) return null;
+        const finishedMs = poolTaskFinishedMs(t.finished_at);
+        if (finishedMs > 0 && Date.now() - finishedMs >= DONE_KEEP_MS) return null;
+      }
       const pct = t.count > 0 ? Math.min(100, Math.round((t.done / t.count) * 100)) : 0;
       return {
         name,
@@ -624,9 +660,13 @@ export function PoolPage() {
               );
             }
           }
+          // 陈旧终态（finished_at 超过保留窗口）不恢复：后端常驻上次任务快照，
+          // 挂载即恢复会把几小时前的"已完成"进度条复活出来。
           if (terminal) {
-            setPushTask(snap);
-            settleTask();
+            if (isTerminalFresh(snap.finished_at)) {
+              setPushTask(snap);
+              settleTask();
+            }
           } else if (snap.id) {
             setPushTask(snap);
             setLogOpen(true);
@@ -654,8 +694,10 @@ export function PoolPage() {
             }
           }
           if (terminal) {
-            setPoolTask(snap);
-            settleTask();
+            if (isTerminalFresh(snap.finished_at)) {
+              setPoolTask(snap);
+              settleTask();
+            }
           } else {
             setPoolTask(snap);
             setLogOpen(true);
