@@ -3,7 +3,8 @@ Grok 号池网关。
 
 把本机 `/grok/v1/*` 转发到 `https://cli-chat-proxy.grok.com/v1`，
 用号池账号的 access_token 鉴权。每次请求自动从号池取号
-（ACTIVE + 已认证 + token 未过期），轮询均匀分摊；
+（ACTIVE + 已认证 + token 未过期），没降智与新注册账号优先、
+层内轮询均匀分摊；
 上游判定为坏号的账号（401/403/404/429 等）进入临时冷却，避免反复命中。
 """
 
@@ -27,6 +28,7 @@ from core.logger import logger
 from core.util import (
     curl_error_code,
     decode_jwt_exp,
+    iso_after_hours,
     now_iso_tz,
     proxy_endpoint_ready,
 )
@@ -103,6 +105,12 @@ _HOP_BY_HOP = {
 _lock = threading.Lock()
 _seq = 0
 _rr_index = 0  # 自动选号轮询游标（跨请求共享，均匀分摊流量）
+
+# ── 选号优先分层（新注册 + 没降智）─────────────────────────
+# 新注册优待窗口：created_at 在该窗口内的账号视为「新注册」。
+# 新号日额度完整、尚未被质量审计命中过，注册补号后优先消化新号；
+# 窗口与上游额度按日重置（24h）对齐，出窗后自然回归常规轮询。
+_FRESH_ACCOUNT_SEC = 24 * 3600
 
 # ── 账号临时冷却（对齐 CLIProxyAPI 凭据冷却链路）────────────────────
 # 上游按状态码判定坏号后临时冻结，避免轮询反复命中坏号；到期自动解冻。
@@ -250,7 +258,7 @@ def snapshot() -> dict[str, Any]:
         "upstream": GROK_BASE,
         "client_base": f"http://{config.API_HOST}:{config.API_PORT}/grok/v1",
         "base_path": "/grok/v1",
-        "select": "自动轮询取号（ACTIVE + 已认证）",
+        "select": "自动取号（新注册/没降智优先 + 粘性会话 + 轮询）",
         "proxy": str(config.PROXY or "").strip(),
         "stats": stats,
         "logs": logs,
@@ -547,20 +555,44 @@ def _read_body(handler: BaseHTTPRequestHandler) -> bytes:
     return handler.rfile.read(length)
 
 
+def _preferred_pool(
+    rows: list[dict[str, Any]], fresh_cutoff: str
+) -> list[dict[str, Any]]:
+    """按「没降智 + 新注册」取最优一层候选，层内保持原有顺序交给轮询分摊。
+
+    分层键 (clean, fresh)，值越小越优先：clean = 无降智 strike 记录
+    （quality_strikes=0，出现过降智的账号即使新也不如久经审计的干净老号）；
+    fresh = created_at 在优待窗口内（created_at 与 fresh_cutoff 同为
+    北京 ISO 带时区格式，字符串比较即时序比较，缺失/空串视为非新号）。
+    返回最优一层候选；全员同层时即原候选集，退化为纯轮询。
+    """
+    def tier(row: dict[str, Any]) -> tuple[int, int]:
+        clean = int(row.get("quality_strikes") or 0) == 0
+        fresh = str(row.get("created_at") or "") >= fresh_cutoff
+        return (0 if clean else 1, 0 if fresh else 1)
+
+    tiered = [(tier(row), row) for row in rows]
+    best = min(t for t, _ in tiered)
+    return [row for t, row in tiered if t == best]
+
+
 def _pick_account(
     session_key: str = "", exclude_ids: set[int] | None = None
 ) -> tuple[dict[str, Any] | None, str]:
-    """从号池候选（ACTIVE + 已认证 + 未降智）按「粘性会话 + 轮询」挑选 token 未过期、未冷却的账号。
+    """从号池候选（ACTIVE + 已认证 + 未降智）挑选账号：「新注册/没降智优先 + 粘性会话 + 轮询」。
 
     - 过滤 JWT 已过期的账号（exp 解析失败的视为有效，交由上游判定）
     - 过滤冷却中的账号（上游判定坏号后临时冻结，到期自动解冻）
     - 过滤质量冷却 / 长期排除的账号（候选查询已排除）
     - exclude_ids：扣流重试时本请求已试过的账号，过滤后为空则放开限制
       （无限重试语义：全部试过时允许复选，由 strike 升级制自然收敛）
+    - 优先分层：没降智（无 strike 记录）且新注册（优待窗口内）的账号最先，
+      逐层退化到干净老号、有 strike 记录的账号；每层内仍按轮询均匀分摊
     - 粘性会话（对齐 CLIProxyAPI SessionAffinity）：会话标识非空时，
-      绑定账号在 TTL 内复用；绑定账号冷却 / 禁用 / 删除 / token 过期
-      则自动解绑并故障切换到新号后重建绑定；无会话标识时退化为纯轮询
-    - 轮询游标全局递增，多账号时均匀分摊请求
+      绑定账号在 TTL 内复用（粘性优先于分层，绑定账号不因出优待层被换掉）；
+      绑定账号冷却 / 禁用 / 删除 / token 过期则自动解绑并故障切换到新号；
+      无会话标识时退化为纯轮询
+    - 轮询游标全局递增，同层多账号时均匀分摊请求
     """
     global _rr_index
     now = int(time.time())
@@ -575,6 +607,7 @@ def _pick_account(
         candidates = fresh or candidates
     if not candidates:
         return None, "号池无可用账号（需 ACTIVE、已认证且未降智）"
+    fresh_cutoff = iso_after_hours(-_FRESH_ACCOUNT_SEC / 3600)
     with _lock:
         # 清理已到期的冷却记录，避免内存无界增长
         expired_ids = [acc_id for acc_id, until in _cooldowns.items() if until <= now_mono]
@@ -596,14 +629,13 @@ def _pick_account(
                         return matched, ""  # 命中绑定：同一会话复用同一账号
                     # 绑定失效（账号冷却 / 禁用 / 删除 / token 过期）→ 解绑并故障切换
                     del _session_bindings[session_key]
-            idx = _rr_index % len(ready)
-            _rr_index = _rr_index + 1
-            picked = ready[idx]
-            _session_bindings[session_key] = (int(picked["id"]), now_mono)
-            return picked, ""
-        idx = _rr_index % len(ready)
+        pool = _preferred_pool(ready, fresh_cutoff)
+        idx = _rr_index % len(pool)
         _rr_index = _rr_index + 1
-    return ready[idx], ""
+        picked = pool[idx]
+        if session_key:
+            _session_bindings[session_key] = (int(picked["id"]), now_mono)
+        return picked, ""
 
 
 def _cooldown_account(account_id: int, seconds: float) -> None:

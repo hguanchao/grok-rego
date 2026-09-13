@@ -228,13 +228,15 @@ def list_gateway_candidates() -> list[dict[str, Any]]:
     """网关自动选号候选：ACTIVE、已认证、未处于质量冷却/长期排除的未删除账号（按 id 升序）。
 
     质量状态由网关被动审计写入：命中 missing_thinking 冷却 12h，冷却结束后
-    再犯长期排除（quality_disabled=1）。只返回 id / email / access_token。
+    再犯长期排除（quality_disabled=1）。除 id / email / access_token 外附带
+    created_at / quality_strikes，供网关选号做「新注册 + 没降智」优先分层。
     """
     now = now_iso_tz()
     with connect() as conn:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
-            "SELECT id, email, access_token FROM accounts "
+            "SELECT id, email, access_token, created_at, "
+            "COALESCE(quality_strikes, 0) AS quality_strikes FROM accounts "
             "WHERE COALESCE(is_deleted, 0) = 0 "
             "AND COALESCE(status, 1) = ? "
             "AND COALESCE(access_token, '') != '' "

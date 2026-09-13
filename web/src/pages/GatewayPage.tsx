@@ -327,7 +327,7 @@ export function GatewayPage() {
                   <div className="gw-section-label">
                     <Link2 className="size-3" strokeWidth={1.6} aria-hidden />
                     <span>接入地址</span>
-                    <LabelHelp tip="Claude Code 将 ANTHROPIC_BASE_URL 设为 http://127.0.0.1:8787/zen（不带 /v1）；Grok 客户端用完整 /grok/v1 地址，网关自动从号池轮询取号。" />
+                    <LabelHelp tip="Claude Code 将 ANTHROPIC_BASE_URL 设为 http://127.0.0.1:8787/zen（不带 /v1）；Grok 客户端用完整 /grok/v1 地址，网关自动从号池取号，优先新注册与未降智账号。" />
                   </div>
                   {[zenChannel, grokChannel].map((channel, index) => (
                     <div
