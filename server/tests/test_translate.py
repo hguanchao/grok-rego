@@ -16,6 +16,9 @@ import re
 from pathlib import Path
 
 from gateway.anthropic import (
+    _convert_tool_choice,
+    _convert_tools,
+    _iter_tool_blocks,
     chat_to_message,
     iter_anthropic_sse,
     iter_responses_sse,
@@ -137,6 +140,74 @@ def test_messages_to_responses_effort_mapping() -> None:
     }
     resp = messages_to_responses(payload)
     assert resp["reasoning"] == {"effort": "xhigh", "summary": "concise"}
+
+
+def test_shared_converters_parity() -> None:
+    """共享转换器与旧双份实现语义一致（chat/responses 旧分支逐条对照）。
+
+    旧 chat 分支：str any→required/auto/none 直通/未知不设；
+    dict tool+name→function，auto/any/required/none→required 归一；
+    旧 responses 分支：dict tool+name→function，auto/required/none 直通。
+    合并后的 _convert_tool_choice 必须同时满足两者（交集为超集时取并）。
+    """
+    assert _convert_tools(
+        [{"name": "R", "description": "d", "input_schema": {"type": "object"}}]
+    ) == [
+        {
+            "type": "function",
+            "function": {
+                "name": "R",
+                "description": "d",
+                "parameters": {"type": "object"},
+            },
+        }
+    ]
+    assert _convert_tools("not-a-list") == []
+    assert _convert_tool_choice("any") == "required"
+    assert _convert_tool_choice("auto") == "auto"
+    assert _convert_tool_choice("none") == "none"
+    assert _convert_tool_choice("weird") is None
+    assert _convert_tool_choice({"type": "tool", "name": "R"}) == {
+        "type": "function",
+        "function": {"name": "R"},
+    }
+    assert _convert_tool_choice({"type": "auto"}) == "auto"
+    assert _convert_tool_choice({"type": "any"}) == "required"
+    assert _convert_tool_choice({"type": "required"}) == "required"
+    assert _convert_tool_choice({"type": "none"}) == "none"
+    assert _convert_tool_choice({"type": "bogus"}) is None
+    assert _convert_tool_choice(None) is None
+
+
+def test_shared_tool_block_scan() -> None:
+    """共享工具块扫描：声明集合去重 + 孤儿计数（缺 id 的 result 不算孤儿）。"""
+    blocks, orphans = _iter_tool_blocks(
+        {
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "tool_use", "id": "a", "name": "R", "input": {}},
+                        {"type": "tool_use", "id": "a", "name": "R", "input": {}},
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "tool_result", "tool_use_id": "a", "content": "ok"},
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "gone",
+                            "content": "stale",
+                        },
+                        {"type": "tool_result", "content": "no-id"},
+                    ],
+                },
+            ]
+        }
+    )
+    assert [b["id"] for b in blocks] == ["a"]
+    assert orphans == 1
 
 
 # ─── SSE 翻译 ────────────────────────────────────────────────

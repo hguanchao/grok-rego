@@ -191,6 +191,106 @@ def _system_to_text(system: Any) -> str:
     return _text_of(system).strip()
 
 
+def _convert_tools(tools: Any) -> list[dict[str, Any]]:
+    """Anthropic tools → OpenAI function tools（chat / responses 共用，唯一真相源）。"""
+    converted: list[dict[str, Any]] = []
+    if not isinstance(tools, list):
+        return converted
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        converted.append(
+            {
+                "type": "function",
+                "function": {
+                    "name": tool.get("name"),
+                    "description": tool.get("description") or "",
+                    "parameters": tool.get("input_schema")
+                    or {"type": "object", "properties": {}},
+                },
+            }
+        )
+    return converted
+
+
+def _convert_tool_choice(choice: Any) -> Any:
+    """Anthropic tool_choice → OpenAI tool_choice（chat / responses 共用）。
+
+    返回 None 表示无选择（调用方不设字段）；dict 形态保留 function 名。
+    """
+    if isinstance(choice, str):
+        if choice == "any":
+            return "required"
+        if choice in ("auto", "none"):
+            return choice
+        return None
+    if not isinstance(choice, dict):
+        return None
+    name = choice.get("name")
+    ctype = choice.get("type")
+    if ctype == "tool" and name:
+        return {"type": "function", "function": {"name": name}}
+    if ctype in ("auto", "any", "required", "none"):
+        return "required" if ctype in ("any", "required") else ctype
+    return None
+
+
+def _convert_sampling(payload: dict[str, Any], out: dict[str, Any]) -> None:
+    """max_tokens / temperature / top_p / stop_sequences 透传（chat / responses 共用）。"""
+    if payload.get("max_tokens") is not None:
+        out["max_tokens"] = payload.get("max_tokens")
+    if payload.get("temperature") is not None:
+        out["temperature"] = payload.get("temperature")
+    if payload.get("top_p") is not None:
+        out["top_p"] = payload.get("top_p")
+    if payload.get("stop_sequences"):
+        out["stop"] = payload.get("stop_sequences")
+
+
+def _iter_tool_blocks(
+    payload: dict[str, Any],
+) -> tuple[list[dict[str, Any]], int]:
+    """扫描 Messages 全文：返回 (tool_use 声明块列表, 孤儿 tool_result 数）。
+
+    孤儿 = tool_use_id 配不上任何 tool_use.id（/compact 压缩残留）。
+    chat 路由的上游是宽松匹配（tool_call_id 对不上只影响本轮），
+    responses 路由是严格配对（直接 400），是否丢弃由调用方按路由决定；
+    此处只统计、不丢弃，保证两路由看到同一份声明集合。
+    """
+    declared: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    for item in payload.get("messages") or []:
+        if not isinstance(item, dict):
+            continue
+        content = item.get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if str(block.get("type") or "") == "tool_use" and block.get("id"):
+                bid = str(block["id"])
+                if bid not in seen_ids:
+                    seen_ids.add(bid)
+                    declared.append(block)
+    orphans = 0
+    for item in payload.get("messages") or []:
+        if not isinstance(item, dict):
+            continue
+        content = item.get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if str(block.get("type") or "") != "tool_result":
+                continue
+            call_id = str(block.get("tool_use_id") or "")
+            if call_id and call_id not in seen_ids:
+                orphans += 1
+    return declared, orphans
+
+
 def messages_to_chat(payload: dict[str, Any]) -> dict[str, Any]:
     """Anthropic Messages 请求体 → OpenAI Chat Completions。"""
     messages: list[dict[str, Any]] = []
@@ -230,6 +330,8 @@ def messages_to_chat(payload: dict[str, Any]) -> dict[str, Any]:
                     }
                 )
             elif btype == "tool_result":
+                # chat 上游宽松匹配：孤儿 result 仅影响本轮，不 400，原样透传
+                # （responses 路由才需丢弃，见 messages_to_responses）。
                 messages.append(
                     {
                         "role": "tool",
@@ -254,48 +356,13 @@ def messages_to_chat(payload: dict[str, Any]) -> dict[str, Any]:
     effort = effort_from_body(payload)
     if effort and supports_reasoning(str(out.get("model") or "")):
         out["reasoning_effort"] = effort
-    if payload.get("max_tokens") is not None:
-        out["max_tokens"] = payload.get("max_tokens")
-    if payload.get("temperature") is not None:
-        out["temperature"] = payload.get("temperature")
-    if payload.get("top_p") is not None:
-        out["top_p"] = payload.get("top_p")
-    if payload.get("stop_sequences"):
-        out["stop"] = payload.get("stop_sequences")
-    tools = payload.get("tools")
-    if isinstance(tools, list) and tools:
-        converted = []
-        for tool in tools:
-            if not isinstance(tool, dict):
-                continue
-            converted.append(
-                {
-                    "type": "function",
-                    "function": {
-                        "name": tool.get("name"),
-                        "description": tool.get("description") or "",
-                        "parameters": tool.get("input_schema") or {"type": "object", "properties": {}},
-                    },
-                }
-            )
-        if converted:
-            out["tools"] = converted
-    choice = payload.get("tool_choice")
-    if isinstance(choice, str):
-        if choice == "any":
-            out["tool_choice"] = "required"
-        elif choice in ("auto", "none"):
-            out["tool_choice"] = choice
-    elif isinstance(choice, dict):
-        name = choice.get("name")
-        if choice.get("type") == "tool" and name:
-            out["tool_choice"] = {"type": "function", "function": {"name": name}}
-        elif choice.get("type") == "auto":
-            out["tool_choice"] = "auto"
-        elif choice.get("type") in ("any", "required"):
-            out["tool_choice"] = "required"
-        elif choice.get("type") == "none":
-            out["tool_choice"] = "none"
+    _convert_sampling(payload, out)
+    converted = _convert_tools(payload.get("tools"))
+    if converted:
+        out["tools"] = converted
+    tool_choice = _convert_tool_choice(payload.get("tool_choice"))
+    if tool_choice is not None:
+        out["tool_choice"] = tool_choice
     return out
 
 
@@ -640,8 +707,9 @@ def messages_to_responses(payload: dict[str, Any]) -> dict[str, Any]:
     """
     system = _system_to_text(payload.get("system"))
     messages: list[dict[str, Any]] = []
-    # /compact 后的历史可能把过期工具轮压缩成"裸 tool_result"（无对应 tool_use）：
-    # 上游按 call_id 校验配对会 400，此处预过滤掉无配对的 tool_result。
+    # /compact 残留的孤儿 tool_result（无对应 tool_use）：responses 上游按 call_id
+    # 严格配对会 400，此处预过滤；声明集合走共享扫描，与 chat 路由同源。
+    _, orphans = _iter_tool_blocks(payload)
     declared_ids: set[str] = set()
     for item in payload.get("messages") or []:
         if not isinstance(item, dict):
@@ -652,8 +720,7 @@ def messages_to_responses(payload: dict[str, Any]) -> dict[str, Any]:
         for block in content:
             if not isinstance(block, dict):
                 continue
-            btype = str(block.get("type") or "")
-            if btype == "tool_use" and block.get("id"):
+            if str(block.get("type") or "") == "tool_use" and block.get("id"):
                 declared_ids.add(str(block["id"]))
     dropped_orphans = 0
     for item in payload.get("messages") or []:
@@ -730,41 +797,16 @@ def messages_to_responses(payload: dict[str, Any]) -> dict[str, Any]:
         if _resp_eff not in ("none", "minimal", "low", "medium", "high", "xhigh"):
             _resp_eff = "high"
         out["reasoning"] = {"effort": _resp_eff, "summary": "concise"}
+    _convert_sampling(payload, out)
+    # Responses 的 max_tokens 语义是输出上限，同步一份 max_output_tokens
     if payload.get("max_tokens") is not None:
         out["max_output_tokens"] = payload.get("max_tokens")
-    if payload.get("temperature") is not None:
-        out["temperature"] = payload.get("temperature")
-    if payload.get("top_p") is not None:
-        out["top_p"] = payload.get("top_p")
-    tools = payload.get("tools")
-    if isinstance(tools, list) and tools:
-        converted = []
-        for tool in tools:
-            if not isinstance(tool, dict):
-                continue
-            converted.append(
-                {
-                    "type": "function",
-                    "name": tool.get("name"),
-                    "description": tool.get("description") or "",
-                    "parameters": tool.get("input_schema") or {"type": "object", "properties": {}},
-                }
-            )
-        if converted:
-            out["tools"] = converted
-    choice = payload.get("tool_choice")
-    if isinstance(choice, str):
-        if choice == "any":
-            out["tool_choice"] = "required"
-        elif choice in ("auto", "none"):
-            out["tool_choice"] = choice
-    elif isinstance(choice, dict):
-        name = choice.get("name")
-        ctype = choice.get("type")
-        if ctype == "tool" and name:
-            out["tool_choice"] = {"type": "function", "name": name}
-        elif ctype in ("auto", "required", "none"):
-            out["tool_choice"] = ctype
+    converted = _convert_tools(payload.get("tools"))
+    if converted:
+        out["tools"] = converted
+    tool_choice = _convert_tool_choice(payload.get("tool_choice"))
+    if tool_choice is not None:
+        out["tool_choice"] = tool_choice
     return out
 
 
