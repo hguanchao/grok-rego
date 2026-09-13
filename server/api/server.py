@@ -452,10 +452,24 @@ def _handle_usage_api(
             _error_json(handler, 400, "dim 仅支持 account / model")
             return True
         try:
+            offset = int(query.get("offset", ["0"])[0] or "0")
+        except (TypeError, ValueError):
+            offset = 0
+        try:
+            # limit <= 0 表示不分页（返回全量）
+            limit = int(query.get("limit", ["0"])[0] or "0")
+        except (TypeError, ValueError):
+            limit = 0
+        try:
             _send_json(
                 handler,
                 200,
-                {"ok": True, "data": query_usage_grouped(dimension=dimension)},
+                {
+                    "ok": True,
+                    "data": query_usage_grouped(
+                        dimension=dimension, offset=offset, limit=limit
+                    ),
+                },
             )
         except ValueError as exc:
             _error_json(handler, 400, str(exc))

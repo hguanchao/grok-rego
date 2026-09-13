@@ -140,7 +140,8 @@
 /* mode toggle (segment) */.mode-toggle {
   width: 100% !important;
   display: grid !important;
-  grid-template-columns: 1fr 1fr;
+  /* auto-fit：2 个 item 排成 2 列、3 个 item 排成 3 列，避免三档控件被挤到第二行 */
+  grid-template-columns: repeat(auto-fit, minmax(0, 1fr));
   gap: 3px !important;
   padding: 3px !important;
   border: 1px solid var(--border) !important;

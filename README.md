@@ -7,6 +7,7 @@ xAI Grok Build 账号自动化工具：**批量注册 → Device Flow 授权 →
 ## 功能特性
 
 - **批量注册**：多线程并发注册，支持 Cloudflare / Yyds 邮箱服务与代理配置
+- **全局仿真人**：注册链路全量拟人化（贝塞尔鼠标轨迹、拟人点击与键入、空闲微动），降低被风控识别概率
 - **Device Flow 授权**：浏览器端 OAuth Device Flow，自动完成 Token 交换
 - **SSO 会话**：注册附带的会话凭证入库，供下游渠道使用
 - **号池管理**：账号列表、状态、筛选与巡检，后台固定周期扫描临期账号并自动续期
@@ -32,7 +33,7 @@ grok-rego/
 │   ├── api/                   # 管理 API 路由、号池任务（pool_jobs）、推送（push）
 │   ├── core/                  # 配置 / 日志 / 工具（config、logger、util）
 │   ├── gateway/               # 上游反代（opencode：OpenCode Zen · grok：号池 · ops：运维聚合）
-│   ├── workflow/              # 注册 / OAuth / 浏览器 / 任务编排 / 邮箱
+│   ├── workflow/              # 注册 / OAuth / 浏览器 / 仿真人 / 任务编排 / 邮箱
 │   ├── db/                    # 数据库（init + 账号读写）
 │   ├── main.py                # CLI 批量注册 + --serve 启动管理 API
 │   ├── pyproject.toml         # uv 项目定义（Python ≥ 3.13）
@@ -98,6 +99,34 @@ uv run python main.py --serve       # 启动管理 API（默认 8787）
 | `auth_enabled` | 注册完成后是否自动执行 SSO 授权与 grok.com 风控体检 |
 | `g2a_base_url` / `g2a_username` / `g2a_password` | G2A 管理端配置（登录后推送 Web 池） |
 | `cpa_base_url` / `cpa_management_key` | CPA 管理端配置（auth-files 批量上传） |
+| `human_sim` | 全局仿真人开关（`false` 时退回 Camoufox 自带 humanize） |
+| `human_level` | 拟人强度：`light` 快 / `normal` 平衡（默认）/ `heavy` 最像人 |
+
+## 全局仿真人（防风控）
+
+注册链路的鼠标与键盘动作统一由 `server/workflow/human.py` 接管，替代机械式 click / fill：
+
+| 维度 | 做法 |
+| --- | --- |
+| 鼠标轨迹 | 三次贝塞尔曲线（缓入缓出）+ 垂直方向弧度 + 逐点抖动 + 偶发过冲回拉，绝不是直线 |
+| 点击 | 移动 → 点击前驻留 → 随机按下时长 → 点击后停顿；落点在元素内随机（不总点正中心） |
+| 键入 | 逐字高斯延迟、思考停顿、偶发错字（邻键）回删重打、大写走 `Shift` |
+| 校验 | 键入后回读输入框实际值，不一致则清掉重打一次，仍不一致仅告警不阻塞 |
+| 滚动 | 分段滚动 + 段间停顿 |
+| 空闲 | 等待轮询期间随机微动 / 轻微滚动，打散光标长时间静止的自动化特征 |
+
+三档强度（`human_level`）在速度与拟真度之间取舍，Web「注册」页可实时切换：
+
+| 档位 | 轨迹上限 | 键入间隔 | 错字率 | 适用 |
+| --- | --- | --- | --- | --- |
+| `light` | 0.35s | 45~115ms | 0% | 追求吞吐 |
+| `normal` | 0.75s | 70~190ms | 2% | 默认平衡 |
+| `heavy` | 1.25s | 95~265ms | 3% | 被风控盯上时降速跑 |
+
+**不会卡死**：单次轨迹有总时长硬上限；逐步实测 `mouse.move` 真实耗时并动态收敛步数；
+任何异常都吞掉并退化为「一次直达移动 + 原生点击」。引擎开启时会关掉 Camoufox 自带
+`humanize`（二者同时开会双重曲线化，既拖慢又可能等待轨迹结束而卡住），
+`human_sim=false` 时恢复原来的 `humanize=0.8` 行为。
 
 ## OpenCode Zen 网关
 

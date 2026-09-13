@@ -32,6 +32,7 @@ htmlcov/
 .roo/
 .copilot/
 .amp/
+.workbuddy-ai/
 
 # Runtime data
 server/db/data/

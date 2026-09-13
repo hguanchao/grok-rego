@@ -7,6 +7,7 @@ import {
   Eye,
   EyeOff,
   FoldVertical,
+  MousePointer2,
   Play,
   Save,
   SlidersHorizontal,
@@ -59,6 +60,7 @@ import {
   stopRegister,
   type AppConfig,
   type DomainMode,
+  type HumanLevel,
   type LogEntry,
   type MailProvider,
   type RegisterJobState,
@@ -141,6 +143,8 @@ export function RegisterPage() {
   const [mode, setMode] = useState<"batch" | "single">("single");
   const [headless, setHeadless] = useState(false);
   const [authEnabled, setAuthEnabled] = useState(true);
+  const [humanSim, setHumanSim] = useState(true);
+  const [humanLevel, setHumanLevel] = useState<HumanLevel>("normal");
   const [count, setCount] = useState(1);
   const [threads, setThreads] = useState(1);
   const [proxy, setProxy] = useState("");
@@ -237,6 +241,12 @@ export function RegisterPage() {
     setMailProvider(data.mail_provider === "yyds" ? "yyds" : "cf");
     setProxy(data.proxy || "");
     setAuthEnabled(Boolean(data.auth_enabled));
+    setHumanSim(data.human_sim !== false);
+    setHumanLevel(
+      data.human_level === "light" || data.human_level === "heavy"
+        ? data.human_level
+        : "normal",
+    );
     setCfApiBase(data.cf_api_base || "");
     setCfApiKey(data.cf_api_key || "");
     setCfDomains(Array.isArray(data.cf_domains) ? data.cf_domains : []);
@@ -255,6 +265,8 @@ export function RegisterPage() {
       mail_provider: mailProvider,
       proxy: proxy.trim(),
       auth_enabled: authEnabled,
+      human_sim: humanSim,
+      human_level: humanLevel,
       cf_api_base: cfApiBase.trim(),
       cf_api_key: cfApiKey,
       cf_domains: cfDomains,
@@ -271,6 +283,8 @@ export function RegisterPage() {
     mailProvider,
     proxy,
     authEnabled,
+    humanSim,
+    humanLevel,
     cfApiBase,
     cfApiKey,
     cfDomains,
@@ -652,6 +666,61 @@ export function RegisterPage() {
                 <ToggleGroupItem className="mode-toggle-item" value="noauth" aria-label="不自动 SSO 授权">
                   <CircleX className="size-3.5" strokeWidth={1.6} />
                   关闭
+                </ToggleGroupItem>
+              </ToggleGroup>
+            </div>
+
+            <div className="field-block">
+              <div className="field-label">
+                <b>仿真人</b>
+                <span className="field-hint">贝塞尔轨迹 · 拟人键入</span>
+              </div>
+              <ToggleGroup
+                type="single"
+                className="mode-toggle"
+                value={humanSim ? "on" : "off"}
+                onValueChange={(value) => {
+                  if (value === "on") setHumanSim(true);
+                  if (value === "off") setHumanSim(false);
+                }}
+                disabled={formDisabled}
+                aria-label="全局仿真人防风控"
+              >
+                <ToggleGroupItem className="mode-toggle-item" value="on" aria-label="开启仿真人">
+                  <MousePointer2 className="size-3.5" strokeWidth={1.6} />
+                  开启
+                </ToggleGroupItem>
+                <ToggleGroupItem className="mode-toggle-item" value="off" aria-label="关闭仿真人">
+                  <CircleX className="size-3.5" strokeWidth={1.6} />
+                  关闭
+                </ToggleGroupItem>
+              </ToggleGroup>
+            </div>
+
+            <div className="field-block">
+              <div className="field-label">
+                <b>拟人强度</b>
+              </div>
+              <ToggleGroup
+                type="single"
+                className="mode-toggle"
+                value={humanLevel}
+                onValueChange={(value) => {
+                  if (value === "light" || value === "normal" || value === "heavy") {
+                    setHumanLevel(value);
+                  }
+                }}
+                disabled={formDisabled || !humanSim}
+                aria-label="拟人强度"
+              >
+                <ToggleGroupItem className="mode-toggle-item" value="light" aria-label="轻量">
+                  轻量
+                </ToggleGroupItem>
+                <ToggleGroupItem className="mode-toggle-item" value="normal" aria-label="标准">
+                  标准
+                </ToggleGroupItem>
+                <ToggleGroupItem className="mode-toggle-item" value="heavy" aria-label="重度">
+                  重度
                 </ToggleGroupItem>
               </ToggleGroup>
             </div>

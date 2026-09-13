@@ -60,6 +60,13 @@ OAUTH2_SCOPES: list[str] = [
 GOTO_TIMEOUT: int = 60000
 ELEMENT_TIMEOUT: int = 15000
 
+# === 全局仿真人（防风控）===
+# human_sim=false 时关闭自研拟人引擎，行为与接入前一致（仅依赖 Camoufox humanize）
+HUMAN_SIM: bool = True
+# 拟人强度：light（快）/ normal（默认，平衡）/ heavy（慢，最像人）
+HUMAN_LEVEL: str = "normal"
+HUMAN_LEVELS: tuple[str, ...] = ("light", "normal", "heavy")
+
 # === 流程开关 ===
 IS_AUTH: bool = True
 
@@ -89,6 +96,8 @@ _PUBLIC_CONFIG_KEYS = (
     "cpa_management_key",
     "gateway_api_key",
     "grok_version",
+    "human_sim",
+    "human_level",
 )
 
 
@@ -150,6 +159,7 @@ def _apply_config_data(data: dict[str, Any]) -> None:
     global MAIL_PROVIDER, YYDS_API_BASE, YYDS_API_KEY
     global G2A_BASE_URL, G2A_USERNAME, G2A_PASSWORD, CPA_BASE_URL, CPA_MANAGEMENT_KEY
     global GATEWAY_API_KEY, GROK_VERSION
+    global HUMAN_SIM, HUMAN_LEVEL
 
     if data.get("cf_api_base") is not None:
         CF_API_BASE = str(data["cf_api_base"]).strip().rstrip("/")
@@ -197,6 +207,18 @@ def _apply_config_data(data: dict[str, Any]) -> None:
         ver = str(raw_ver).strip()
         if ver:
             GROK_VERSION = ver
+    if "human_sim" in data:
+        HUMAN_SIM = bool(data.get("human_sim"))
+    if data.get("human_level") is not None:
+        lvl = str(data["human_level"]).strip().lower()
+        if lvl in HUMAN_LEVELS:
+            HUMAN_LEVEL = lvl
+        else:
+            print(
+                f"[config] 无效 human_level={data['human_level']!r}，"
+                f"仅支持 {'/'.join(HUMAN_LEVELS)}，已回退 normal"
+            )
+            HUMAN_LEVEL = "normal"
 
 
 def load_config() -> None:
@@ -238,6 +260,8 @@ def get_public_config() -> dict[str, Any]:
         "cpa_management_key": CPA_MANAGEMENT_KEY,
         "gateway_api_key": GATEWAY_API_KEY,
         "grok_version": GROK_VERSION,
+        "human_sim": HUMAN_SIM,
+        "human_level": HUMAN_LEVEL,
     }
 
 
@@ -271,6 +295,13 @@ def update_public_config(patch: dict[str, Any]) -> dict[str, Any]:
                 raise ValueError("grok_version 不能为空")
             current[key] = ver
             current.pop("grok_client_version", None)
+        elif key == "human_sim":
+            current[key] = bool(value)
+        elif key == "human_level":
+            lvl = str(value or "").strip().lower()
+            if lvl not in HUMAN_LEVELS:
+                raise ValueError(f"human_level 仅支持 {'/'.join(HUMAN_LEVELS)}")
+            current[key] = lvl
         elif key in ("cf_api_base", "yyds_api_base", "g2a_base_url", "cpa_base_url"):
             current[key] = str(value or "").strip().rstrip("/")
         elif value is None:

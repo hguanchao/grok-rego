@@ -564,15 +564,6 @@
 .usage-detail-foot .pagination-bar {
   max-width: 100%;
 }
-.usage-detail-count {
-  display: flex;
-  align-items: center;
-  justify-content: flex-end;
-  margin-top: 12px;
-  padding-top: 12px;
-  border-top: 1px solid var(--border);
-  flex-shrink: 0;
-}
 .usage-grouped-name {
   display: inline-block;
   max-width: 100%;

@@ -59,10 +59,16 @@ export function UsagePage() {
   );
   const [recent, setRecent] = useState<UsageRow[]>([]);
   const [recentTotal, setRecentTotal] = useState(0);
-  const [grouped, setGrouped] = useState<Record<UsageGroupDim, UsageGroupedRow[]> | null>({
+  const [grouped, setGrouped] = useState<Record<UsageGroupDim, UsageGroupedRow[]>>({
     account: [],
     model: [],
   });
+  const [groupTotal, setGroupTotal] = useState(0);
+  const [groupPage, setGroupPage] = usePageCache("usage.groupPage", () => 1);
+  const [groupPageSize, setGroupPageSize] = usePageCache(
+    "usage.groupPageSize",
+    () => DETAIL_DEFAULT_PAGE_SIZE,
+  );
   const [detailDim, setDetailDim] = usePageCache<DetailDim>("usage.detailDim", () => "requests");
   const dimRef = useRef<DetailDim>(detailDim);
   dimRef.current = detailDim;
@@ -74,24 +80,36 @@ export function UsagePage() {
   const sizeRef = useRef(detailPageSize);
   pageRef.current = detailPage;
   sizeRef.current = detailPageSize;
+  const groupPageRef = useRef(groupPage);
+  const groupSizeRef = useRef(groupPageSize);
+  groupPageRef.current = groupPage;
+  groupSizeRef.current = groupPageSize;
 
-  // 加载账号/模型分组聚合（全量，无需分页）
-  const loadGrouped = useCallback(async () => {
-    const seq = ++groupSeq.current;
-    try {
-      const [acc, mod] = await Promise.all([
-        fetchUsageGrouped("account"),
-        fetchUsageGrouped("model"),
-      ]);
-      if (seq !== groupSeq.current) return;
-      setGrouped({ account: acc.items, model: mod.items });
-    } catch (err) {
-      if (seq !== groupSeq.current) return;
-      if (detailDim === "account" || detailDim === "model") {
-        toast.error(err instanceof ApiError ? err.message : "加载用量分组失败");
+  // 加载账号/模型分组聚合（分页）：只拉当前维度那一页，避免全量下发
+  const loadGrouped = useCallback(
+    async (page: number, size: number, silent = false) => {
+      const seq = ++groupSeq.current;
+      const dim = dimRef.current;
+      if (dim === "requests") return;
+      try {
+        const next = await fetchUsageGrouped(dim, (page - 1) * size, size);
+        if (seq !== groupSeq.current) return;
+        setGrouped((prev) => ({ ...prev, [dim]: next.items }));
+        setGroupTotal(next.total);
+        const totalPages = Math.max(1, Math.ceil(next.total / Math.max(1, size)));
+        if (page > totalPages) {
+          setGroupPage(totalPages);
+          return;
+        }
+      } catch (err) {
+        if (seq !== groupSeq.current) return;
+        if (!silent) {
+          toast.error(err instanceof ApiError ? err.message : "加载用量分组失败");
+        }
       }
-    }
-  }, [detailDim]);
+    },
+    [setGroupPage],
+  );
 
   const load = useCallback(
     async (soft = false) => {
@@ -149,20 +167,26 @@ export function UsagePage() {
       void load(true);
       if (dimRef.current === "requests") {
         void loadDetail(pageRef.current, sizeRef.current, true);
+      } else {
+        void loadGrouped(groupPageRef.current, groupSizeRef.current, true);
       }
-      void loadGrouped();
     }, AUTO_REFRESH_MS);
     return () => window.clearInterval(timer);
   }, [load, loadDetail, loadGrouped]);
 
-  // 明细维度切换：请求→加载逐条分页；账号/模型→加载分组聚合
+  // 明细维度切换：请求→加载逐条分页；账号/模型→加载分组分页
   useEffect(() => {
     if (detailDim === "requests") {
       void loadDetail(detailPage, detailPageSize);
     } else {
-      void loadGrouped();
+      void loadGrouped(groupPage, groupPageSize);
     }
-  }, [detailDim, detailPage, detailPageSize, loadDetail, loadGrouped]);
+  }, [detailDim, detailPage, detailPageSize, groupPage, groupPageSize, loadDetail, loadGrouped]);
+
+  // 切换维度时分组回到第一页，避免沿用另一维度的页码导致空白
+  useEffect(() => {
+    setGroupPage(1);
+  }, [detailDim, setGroupPage]);
 
   const summary = data?.summary;
 
@@ -186,6 +210,13 @@ export function UsagePage() {
   useEffect(() => {
     if (detailPage !== detailPageSafe) setDetailPage(detailPageSafe);
   }, [detailPage, detailPageSafe, setDetailPage]);
+
+  const groupTotalPages = Math.max(1, Math.ceil(groupTotal / Math.max(1, groupPageSize)));
+  const groupPageSafe = Math.min(Math.max(1, groupPage), groupTotalPages);
+
+  useEffect(() => {
+    if (groupPage !== groupPageSafe) setGroupPage(groupPageSafe);
+  }, [groupPage, groupPageSafe, setGroupPage]);
 
   if (loading && !data) return <LoadingSkeleton />;
 
@@ -224,7 +255,11 @@ export function UsagePage() {
               disabled={refreshing}
               onClick={() => {
                 void load(true);
-                void loadDetail(detailPage, detailPageSize);
+                if (dimRef.current === "requests") {
+                  void loadDetail(detailPage, detailPageSize);
+                } else {
+                  void loadGrouped(groupPage, groupPageSize);
+                }
               }}
               title="立即刷新（另有 30s 自动刷新）"
               aria-busy={refreshing}
@@ -410,10 +445,10 @@ export function UsagePage() {
             {detailDim === "requests" ? (
               <RequestDetailTable rows={recent} />
             ) : (
-              <GroupedDetailTable rows={grouped?.[detailDim] ?? []} dimension={detailDim} />
+              <GroupedDetailTable rows={grouped[detailDim]} dimension={detailDim} />
             )}
-            {detailDim === "requests" ? (
-              <div className="usage-detail-foot">
+            <div className="usage-detail-foot">
+              {detailDim === "requests" ? (
                 <Pagination
                   page={detailPageSafe}
                   pageSize={detailPageSize}
@@ -422,14 +457,17 @@ export function UsagePage() {
                   onPageChange={setDetailPage}
                   onPageSizeChange={setDetailPageSize}
                 />
-              </div>
-            ) : (
-              <div className="usage-detail-count">
-                <span className="font-mono text-[11px] text-muted-foreground">
-                  {detailDim === "account" ? "账号" : "模型"} · {grouped?.[detailDim]?.length ?? 0} 项
-                </span>
-              </div>
-            )}
+              ) : (
+                <Pagination
+                  page={groupPageSafe}
+                  pageSize={groupPageSize}
+                  total={groupTotal}
+                  pageSizeOptions={DETAIL_PAGE_SIZE_OPTIONS}
+                  onPageChange={setGroupPage}
+                  onPageSizeChange={setGroupPageSize}
+                />
+              )}
+            </div>
           </section>
         </div>
 

@@ -53,6 +53,11 @@ from workflow.browser import (
     safe_goto,
     try_click_cookies,
 )
+from workflow import human
+from workflow.human import before_submit as human_before_submit
+from workflow.human import describe as human_describe
+from workflow.human import fidget as human_fidget
+from workflow.human import reading_pause as human_reading_pause
 from workflow.mail import create_temp_email, poll_for_code
 
 # ─── 任务协作取消：API 停止时 set，run_signups 协作退出 ────────────────────
@@ -236,14 +241,16 @@ def _on_form_page(page: Any) -> bool:
 def _camoufox_kwargs(headless: bool) -> dict[str, Any]:
     """Camoufox 启动参数：可视/无头 + 代理 + 反检测增强。
 
-    - humanize：拟人轨迹，上限 0.8s，避免用户动鼠标后无限等待
+    - humanize：仿真人引擎开启时置 False，轨迹交由 workflow.human 自己发。
+      两套拟人同时开会叠加（每段 move 都被 humanize 再曲线化一次），
+      既拖慢流程又可能因等待轨迹结束而卡住；引擎关闭时保持原有 0.8s 行为。
     - geoip：按代理 IP 自动匹配时区/语言/地理位置
     - locale：英语系 locale，与代理出口 IP 地理一致
     """
     kwargs: dict[str, Any] = {
         "headless": headless,
-        # 上限 0.8s：humanize 默认会等轨迹走完；用户动鼠标/最小化时无限等会卡死自动化
-        "humanize": 0.8,
+        # 仿真人引擎接管轨迹 → 关掉 Camoufox humanize；否则保留 0.8s 上限的原行为
+        "humanize": False if human.enabled() else 0.8,
         "geoip": True,
         "locale": ["en-US", "en"],
         # 允许点击跨域 Turnstile iframe 内勾选框（Camoufox 官方 Turnstile 场景）
@@ -470,6 +477,8 @@ def wait_until(
         # check_for_errors 保留兼容；致命文案已由 _ensure_no_page_fatal 处理
         if check_for_errors and "an error occurred" in text:
             raise PageFatalError("An error occurred")
+        # 密集轮询里低频微动，控制开销的同时打散静止态
+        human_fidget(page, chance=0.08)
         time.sleep(0.5)
     _ensure_no_page_fatal(page)
     if done_when is not None:
@@ -490,6 +499,8 @@ def _enter_signup_page(page: Any) -> bool:
     # 落地页为社交登录入口时点「Sign up with email」；已是表单页则跳过
     if _has_input(page, "input[type='email']"):
         return True
+    # 进页面先看两眼再找入口，不做「落地即点」
+    human_reading_pause(page, scale=0.5)
     for label in ("Sign up with email", "Continue with email", "Sign up with Email"):
         if click(page, label):
             _ensure_no_page_fatal(page)
@@ -511,6 +522,8 @@ def _ensure_email(
     deadline = time.time() + EMAIL_PAGE_WAIT_SECS
     while time.time() < deadline and not _has_input(page, "input[type='email']"):
         _ensure_no_page_fatal(page)
+        # 等待期间让光标偶尔动一下，避免长时间静止被判为自动化
+        human_fidget(page, chance=0.10)
         time.sleep(0.5)
     _ensure_no_page_fatal(page)
     if not _has_input(page, "input[type='email']"):
@@ -575,6 +588,7 @@ def _submit_email(page: Any, email: str) -> tuple[str, bool]:
     if not fill(page, email, EMAIL_INPUT_SELECTORS):
         logger.warning(f"[邮箱] 未找到输入框  {log_email}  · {elapsed_label(t0)}")
         return "email", False
+    human_before_submit(page)
     if not click(page, "Sign up") and not click(page, "Continue"):
         logger.warning(f"[邮箱] 未找到 Sign up 按钮  {log_email}  · {elapsed_label(t0)}")
         return "email", False
@@ -654,6 +668,7 @@ def _wait_form_ready(page: Any, timeout: int = FORM_READY_TIMEOUT) -> bool:
             else:
                 last_click = time.time()
             _ensure_no_page_fatal(page)
+        human_fidget(page, chance=0.10)
         time.sleep(0.5)
     _ensure_no_page_fatal(page)
     return _on_form_page(page)
@@ -891,6 +906,7 @@ def _fill_signup_form(page: Any, first_name: str, last_name: str, password: str)
 
     # Turnstile / 填表期间 Cookie 横幅可能再次盖住提交按钮
     try_click_cookies(page)
+    human_before_submit(page)
     if not click(page, "Complete sign up") and not click(page, "Create account") and not click(page, "Continue"):
         logger.warning(f"[资料] 未找到提交按钮  {full_name}  · {elapsed_label(t0)}")
         _dump_page(page, "complete-signup-missing")
@@ -964,6 +980,8 @@ def _wait_sso_ready(
                     continue
                 break
             _ensure_no_page_fatal(page)
+        # SSO 落地前的等待最长，最需要打散静止态
+        human_fidget(page, chance=0.15)
         time.sleep(SSO_POLL_INTERVAL)
     who = email or ""
     logger.error(
@@ -1239,6 +1257,7 @@ def preflight_check() -> bool:
     只做 HTTP 探测，不开浏览器。人机验证由正式注册窗口处理。
     任一项不通过返回 False，调用方应中止注册任务。
     """
+    logger.info(f"[预检] {human_describe()}")
     mail_base = _mail_base_url()
     results = {
         "proxy": _check_proxy(),

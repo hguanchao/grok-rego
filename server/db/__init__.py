@@ -1109,20 +1109,24 @@ _GROUPED_KEY = {
 }
 
 
-def query_usage_grouped(*, dimension: str) -> dict[str, Any]:
-    """按维度聚合用量：account（账号）/ model（模型）。
+def query_usage_grouped(
+    *, dimension: str, offset: int = 0, limit: int = 0
+) -> dict[str, Any]:
+    """按维度聚合用量：account（账号）/ model（模型），支持分页。
 
     返回每个维度的请求数、成功/失败、token 汇总与最近一次时间。
+    limit <= 0 表示不分页（返回全量，兼容老调用）；limit > 0 时按 offset 分页，
+    同时返回分组总数 total 供前端算总页数。
     dimension 非法时抛 ValueError（API 映射 400）。
     """
     if dimension not in _GROUPED_KEY:
         raise ValueError(f"dimension 仅支持 {'/'.join(_GROUPED_KEY)}")
     init_usages_table()
     key_expr = _GROUPED_KEY[dimension]
-    with connect() as conn:
-        conn.row_factory = sqlite3.Row
-        rows = conn.execute(
-            f"""
+    offset = max(0, int(offset))
+    limit = max(0, int(limit))
+    # 聚合作为子查询：总数 COUNT 与分页取页共用同一段 SQL，避免两处逻辑漂移
+    grouped = f"""
             SELECT {key_expr} AS key,
                    COUNT(*) AS requests,
                    SUM(CASE WHEN status = 1 THEN 1 ELSE 0 END) AS success,
@@ -1135,9 +1139,16 @@ def query_usage_grouped(*, dimension: str) -> dict[str, Any]:
                    MAX(created_at) AS last_at
             FROM usages
             GROUP BY key
-            ORDER BY requests DESC, key
-            """
-        ).fetchall()
+    """
+    with connect() as conn:
+        conn.row_factory = sqlite3.Row
+        total = conn.execute(f"SELECT COUNT(*) FROM ({grouped})").fetchone()[0]
+        sql = f"SELECT * FROM ({grouped}) ORDER BY requests DESC, key"
+        params: list[Any] = []
+        if limit > 0:
+            sql += " LIMIT ? OFFSET ?"
+            params = [limit, offset]
+        rows = conn.execute(sql, params).fetchall()
     items: list[dict[str, Any]] = []
     for row in rows:
         p = _usages_int(row, "prompt_tokens")
@@ -1157,7 +1168,13 @@ def query_usage_grouped(*, dimension: str) -> dict[str, Any]:
                 "last_at": str(row["last_at"] or ""),
             }
         )
-    return {"dimension": dimension, "items": items}
+    return {
+        "dimension": dimension,
+        "items": items,
+        "total": int(total or 0),
+        "offset": offset,
+        "limit": limit,
+    }
 
 
 # ─── 网关运维聚合查询 ─────────────────────────────────────

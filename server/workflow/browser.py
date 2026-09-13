@@ -2,6 +2,9 @@
 浏览器自动化辅助函数。
 
 模拟真人行为：逐字键入、鼠标移动、Cookie 处理、Turnstile 验证等。
+
+拟人动作统一委托 workflow.human（贝塞尔轨迹 / 拟人点击 / 拟人键入 / 空闲微动），
+本模块只负责元素定位与降级兜底。human_sim 关闭时行为与接入前一致。
 """
 
 import random
@@ -11,6 +14,7 @@ from typing import Any
 from core.config import GOTO_TIMEOUT
 from core.logger import logger
 from core.util import elapsed_label
+from workflow import human
 
 # 全页拦截特征：禁止用 challenges.cloudflare.com（Turnstile widget 的 iframe/脚本也会命中）
 _CF_INTERSTITIAL_URL = ("cf-chl-", "/cdn-cgi/challenge")
@@ -41,25 +45,29 @@ _COOKIE_SELECTORS = (
 
 
 def human_mouse_move(page: Any) -> None:
-    """空操作。多段 page.mouse.move 会被 Camoufox humanize 接管；
+    """页面就绪后的拟人热身：一次曲线轨迹 + 阅读停顿。
 
-    用户动鼠标或最小化窗口时轨迹等不到结束，整段自动化会卡住。
-    点击一律走 locator.click（带超时），拟人轨迹由 Camoufox 自己做。
+    轨迹由 workflow.human 自己发（带总时长预算与实测延迟自适应），
+    不会像多段裸 mouse.move 那样在用户动鼠标 / 窗口最小化时卡住。
     """
-    return
+    human.warmup(page)
 
 
 def _human_click(page: Any, x: float, y: float) -> None:
-    """坐标点击：只发一次 click，轨迹交给 Camoufox humanize，避免多段 move 卡死。"""
+    """坐标点击：优先拟人轨迹点击；引擎关闭或异常时退化为一次直达 click。"""
+    if human.click_at(page, x, y):
+        return
     page.mouse.click(x, y, delay=random.randint(30, 90))
 
 
 def human_click_locator(page: Any, locator: Any) -> bool:
-    """优先 locator.click（有超时，Camoufox 仍会拟人化轨迹）；失败再坐标点。"""
+    """拟人点击元素；失败依次退回原生 locator.click 与坐标点击。"""
     try:
         locator.scroll_into_view_if_needed(timeout=2000)
     except Exception:
         pass
+    if human.click(page, locator, timeout=8000):
+        return True
     try:
         locator.click(timeout=8000, delay=random.randint(30, 90))
         return True
@@ -81,7 +89,12 @@ def human_click_locator(page: Any, locator: Any) -> bool:
 def human_type_locator(
     page: Any, locator: Any, text: str, *, clear: bool = False
 ) -> bool:
-    """点击聚焦后逐字键入；clear=True 时先全选删除（验证码复用）。"""
+    """拟人键入：曲线移动聚焦后逐字敲入（含错字回删、思考停顿）并回读校验。
+
+    clear=True 时先全选删除（验证码复用）。引擎不可用时退化为原生逐字键入。
+    """
+    if human.type_text(page, locator, text, clear=clear):
+        return True
     human_click_locator(page, locator)
     page.wait_for_timeout(random.randint(200, 500))
     if clear:
@@ -110,6 +123,8 @@ def safe_goto(page: Any, url: str) -> bool:
             return False
         logger.debug("[浏览器] 页面已部分加载，继续尝试")
     handle_cf_challenge(page)
+    # 落地后的阅读停顿：真人不会在页面刚出来就立刻动手
+    human.reading_pause(page)
     return True
 
 

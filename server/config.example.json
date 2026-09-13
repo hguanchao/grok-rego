@@ -13,5 +13,7 @@
   "g2a_password": "",
   "cpa_base_url": "",
   "cpa_management_key": "",
-  "grok_version": "1.0.16"
+  "grok_version": "1.0.16",
+  "human_sim": true,
+  "human_level": "normal"
 }

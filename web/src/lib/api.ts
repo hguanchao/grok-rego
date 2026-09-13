@@ -4,6 +4,8 @@
 
 export type MailProvider = "cf" | "yyds";
 export type DomainMode = "poll" | "random";
+/** 全局仿真人强度：light 快 / normal 平衡 / heavy 最像人 */
+export type HumanLevel = "light" | "normal" | "heavy";
 
 export interface AppConfig {
   cf_api_base: string;
@@ -22,6 +24,8 @@ export interface AppConfig {
   cpa_management_key: string;
   gateway_api_key: string;
   grok_version: string;
+  human_sim: boolean;
+  human_level: HumanLevel;
 }
 
 export interface LogEntry {
@@ -586,6 +590,10 @@ export interface UsageGroupedRow {
 export interface UsageGroupedData {
   dimension: UsageGroupDim;
   items: UsageGroupedRow[];
+  /** 分组总数（不分页时等于 items.length） */
+  total: number;
+  offset: number;
+  limit: number;
 }
 
 export async function fetchUsageSummary(days = 1): Promise<UsageSummaryData> {
@@ -605,6 +613,14 @@ export async function fetchUsageRecent(
 
 export async function fetchUsageGrouped(
   dimension: UsageGroupDim,
+  offset = 0,
+  limit = 0,
 ): Promise<UsageGroupedData> {
-  return request<UsageGroupedData>(`/api/usage/grouped?dim=${dimension}`);
+  // limit = 0 → 后端不分页，返回全量
+  const params = new URLSearchParams({
+    dim: dimension,
+    offset: String(Math.max(0, offset)),
+    limit: String(Math.max(0, limit)),
+  });
+  return request<UsageGroupedData>(`/api/usage/grouped?${params.toString()}`);
 }
