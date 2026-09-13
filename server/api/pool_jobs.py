@@ -7,7 +7,8 @@ from __future__ import annotations
 
 - HTTP 直连 curl_cffi（Chrome TLS 指纹），代理走代理池
 - 探活走 GET /billing 验证 token 有效性（不计费、不消耗生成额度）
-- 降智判定已移交网关被动审计（gateway/quality.py）：命中→冷却 12h→再犯长期排除
+- 降智判定不再存在：网关被动审计（gateway/quality.py）已于 2026-09-13 移除，
+  accounts 的 quality_* 字段不再被写入（仅保留历史值与手动清理接口）
 - 网络失败自动重试一次
 """
 
@@ -265,7 +266,7 @@ kind=inspect  GET /billing 探活验证 token：2xx 恢复 ACTIVE，临期（≤
               401·403 恢复链（刷新后再探，仍失效标 REAUTH）/
               402·429 限流配额 / 网络与 5xx 不改状态只记原因
               续期失败不判死（探活已通过，旧 token 仍可用，下轮重试）；
-              降智判定不在巡检：由网关被动审计（gateway/quality.py）负责
+              降智判定不在巡检（网关被动审计已移除，不再有任何写入方）
 kind=reauth   重登闭环：有 refresh_token 先 OIDC 刷新；被拒或无刷新凭据
               降级为 device flow 重新授权（入认证池），远端交换 token
 """

@@ -32,7 +32,7 @@ from datetime import date, timedelta
 from typing import Any
 
 from core.logger import logger
-from core.util import decode_jwt_exp, iso_after_hours, now_dt, now_iso_tz
+from core.util import decode_jwt_exp, now_dt, now_iso_tz
 
 # 兼容已有数据库：表已存在但缺少新字段时补加
 _ACCOUNT_MIGRATIONS = [
@@ -246,68 +246,6 @@ def list_gateway_candidates() -> list[dict[str, Any]]:
             (STATUS_ACTIVE, now),
         ).fetchall()
     return [dict(row) for row in rows]
-
-
-def mark_quality_hit(account_id: int, *, cooldown_hours: float = 12) -> str:
-    """网关被动审计命中降智（missing_thinking）：命中升级制。
-
-    agent 流量的工具调用轮次上游可能不计费推理，单轮命中不可靠——
-    第 1 次仅记 strike 观察；12h 内再次命中才冷却（cooldown_hours）；
-    冷却结束后第 3 次命中长期排除。
-
-    返回动作：observed（首次，仅记录不惩罚）/ cooled（冷却 12h）/
-    disabled（第 3 次，长期排除）/ unchanged（冷却中或已排除）。
-    """
-    with connect() as conn:
-        cursor = conn.cursor()
-        row = cursor.execute(
-            "SELECT COALESCE(quality_strikes, 0), COALESCE(quality_disabled, 0), "
-            "COALESCE(quality_cooldown_until, '') FROM accounts WHERE id=?",
-            (int(account_id),),
-        ).fetchone()
-        if row is None:
-            return "unchanged"
-        strikes, disabled, cooldown_until = int(row[0]), int(row[1]), str(row[2] or "")
-        now = now_iso_tz()
-        if disabled or cooldown_until > now:
-            return "unchanged"
-        strikes += 1
-        if strikes >= 3:
-            cursor.execute(
-                "UPDATE accounts SET quality_disabled=1, quality_cooldown_until='', "
-                "quality_strikes=?, updated_at=? "
-                "WHERE id=? AND COALESCE(is_deleted, 0) = 0",
-                (strikes, now, int(account_id)),
-            )
-            conn.commit()
-            logger.warning(
-                f"[数据库] 网关质量判定第 {strikes} 次命中 id={account_id} 长期排除"
-                f"（可通过手动启用或重置恢复）"
-            )
-            return "disabled"
-        if strikes >= 2:
-            cursor.execute(
-                "UPDATE accounts SET quality_strikes=?, quality_cooldown_until=?, "
-                "updated_at=? WHERE id=? AND COALESCE(is_deleted, 0) = 0",
-                (strikes, iso_after_hours(cooldown_hours), now, int(account_id)),
-            )
-            conn.commit()
-            logger.warning(
-                f"[数据库] 网关质量判定第 {strikes} 次命中 id={account_id} "
-                f"冷却 {cooldown_hours:g}h（冷却结束自动恢复选号资格）"
-            )
-            return "cooled"
-        cursor.execute(
-            "UPDATE accounts SET quality_strikes=?, updated_at=? "
-            "WHERE id=? AND COALESCE(is_deleted, 0) = 0",
-            (strikes, now, int(account_id)),
-        )
-        conn.commit()
-        logger.warning(
-            f"[数据库] 网关质量判定首次命中 id={account_id}（仅记录观察，"
-            f"再次命中才冷却）"
-        )
-        return "observed"
 
 
 def clear_quality_flags(account_ids: list[int]) -> int:
