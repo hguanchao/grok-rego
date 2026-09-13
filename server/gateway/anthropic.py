@@ -12,6 +12,8 @@ import time
 from collections.abc import Iterator
 from typing import Any
 
+from core.logger import logger
+
 _NATIVE_MESSAGES_PREFIX = ("claude-", "qwen")
 _FREE_UPSTREAM = "big-pickle"
 # Claude Code 内置档位 / 全名 → 免费模型（Zen public 密钥打不了付费 Claude）
@@ -341,6 +343,14 @@ def chat_to_message(payload: dict[str, Any], model: str | None) -> dict[str, Any
     if not content:
         content.append({"type": "text", "text": ""})
     usage = payload.get("usage") if isinstance(payload.get("usage"), dict) else {}
+    pdet = usage.get("prompt_tokens_details")
+    cache_read = int(pdet.get("cached_tokens") or 0) if isinstance(pdet, dict) else 0
+    nonstream_usage: dict[str, int] = {
+        "input_tokens": int(usage.get("prompt_tokens") or 0),
+        "output_tokens": int(usage.get("completion_tokens") or 0),
+    }
+    if cache_read:
+        nonstream_usage["cache_read_input_tokens"] = cache_read
     return {
         "id": str(payload.get("id") or f"msg_{int(time.time())}"),
         "type": "message",
@@ -349,10 +359,7 @@ def chat_to_message(payload: dict[str, Any], model: str | None) -> dict[str, Any
         "content": content,
         "stop_reason": _stop_reason(str(choice.get("finish_reason") or "stop")),
         "stop_sequence": None,
-        "usage": {
-            "input_tokens": int(usage.get("prompt_tokens") or 0),
-            "output_tokens": int(usage.get("completion_tokens") or 0),
-        },
+        "usage": nonstream_usage,
     }
 
 
@@ -370,6 +377,8 @@ def iter_anthropic_sse(openai_chunks: Iterator[bytes], model: str | None) -> Ite
     block_index = -1
     msg_id = f"msg_{int(time.time() * 1000)}"
     output_tokens = 0
+    input_tokens = 0
+    cache_read_tokens = 0
     stop = "end_turn"
     tool_blocks: dict[int, int] = {}
     tool_args: dict[int, str] = {}
@@ -468,6 +477,16 @@ def iter_anthropic_sse(openai_chunks: Iterator[bytes], model: str | None) -> Ite
             },
         )
 
+    def _final_usage() -> dict[str, int]:
+        # Anthropic 原生流：input_tokens 在 message_start，累计值在 message_delta。
+        # 此前只回 output_tokens，客户端用量恒为 0；现把上游 usage 全量回传。
+        out: dict[str, int] = {"output_tokens": output_tokens}
+        if input_tokens:
+            out["input_tokens"] = input_tokens
+        if cache_read_tokens:
+            out["cache_read_input_tokens"] = cache_read_tokens
+        return out
+
     def close_all() -> Iterator[bytes]:
         if not started:
             yield from ensure_message()
@@ -479,7 +498,7 @@ def iter_anthropic_sse(openai_chunks: Iterator[bytes], model: str | None) -> Ite
             {
                 "type": "message_delta",
                 "delta": {"stop_reason": stop, "stop_sequence": None},
-                "usage": {"output_tokens": output_tokens},
+                "usage": _final_usage(),
             },
         )
         yield _sse("message_stop", {"type": "message_stop"})
@@ -509,6 +528,11 @@ def iter_anthropic_sse(openai_chunks: Iterator[bytes], model: str | None) -> Ite
             if obj.get("id"):
                 msg_id = str(obj["id"])
             usage = obj.get("usage") if isinstance(obj.get("usage"), dict) else {}
+            if usage.get("prompt_tokens"):
+                input_tokens = int(usage["prompt_tokens"])
+                pdet = usage.get("prompt_tokens_details")
+                if isinstance(pdet, dict) and pdet.get("cached_tokens"):
+                    cache_read_tokens = int(pdet["cached_tokens"])
             if usage.get("completion_tokens"):
                 output_tokens = int(usage["completion_tokens"])
             choices = obj.get("choices")
@@ -616,6 +640,22 @@ def messages_to_responses(payload: dict[str, Any]) -> dict[str, Any]:
     """
     system = _system_to_text(payload.get("system"))
     messages: list[dict[str, Any]] = []
+    # /compact 后的历史可能把过期工具轮压缩成"裸 tool_result"（无对应 tool_use）：
+    # 上游按 call_id 校验配对会 400，此处预过滤掉无配对的 tool_result。
+    declared_ids: set[str] = set()
+    for item in payload.get("messages") or []:
+        if not isinstance(item, dict):
+            continue
+        content = item.get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            btype = str(block.get("type") or "")
+            if btype == "tool_use" and block.get("id"):
+                declared_ids.add(str(block["id"]))
+    dropped_orphans = 0
     for item in payload.get("messages") or []:
         if not isinstance(item, dict):
             continue
@@ -643,7 +683,13 @@ def messages_to_responses(payload: dict[str, Any]) -> dict[str, Any]:
             elif btype == "tool_result":
                 call_id = str(block.get("tool_use_id") or "")
                 output_text = _text_of(block.get("content"))
-                if call_id:
+                if not call_id:
+                    # 异常历史（缺 tool_use_id）：回退普通文本，保证请求可解析
+                    text_parts.append(output_text)
+                elif call_id not in declared_ids:
+                    # 压缩后残留的孤儿 tool_result：上游配对校验必 400，直接丢弃
+                    dropped_orphans += 1
+                else:
                     tool_items.append(
                         {
                             "type": "function_call_output",
@@ -651,9 +697,6 @@ def messages_to_responses(payload: dict[str, Any]) -> dict[str, Any]:
                             "output": output_text,
                         }
                     )
-                else:
-                    # 异常历史（缺 tool_use_id）：回退普通文本，保证请求可解析
-                    text_parts.append(output_text)
             elif btype == "tool_use":
                 tool_items.append(
                     {
@@ -671,6 +714,11 @@ def messages_to_responses(payload: dict[str, Any]) -> dict[str, Any]:
         "input": messages if messages else "",
         "stream": bool(payload.get("stream")),
     }
+    if dropped_orphans:
+        logger.warning(
+            f"[网关] Responses 翻译丢弃 {dropped_orphans} 个孤儿 tool_result"
+            "（疑 /compact 压缩残留，避免上游 400）"
+        )
     if system:
         out["instructions"] = system
     # 思考预算 → 推理档位；Responses 用 reasoning.effort（上游不认 max，钳制到合法档）
@@ -758,6 +806,14 @@ def responses_to_message(payload: dict[str, Any], model: str | None) -> dict[str
     if not content:
         content.append({"type": "text", "text": ""})
     usage = payload.get("usage") if isinstance(payload.get("usage"), dict) else {}
+    idet = usage.get("input_tokens_details")
+    resp_cache = int(idet.get("cached_tokens") or 0) if isinstance(idet, dict) else 0
+    resp_usage: dict[str, int] = {
+        "input_tokens": int(usage.get("input_tokens") or 0),
+        "output_tokens": int(usage.get("output_tokens") or 0),
+    }
+    if resp_cache:
+        resp_usage["cache_read_input_tokens"] = resp_cache
     return {
         "id": f"msg_{int(time.time())}",
         "type": "message",
@@ -766,10 +822,7 @@ def responses_to_message(payload: dict[str, Any], model: str | None) -> dict[str
         "content": content,
         "stop_reason": stop,
         "stop_sequence": None,
-        "usage": {
-            "input_tokens": int(usage.get("input_tokens") or 0),
-            "output_tokens": int(usage.get("output_tokens") or 0),
-        },
+        "usage": resp_usage,
     }
 
 
@@ -788,6 +841,8 @@ def iter_responses_sse(gen: Iterator[bytes], model: str | None) -> Iterator[byte
     block_index = -1
     msg_id = f"msg_{int(time.time() * 1000)}"
     output_tokens = 0
+    input_tokens = 0
+    cache_read_tokens = 0
     stop = "end_turn"
     # 流终 stop_reason 收敛为 tool_use，CLI 才会执行工具并回传 tool_result
     tool_seen = False
@@ -877,6 +932,16 @@ def iter_responses_sse(gen: Iterator[bytes], model: str | None) -> Iterator[byte
             },
         )
 
+    def _final_usage() -> dict[str, int]:
+        # Responses 路由此前只回 output_tokens，客户端用量恒为 0；
+        # input_tokens / cache_read_input_tokens 从 response.usage 透传。
+        out: dict[str, int] = {"output_tokens": output_tokens}
+        if input_tokens:
+            out["input_tokens"] = input_tokens
+        if cache_read_tokens:
+            out["cache_read_input_tokens"] = cache_read_tokens
+        return out
+
     def finish() -> Iterator[bytes]:
         # 先发 message_start：reasoning 耗尽预算等场景上游无任何文本增量，
         # 不补 start 会让 Claude Code 收到无头 SSE 而判定流式不完整
@@ -891,7 +956,7 @@ def iter_responses_sse(gen: Iterator[bytes], model: str | None) -> Iterator[byte
             {
                 "type": "message_delta",
                 "delta": {"stop_reason": final_stop, "stop_sequence": None},
-                "usage": {"output_tokens": output_tokens},
+                "usage": _final_usage(),
             },
         )
         yield _sse("message_stop", {"type": "message_stop"})
@@ -926,6 +991,11 @@ def iter_responses_sse(gen: Iterator[bytes], model: str | None) -> Iterator[byte
                 if resp.get("id"):
                     msg_id = str(resp["id"])
                 u = resp.get("usage") if isinstance(resp.get("usage"), dict) else {}
+                if u.get("input_tokens"):
+                    input_tokens = int(u["input_tokens"])
+                    idet = u.get("input_tokens_details")
+                    if isinstance(idet, dict) and idet.get("cached_tokens"):
+                        cache_read_tokens = int(idet["cached_tokens"])
                 if u.get("output_tokens"):
                     output_tokens = int(u["output_tokens"])
                 inc = resp.get("incomplete_details")

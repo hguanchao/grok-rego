@@ -741,6 +741,17 @@ def proxy(handler: BaseHTTPRequestHandler, method: str, path: str) -> None:
                 usage = acc.result()
         else:
             payload = upstream.content or b""
+            if status >= 400:
+                # 上游拒收（如超窗/坏工具对）：原文只透传给客户端，err 为空会导致
+                # 用量 reason=None、日志只有 status，事后无法定位。截断记入 err。
+                raw_text = payload.decode("utf-8", "replace").strip()
+                snippet = " ".join(raw_text.split())[:240]
+                err = f"upstream_{status}:{snippet}" if snippet else f"upstream_{status}"
+                logger.warning(
+                    f"[网关] 上游拒收 {method} {path} model={model or '-'} "
+                    f"status={status} in={len(forward_body)} out={len(payload)} "
+                    f"effort={effort_flag or '-'} err={snippet or '-'}"
+                )
             if status < 400 and resource_path(path, "/zen") == "/models":
                 payload = _filter_free_models(payload)
             elif status < 400 and translate:
