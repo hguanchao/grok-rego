@@ -92,24 +92,36 @@ function tagSlug(tag: string): string {
       return "preflight";
     case "任务":
       return "task";
+    case "批量注册":
+      return "batch";
     case "入池":
       return "inpool";
     case "出池":
       return "outpool";
+    case "认证":
+      return "auth";
     case "注册":
       return "signup";
     case "邮箱":
       return "mail";
+    case "临时邮箱":
+      return "mailtemp";
     case "邮件":
       return "inbox";
     case "资料":
       return "profile";
     case "CF挑战":
       return "cf";
+    case "Turnstile":
+      return "turnstile";
     case "SSO":
       return "sso";
     case "风控":
       return "risk";
+    case "浏览器":
+      return "browser";
+    case "诊断":
+      return "diag";
     default:
       return "misc";
   }

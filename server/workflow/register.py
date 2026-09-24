@@ -142,8 +142,8 @@ EMAIL_INPUT_SELECTORS = [
     "input[autocomplete='email']",
 ]
 
-FIRST_NAMES = ["James", "John", "Robert", "Michael", "William", "David", "Richard", "Joseph", "Thomas", "Charles", "Christopher", "Daniel", "Matthew", "Anthony", "Mark", "Donald", "Steven", "Paul", "Andrew", "Joshua", "Kenneth", "Kevin", "Brian", "George", "Edward", "Ronald", "Timothy", "Jason", "Jeffrey", "Ryan", "Mary", "Patricia", "Jennifer", "Linda", "Elizabeth", "Barbara", "Susan", "Jessica", "Sarah", "Karen", "Nancy", "Lisa", "Betty", "Margaret", "Sandra", "Ashley", "Kimberly", "Emily", "Donna", "Michelle", "Carol", "Amanda", "Melissa", "Deborah", "Stephanie", "Rebecca", "Sharon", "Laura", "Cynthia", "Nicholas", "Tyler", "Samuel", "Benjamin", "Nathan", "Alexander", "Peter", "Henry", "Douglas", "Zachary", "Brandon", "Patrick", "Jeremy", "Rachel", "Laura", "Amber", "Crystal", "Morgan", "Jasmine", "Nicole", "Brittany", "Danielle", "Samantha", "Alexis", "Victoria", "Grace", "Faith", "Autumn", "Sophia", "Natalia", "Marcus", "Dominic", "Vincent", "Adrian", "Elias", "Tristan", "Donovan", "Gabriel", "Camille", "Beatrice", "Daisy", "Evelyn", "Iris", "Naomi", "Quinn", "Wyatt", "Cole", "Easton", "Landon", "Jace", "Maxwell", "Orion", "Silas", "Asher", "Jonah", "Micah", "Ezra", "Ezra", "Simon", "Felix", "Hugo"]
-LAST_NAMES = ["Smith", "Johnson", "Williams", "Brown", "Jones", "Garcia", "Miller", "Davis", "Rodriguez", "Martinez", "Hernandez", "Lopez", "Gonzalez", "Wilson", "Anderson", "Thomas", "Taylor", "Moore", "Jackson", "Martin", "Lee", "Perez", "Thompson", "White", "Harris", "Sanchez", "Clark", "Ramirez", "Lewis", "Robinson", "Walker", "Young", "Allen", "King", "Wright", "Scott", "Torres", "Nguyen", "Hill", "Flores", "Green", "Adams", "Nelson", "Baker", "Hall", "Rivera", "Campbell", "Mitchell", "Carter", "Roberts", "Phillips", "Evans", "Turner", "Diaz", "Parker", "Cruz", "Edwards", "Collins", "Reyes", "Stewart", "Morris", "Morales", "Murphy", "Cook", "Rogers", "Gutierrez", "Ortiz", "Watkins", "Fisher", "Bishop", "Wallace", "Simpson", "Daniels", "Gordon", "Austin", "Marshall", "Pierce", "Hawkins", "Jensen", "Crawford", "Bennett", "Robertson", "Boyd", "Mason", "Romero", "Robertson", "Fox", "Warren", "Burton", "Pierce", "Spencer", "Cole", "Holloway", "Brock", "Vasquez", "Montes", "Rhodes", "Cabrera", "Donovan", "Beck", "Sanford", "Kramer", "Whitfield", "Norris", "Townes", "Pemberton"]
+FIRST_NAMES = ["James", "John", "Robert", "Michael", "William", "David", "Richard", "Joseph", "Thomas", "Charles", "Christopher", "Daniel", "Matthew", "Anthony", "Mark", "Donald", "Steven", "Paul", "Andrew", "Joshua", "Kenneth", "Kevin", "Brian", "George", "Edward", "Ronald", "Timothy", "Jason", "Jeffrey", "Ryan", "Mary", "Patricia", "Jennifer", "Linda", "Elizabeth", "Barbara", "Susan", "Jessica", "Sarah", "Karen", "Nancy", "Lisa", "Betty", "Margaret", "Sandra", "Ashley", "Kimberly", "Emily", "Donna", "Michelle", "Carol", "Amanda", "Melissa", "Deborah", "Stephanie", "Rebecca", "Sharon", "Laura", "Cynthia", "Nicholas", "Tyler", "Samuel", "Benjamin", "Nathan", "Alexander", "Peter", "Henry", "Douglas", "Zachary", "Brandon", "Patrick", "Jeremy", "Rachel", "Amber", "Crystal", "Morgan", "Jasmine", "Nicole", "Brittany", "Danielle", "Samantha", "Alexis", "Victoria", "Grace", "Faith", "Autumn", "Sophia", "Natalia", "Marcus", "Dominic", "Vincent", "Adrian", "Elias", "Tristan", "Donovan", "Gabriel", "Camille", "Beatrice", "Daisy", "Evelyn", "Iris", "Naomi", "Quinn", "Wyatt", "Cole", "Easton", "Landon", "Jace", "Maxwell", "Orion", "Silas", "Asher", "Jonah", "Micah", "Ezra", "Simon", "Felix", "Hugo"]
+LAST_NAMES = ["Smith", "Johnson", "Williams", "Brown", "Jones", "Garcia", "Miller", "Davis", "Rodriguez", "Martinez", "Hernandez", "Lopez", "Gonzalez", "Wilson", "Anderson", "Thomas", "Taylor", "Moore", "Jackson", "Martin", "Lee", "Perez", "Thompson", "White", "Harris", "Sanchez", "Clark", "Ramirez", "Lewis", "Robinson", "Walker", "Young", "Allen", "King", "Wright", "Scott", "Torres", "Nguyen", "Hill", "Flores", "Green", "Adams", "Nelson", "Baker", "Hall", "Rivera", "Campbell", "Mitchell", "Carter", "Roberts", "Phillips", "Evans", "Turner", "Diaz", "Parker", "Cruz", "Edwards", "Collins", "Reyes", "Stewart", "Morris", "Morales", "Murphy", "Cook", "Rogers", "Gutierrez", "Ortiz", "Watkins", "Fisher", "Bishop", "Wallace", "Simpson", "Daniels", "Gordon", "Austin", "Marshall", "Pierce", "Hawkins", "Jensen", "Crawford", "Bennett", "Robertson", "Boyd", "Mason", "Romero", "Fox", "Warren", "Burton", "Spencer", "Cole", "Holloway", "Brock", "Vasquez", "Montes", "Rhodes", "Cabrera", "Donovan", "Beck", "Sanford", "Kramer", "Whitfield", "Norris", "Townes", "Pemberton"]
 
 
 def _generate_profile_name() -> tuple[str, str]:
@@ -231,6 +231,28 @@ def _on_form_page(page: Any) -> bool:
         return False
     return any(_has_input(page, sel) for sel in FORM_FIRST_SELECTORS) or _has_input(
         page, "input[type='password']"
+    )
+
+
+def _is_signup_landing(page: Any) -> bool:
+    """是否为注册入口落地页（社交登录按钮页，无邮箱框）。
+
+    用于 SSO 刷新重试后识别 SPA 状态归零：此时应重新进入邮箱流程，
+    而不是误入 OTP 流水线干等 30s 验证码文案。
+    """
+    if _has_input(page, "input[type='email']"):
+        return False
+    try:
+        body = _page_text(page)
+    except Exception:
+        return False
+    return any(
+        marker in body
+        for marker in (
+            "sign up with email",
+            "continue with email",
+            "continue with google",
+        )
     )
 
 
@@ -349,7 +371,7 @@ def click(
         f'text="{text}"',
         f"input[type='submit'][value='{text}']",
     )
-    for _ in range(retries + 1):
+    for round_no in range(retries + 1):
         if _is_closed(page):
             logger.debug(f"[注册] 页面已关闭，停止点击: {text}")
             return False
@@ -383,11 +405,15 @@ def click(
         except Exception:
             logger.debug(f"[注册] 页面已关闭，停止点击: {text}")
             return False
+        if not quiet:
+            logger.info(
+                f"[注册] 「{text}」第 {round_no + 1}/{retries + 1} 轮未命中，等待重试"
+            )
     if _is_closed(page) or quiet:
         return False
     url = page.url
     body = _page_text(page)[:300].replace("\n", " ")
-    logger.debug(f"[注册] 未找到可点击元素: {text} | URL: {url} | BODY: {body}")
+    logger.warning(f"[注册] 未找到可点击元素: {text} | URL: {url} | BODY: {body}")
     return False
 
 
@@ -498,6 +524,7 @@ def _enter_signup_page(page: Any) -> bool:
     # 落地页为社交登录入口时点「Sign up with email」；已是表单页则跳过
     if _has_input(page, "input[type='email']"):
         return True
+    logger.info("[注册] 落地页未直接出现邮箱框，尝试点击邮箱注册入口")
     # 进页面先看两眼再找入口，不做「落地即点」
     human_reading_pause(page, scale=0.5)
     for label in ("Sign up with email", "Continue with email", "Sign up with Email"):
@@ -541,7 +568,7 @@ def _ensure_email(
         if not email:
             logger.error(f"[邮箱] 邮箱创建失败  · {elapsed_label(create_t0)}")
             return None
-        logger.debug(f"[邮箱] 已创建 {email}  · {elapsed_label(create_t0)}")
+        logger.info(f"[邮箱] 已创建 {email}  · {elapsed_label(create_t0)}")
     if not first_name or not last_name:
         first_name, last_name = _generate_profile_name()
     return email, jwt, first_name, last_name
@@ -618,22 +645,23 @@ def _type_otp(page: Any, selector: str, value: str) -> bool:
 
 
 def _fill_otp(page: Any, code: str) -> bool:
-    """填入验证码：去连字符后逐字键入（页面是 3-3 分框，连字符仅为装饰）。"""
+    """填入验证码：去连字符后逐字键入（页面是 3-3 分框，连字符仅为装饰）。
+
+    顺序：先试明确的单框选择器，再试分框逐格；泛型 inputmode/tel 放最后，
+    避免命中分框第一个框（maxlength=1）导致只敲进 1 个字符。
+    """
     compact = re.sub(r"[^A-Za-z0-9]", "", code)
     if not compact:
         return False
-    selectors = [
+    single_box_selectors = [
         "input[name='code']",
         "input[autocomplete='one-time-code']",
-        "input[inputmode='numeric']",
-        "input[inputmode='text'][maxlength='6']",
-        "input[name='otp']",
-        "input[type='tel']",
         "input[maxlength='6']",
     ]
-    for selector in selectors:
+    for selector in single_box_selectors:
         if _type_otp(page, selector, compact):
             return True
+    # 分框（每框 maxlength=1）：逐格键入
     if len(compact) >= 6:
         for frame in _frames(page):
             try:
@@ -641,11 +669,15 @@ def _fill_otp(page: Any, code: str) -> bool:
                 count = boxes.count()
                 if count < 6:
                     continue
-                for index, char in enumerate(compact[:count]):
+                for index, char in enumerate(compact[:6]):
                     human_type_locator(page, boxes.nth(index), char)
                 return True
             except Exception:
                 continue
+    # 泛型兜底：可能命中分框首格，仅当前两类都失败时才尝试
+    for selector in ("input[inputmode='numeric']", "input[name='otp']", "input[type='tel']"):
+        if _type_otp(page, selector, compact):
+            return True
     return False
 
 
@@ -901,7 +933,6 @@ def _fill_signup_form(page: Any, first_name: str, last_name: str, password: str)
         return False
 
     _check_marketing_opt_in(page)
-    _dump_page(page, "marketing-opt-in")
 
     # Turnstile / 填表期间 Cookie 横幅可能再次盖住提交按钮
     try_click_cookies(page)
@@ -1054,7 +1085,12 @@ def _run_attempt(
         return account_id, email, jwt, first_name, last_name, stage
 
     try:
+        launch_t0 = time.monotonic()
         with Camoufox(**_camoufox_kwargs(headless)) as browser:
+            logger.info(
+                f"[注册] 浏览器已启动（首次启动需下载内核/生成指纹，可能较慢）"
+                f"  · {elapsed_label(launch_t0)}"
+            )
             page = _open_page(browser)
             nav_t0 = time.monotonic()
             if safe_goto(page, config.SIGNUP_URL):
@@ -1087,7 +1123,11 @@ def _run_attempt(
                         fail_stage = "sso"
                     else:
                         fail_stage = None
-                elif email_submitted and not _has_input(page, "input[type='email']"):
+                elif (
+                    email_submitted
+                    and not _has_input(page, "input[type='email']")
+                    and not _is_signup_landing(page)
+                ):
                     fail_stage = _post_email_pipeline(
                         page, email or "", jwt or "", first_name, last_name, password,
                         sso_clock=sso_clock,
@@ -1096,7 +1136,7 @@ def _run_attempt(
                     if email_submitted:
                         # SPA 刷新后前端状态归零，页面回到注册入口落地页：
                         # 自动重新进入邮箱流程（复用已创建的邮箱）
-                        logger.debug(
+                        logger.info(
                             f"[注册] 页面已回到注册入口（刷新重置 SPA 状态），重新进入邮箱流程: {email}"
                         )
                     if not _enter_signup_page(page):
@@ -1266,7 +1306,7 @@ def preflight_check() -> bool:
     results = {
         "proxy": _check_proxy(),
         "注册入口": _check_reachable(config.SIGNUP_URL, "注册入口"),
-        "grok.com": _check_reachable("https://grok.com/", "grok.com "),
+        "grok.com": _check_reachable("https://grok.com/", "grok.com"),
         "邮箱服务": _check_reachable(mail_base, "邮箱服务") if mail_base else False,
     }
     if not mail_base:
@@ -1368,7 +1408,7 @@ def run_signups(
         """带随机启动延迟的注册 worker，错开多浏览器并发窗口降低风控概率。"""
         if worker_count > 1:
             delay = random.uniform(3.0, 8.0) * idx
-            logger.debug(f"[注册] 线程 {idx + 1} 延迟 {delay:.1f}s 启动")
+            logger.info(f"[注册] 线程 {idx + 1} 延迟 {delay:.1f}s 启动")
             time.sleep(delay)
         return run_signup(headless=hless)
 

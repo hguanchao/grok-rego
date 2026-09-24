@@ -232,6 +232,24 @@
 .log-console .reg-log-tag-cf { color: #8b5cf6; }
 .log-console .reg-log-tag-sso { color: #0d9488; }
 .log-console .reg-log-tag-risk { color: #6366f1; }
+.log-console .reg-log-tag-batch { color: var(--terminal-muted); }
+.log-console .reg-log-tag-auth { color: #38bdf8; }
+.log-console .reg-log-tag-mailtemp { color: #2dd4bf; }
+.log-console .reg-log-tag-turnstile { color: #a78bfa; }
+.log-console .reg-log-tag-browser { color: #94a3b8; }
+.log-console .reg-log-tag-diag { color: #fb923c; }
+:root:not(.dark):not([data-theme="dark"]) .log-console .reg-log-tag-batch,
+[data-theme="light"]:not(.dark) .log-console .reg-log-tag-batch { color: var(--terminal-muted); }
+:root:not(.dark):not([data-theme="dark"]) .log-console .reg-log-tag-auth,
+[data-theme="light"]:not(.dark) .log-console .reg-log-tag-auth { color: #0369a1; }
+:root:not(.dark):not([data-theme="dark"]) .log-console .reg-log-tag-mailtemp,
+[data-theme="light"]:not(.dark) .log-console .reg-log-tag-mailtemp { color: #0f766e; }
+:root:not(.dark):not([data-theme="dark"]) .log-console .reg-log-tag-turnstile,
+[data-theme="light"]:not(.dark) .log-console .reg-log-tag-turnstile { color: #6d28d9; }
+:root:not(.dark):not([data-theme="dark"]) .log-console .reg-log-tag-browser,
+[data-theme="light"]:not(.dark) .log-console .reg-log-tag-browser { color: #475569; }
+:root:not(.dark):not([data-theme="dark"]) .log-console .reg-log-tag-diag,
+[data-theme="light"]:not(.dark) .log-console .reg-log-tag-diag { color: #c2410c; }
 :root:not(.dark):not([data-theme="dark"]) .log-console .reg-log-tag-preflight,
 [data-theme="light"]:not(.dark) .log-console .reg-log-tag-preflight { color: #0d9488; }
 :root:not(.dark):not([data-theme="dark"]) .log-console .reg-log-tag-inpool,

@@ -48,13 +48,65 @@ from gateway.usage import StreamUsageAccumulator, extract_nonstream
 # 上游固定参数（产品约定，不走配置）
 ZEN_BASE = "https://opencode.ai/zen/v1"
 ZEN_KEY = "public"
-ZEN_HEADERS = {
-    "Authorization": f"Bearer {ZEN_KEY}",
-    "User-Agent": "opencode/1.18.30",
-    "HTTP-Referer": "https://opencode.ai/",
-    "X-Title": "opencode",
-    "X-Opencode-Session": "cliproxy-opencode-go-session",
-}
+ZEN_UA = "opencode/1.18.31"
+_ID_ALPHANUM = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+_id_lock = threading.Lock()
+_id_last_ts = 0
+_id_ctr = 0
+
+
+def _zen_opencode_id(desc: bool) -> str:
+    """生成 opencode 会话/消息 ID：6 字节时间戳 hex + 14 位随机字母数字。
+
+    时间部分 = (毫秒时间戳 * 0x1000 + 自增计数) 按 48bit 取字节；
+    desc=True 时按位取反（会话 ID 与消息 ID 符号相反），与 opencode 客户端一致。
+    """
+    global _id_last_ts, _id_ctr
+    with _id_lock:
+        ts = int(time.time() * 1000)
+        _id_ctr = 1 if ts != _id_last_ts else _id_ctr + 1
+        _id_last_ts = ts
+        v = ts * 0x1000 + _id_ctr
+    if desc:
+        v = ~v
+    time_part = "".join(f"{(v >> (40 - 8 * i)) & 0xFF:02x}" for i in range(6))
+    rnd = "".join(secrets.choice(_ID_ALPHANUM) for _ in range(14))
+    return time_part + rnd
+
+
+def _zen_headers(session: str | None = None) -> dict[str, str]:
+    """上游固定头；request 每次请求生成，session 由调用方复用（缺省新生成）。"""
+    return {
+        "Authorization": f"Bearer {ZEN_KEY}",
+        "User-Agent": ZEN_UA,
+        "x-opencode-client": "cli",
+        "x-opencode-project": "global",
+        "x-opencode-request": "msg_" + _zen_opencode_id(False),
+        "x-opencode-session": session or ("ses_" + _zen_opencode_id(True)),
+    }
+
+
+# 会话复用：同一客户端（按 IP）在 TTL 内共用一个 session，超时或容量上限后换新
+_SESSION_TTL = 3600.0
+_SESSION_CAP = 512
+_session_lock = threading.Lock()
+_sessions: dict[str, tuple[str, float]] = {}
+
+
+def _client_session(client_key: str) -> str:
+    """取客户端当前会话 ID：命中缓存则续期复用，否则生成新会话。"""
+    now = time.monotonic()
+    with _session_lock:
+        entry = _sessions.get(client_key)
+        if entry and now - entry[1] <= _SESSION_TTL:
+            _sessions[client_key] = (entry[0], now)
+            return entry[0]
+        if len(_sessions) >= _SESSION_CAP:
+            oldest = min(_sessions, key=lambda k: _sessions[k][1])
+            _sessions.pop(oldest, None)
+        ses = "ses_" + _zen_opencode_id(True)
+        _sessions[client_key] = (ses, now)
+        return ses
 
 _MAX_BODY = 32 * 1024 * 1024
 _LOG_CAP = 200
@@ -183,7 +235,8 @@ def snapshot() -> dict[str, Any]:
         "client_base": f"http://{config.API_HOST}:{config.API_PORT}/zen/v1",
         "base_path": "/zen/v1",
         "key": ZEN_KEY,
-        "headers": dict(ZEN_HEADERS),
+        # 展示用示例头：request 为采样值，session 取展示固定会话
+        "headers": _zen_headers(_client_session("display")),
         "proxy": ", ".join(proxypool.redact(u) for u in proxypool.urls())
         or str(config.PROXY or "").strip(),
         "stats": stats,
@@ -367,8 +420,8 @@ def _read_body(handler: BaseHTTPRequestHandler) -> bytes:
     return handler.rfile.read(length)
 
 
-def _forward_headers(incoming: Any) -> dict[str, str]:
-    """透传安全头，强制覆盖上游固定头。"""
+def _forward_headers(incoming: Any, client_key: str) -> dict[str, str]:
+    """透传安全头，强制覆盖上游固定头（session 按客户端复用）。"""
     out: dict[str, str] = {}
     for key, value in incoming.items():
         low = key.lower()
@@ -379,10 +432,13 @@ def _forward_headers(incoming: Any) -> dict[str, str]:
             "user-agent",
             "x-title",
             "x-opencode-session",
+            "x-opencode-request",
+            "x-opencode-client",
+            "x-opencode-project",
         }:
             continue
         out[key] = value
-    out.update(ZEN_HEADERS)
+    out.update(_zen_headers(_client_session(client_key)))
     return out
 
 
@@ -484,7 +540,9 @@ def probe() -> dict[str, Any]:
     t0 = time.monotonic()
     url = f"{ZEN_BASE}/models"
     try:
-        resp = requests.get(url, headers=dict(ZEN_HEADERS), **_proxy_kwargs())
+        resp = requests.get(
+            url, headers=_zen_headers(_client_session("probe")), **_proxy_kwargs()
+        )
         elapsed = int((time.monotonic() - t0) * 1000)
         text = (resp.text or "")[:400]
         ok = 200 <= resp.status_code < 300
@@ -642,7 +700,8 @@ def proxy(handler: BaseHTTPRequestHandler, method: str, path: str) -> None:
         )
 
     url = _upstream_url(forward_path, query)
-    headers = _forward_headers(handler.headers)
+    client_ip = str(handler.client_address[0]) if handler.client_address else "-"
+    headers = _forward_headers(handler.headers, client_ip)
     t0 = time.monotonic()
     bytes_out = 0
     status = 502

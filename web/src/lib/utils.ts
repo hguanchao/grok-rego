@@ -61,8 +61,8 @@ export type RegisterLogGroups = {
   workers: ThreadLogGroup[];
 };
 
-const MAIN_TAGS = new Set(["预检", "任务"]);
-const AUTH_TAGS = new Set(["入池", "出池"]);
+const MAIN_TAGS = new Set(["预检", "任务", "批量注册"]);
+const AUTH_TAGS = new Set(["入池", "出池", "认证"]);
 const WORKER_TAGS = new Set([
   "注册",
   "邮箱",
@@ -71,6 +71,10 @@ const WORKER_TAGS = new Set([
   "CF挑战",
   "SSO",
   "风控",
+  "浏览器",
+  "Turnstile",
+  "诊断",
+  "临时邮箱",
 ]);
 
 /** 从 `[标签] 正文` 取出标签 */

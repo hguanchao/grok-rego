@@ -114,14 +114,17 @@ def _has_body(page: Any) -> bool:
 
 def safe_goto(page: Any, url: str) -> bool:
     """导航到指定 URL，超时不崩溃；出现 Cloudflare 全页挑战则模拟真人点击。"""
+    t0 = time.monotonic()
     try:
         page.goto(url, wait_until="domcontentloaded", timeout=GOTO_TIMEOUT)
-        logger.debug(f"[浏览器] 页面导航完成: {url}")
+        logger.info(f"[浏览器] 页面导航完成: {url}  · {elapsed_label(t0)}")
     except Exception as e:
-        logger.debug(f"[浏览器] 页面导航超时: {e}")
+        logger.warning(
+            f"[浏览器] 页面导航超时: {type(e).__name__}  · {elapsed_label(t0)}"
+        )
         if not _has_body(page):
             return False
-        logger.debug("[浏览器] 页面已部分加载，继续尝试")
+        logger.info("[浏览器] 页面已部分加载，继续尝试")
     handle_cf_challenge(page)
     # 落地后的阅读停顿：真人不会在页面刚出来就立刻动手
     human.reading_pause(page)

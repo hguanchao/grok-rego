@@ -1,5 +1,6 @@
-#!/usr/bin/env bash
+#!/bin/sh
 # grok-rego 一键启动：检查前后端环境后拉起管理 API 与前端 Vite
+# 兼容 POSIX sh（dash）与 bash
 
 set -u
 cd "$(dirname "$0")" || exit 1
@@ -15,13 +16,13 @@ echo "  grok-rego 环境检查"
 echo "========================================"
 echo
 
-if [[ -f server/pyproject.toml ]]; then
+if [ -f server/pyproject.toml ]; then
   ok "后端目录 server/"
 else
   bad "未找到 server/pyproject.toml"
 fi
 
-if [[ -f web/package.json ]]; then
+if [ -f web/package.json ]; then
   ok "前端目录 web/"
 else
   bad "未找到 web/package.json"
@@ -37,11 +38,18 @@ if command -v node >/dev/null 2>&1; then
   node_ver="$(node -v)"
   node_ver="${node_ver#v}"
   node_major="${node_ver%%.*}"
-  if [[ "$node_major" =~ ^[0-9]+$ ]] && (( node_major >= 18 )); then
-    ok "Node.js v${node_ver}"
-  else
-    bad "Node.js 需要 >= 18，当前 v${node_ver}"
-  fi
+  case "$node_major" in
+    ''|*[!0-9]*)
+      bad "无法解析 Node.js 版本: ${node_ver}"
+      ;;
+    *)
+      if [ "$node_major" -ge 18 ]; then
+        ok "Node.js v${node_ver}"
+      else
+        bad "Node.js 需要 >= 18，当前 v${node_ver}"
+      fi
+      ;;
+  esac
 else
   bad "未找到 Node.js >= 18，请安装: https://nodejs.org/"
 fi
@@ -52,7 +60,7 @@ else
   bad "未找到 npm"
 fi
 
-if (( fail != 0 )); then
+if [ "$fail" -ne 0 ]; then
   echo
   echo "环境检查未通过，已中止启动。"
   exit 1
@@ -64,8 +72,8 @@ echo "  准备依赖"
 echo "----------------------------------------"
 echo
 
-if [[ ! -f server/config.json ]]; then
-  if [[ -f server/config.example.json ]]; then
+if [ ! -f server/config.json ]; then
+  if [ -f server/config.example.json ]; then
     cp server/config.example.json server/config.json
     ok "已从 config.example.json 生成 server/config.json"
   else
@@ -91,7 +99,7 @@ fi
 }
 ok "后端依赖已就绪"
 
-if [[ ! -d web/node_modules/vite ]]; then
+if [ ! -d web/node_modules/vite ]; then
   echo "[..]   前端依赖缺失，执行 npm install"
   (
     cd web || exit 1
@@ -112,15 +120,36 @@ echo
 mkdir -p server/logs
 SERVER_LOG="server/logs/server.log"
 
+# 可移植端口探测：优先 nc，其次 curl，最后 python3
+port_open() {
+  host="$1"
+  port="$2"
+  if command -v nc >/dev/null 2>&1; then
+    nc -z "$host" "$port" >/dev/null 2>&1
+  elif command -v curl >/dev/null 2>&1; then
+    curl -s --max-time 1 -o /dev/null "http://${host}:${port}/"
+  else
+    python3 - "$host" "$port" <<'EOF' >/dev/null 2>&1
+import socket, sys
+s = socket.socket()
+s.settimeout(1)
+sys.exit(0 if s.connect_ex((sys.argv[1], int(sys.argv[2]))) == 0 else 1)
+EOF
+  fi
+}
+
 wait_port() {
-  local host="$1" port="$2" pid="$3" timeout="${4:-30}"
-  local n=0
-  local max=$((timeout * 5))
-  while (( n < max )); do
+  host="$1"
+  port="$2"
+  pid="$3"
+  timeout="${4:-30}"
+  n=0
+  max=$((timeout * 5))
+  while [ "$n" -lt "$max" ]; do
     if ! kill -0 "$pid" 2>/dev/null; then
       return 1
     fi
-    if (echo >/dev/tcp/"$host"/"$port") >/dev/null 2>&1; then
+    if port_open "$host" "$port"; then
       return 0
     fi
     sleep 0.2
