@@ -47,7 +47,18 @@ export function Stepper({
   disabled?: boolean;
   onChange: (value: number) => void;
 }) {
-  const update = (next: number) => onChange(Math.min(max, Math.max(min, next)));
+  // 输入中的草稿独立保存，避免受控值被即时钳位后
+  // 出现「清空后想输 2，结果拼成 12」的输入错乱；失焦/回车才提交钳位
+  const [draft, setDraft] = useState<string | null>(null);
+  const update = (next: number) => {
+    setDraft(null);
+    onChange(Math.min(max, Math.max(min, next)));
+  };
+  const commit = (raw: string) => {
+    setDraft(null);
+    const n = Math.trunc(Number(raw));
+    if (Number.isFinite(n)) onChange(Math.min(max, Math.max(min, n)));
+  };
   return (
     <div className="ap-stepper">
       <button
@@ -62,9 +73,18 @@ export function Stepper({
         type="number"
         min={min}
         max={max}
-        value={value}
+        value={draft ?? value}
         disabled={disabled}
-        onChange={(event) => update(Number(event.target.value) || min)}
+        onChange={(event) => setDraft(event.target.value)}
+        onBlur={() => {
+          if (draft !== null) commit(draft);
+        }}
+        onKeyDown={(event) => {
+          if (event.key === "Enter") {
+            event.preventDefault();
+            if (draft !== null) commit(draft);
+          }
+        }}
       />
       <button
         type="button"

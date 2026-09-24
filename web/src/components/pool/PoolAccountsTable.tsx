@@ -236,7 +236,7 @@ export function PoolAccountsTable({
           {showSkeleton ? (
             <SkeletonRows />
           ) : accounts.length === 0 ? (
-            <TableEmptyRow colSpan={11}>
+            <TableEmptyRow colSpan={10}>
               <div
                 className="pool-table-empty"
                 role={loadError ? "alert" : "status"}

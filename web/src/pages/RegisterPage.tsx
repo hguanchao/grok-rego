@@ -419,14 +419,17 @@ export function RegisterPage() {
     return `${((job.success / job.done) * 100).toFixed(2)}%`;
   }, [job.done, job.success]);
 
-  const handleSaveConfig = async () => {
+  /** @returns 是否保存成功（调用方据此决定是否关闭弹窗） */
+  const handleSaveConfig = async (): Promise<boolean> => {
     setSaving(true);
     try {
       const next = await saveConfig(buildConfigPatch());
       applyConfig(next);
       toast.success("配置已保存");
+      return true;
     } catch (error) {
       toast.error("保存失败", { description: errMessage(error) });
+      return false;
     } finally {
       setSaving(false);
     }
@@ -452,19 +455,20 @@ export function RegisterPage() {
     }
     setStarting(true);
     try {
-      // 新任务清空本地日志游标与线程折叠态，避免沿用上轮展开集合
-      setLogs([]);
-      lastLogIdRef.current = 0;
-      seenWorkersRef.current = new Set();
-      userTouchedCollapse.current = false;
-      setOpenThreads([]);
       const status = await startRegister({
         count: finalCount,
         threads: finalThreads,
         headless,
         config: buildConfigPatch(),
       });
+      // 启动成功后才清空上一轮日志/折叠态；失败时保留历史日志便于排查
+      setLogs([]);
+      lastLogIdRef.current = 0;
+      seenWorkersRef.current = new Set();
+      userTouchedCollapse.current = false;
+      setOpenThreads([]);
       setJob(status);
+      stickToBottomRef.current = true;
       if (status.logs?.length) {
         setLogs(status.logs);
         lastLogIdRef.current = status.last_log_id;
@@ -875,7 +879,7 @@ export function RegisterPage() {
               </div>
             </div>
 
-            <div className="log-console">
+            <div className="log-console" ref={consoleRef} onScroll={handleConsoleScroll}>
               {threadGroups.length === 0 ? (
                 <div className="flex h-full min-h-[120px] items-center justify-center">
                   <Empty
@@ -1122,7 +1126,9 @@ export function RegisterPage() {
               type="button"
               disabled={formDisabled || saving}
               onClick={() => {
-                void handleSaveConfig().then(() => setPushDialogOpen(false));
+                void handleSaveConfig().then((ok) => {
+                  if (ok) setPushDialogOpen(false);
+                });
               }}
             >
               保存

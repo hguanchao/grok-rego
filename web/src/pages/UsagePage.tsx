@@ -183,11 +183,6 @@ export function UsagePage() {
     }
   }, [detailDim, detailPage, detailPageSize, groupPage, groupPageSize, loadDetail, loadGrouped]);
 
-  // 切换维度时分组回到第一页，避免沿用另一维度的页码导致空白
-  useEffect(() => {
-    setGroupPage(1);
-  }, [detailDim, setGroupPage]);
-
   const summary = data?.summary;
 
   const trendPoints = useMemo(
@@ -426,7 +421,11 @@ export function UsagePage() {
                 type="single"
                 value={detailDim}
                 onValueChange={(v) => {
-                  if (v === "requests" || v === "account" || v === "model") setDetailDim(v);
+                  if (v === "requests" || v === "account" || v === "model") {
+                    // 切换维度时分组回到第一页（在加载前重置，避免按旧页码多发一次请求）
+                    if (v !== "requests") setGroupPage(1);
+                    setDetailDim(v);
+                  }
                 }}
                 className="usage-metric-toggle"
                 aria-label="明细维度"

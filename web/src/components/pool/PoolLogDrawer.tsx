@@ -58,6 +58,15 @@ export function PoolLogDrawer({
   onClear,
 }: PoolLogDrawerProps) {
   const bodyRef = useRef<HTMLDivElement | null>(null);
+  // 用户上翻查看历史日志时暂停自动滚底，滚回底部附近后恢复
+  const stickToBottomRef = useRef(true);
+
+  const handleBodyScroll = () => {
+    const el = bodyRef.current;
+    if (!el) return;
+    stickToBottomRef.current =
+      el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+  };
 
   /** 最近一条日志（头部「最近」条） */
   const latest = entries[entries.length - 1];
@@ -72,9 +81,9 @@ export function PoolLogDrawer({
     return () => window.removeEventListener("keydown", onKey);
   }, [open, onClose]);
 
-  // 新日志滚底（双 rAF：等列表挂载后再量 scrollHeight）
+  // 新日志滚底（双 rAF：等列表挂载后再量 scrollHeight）；用户上翻时不打扰
   useEffect(() => {
-    if (!open || !entries.length) return;
+    if (!open || !entries.length || !stickToBottomRef.current) return;
     const el = bodyRef.current;
     if (!el) return;
     requestAnimationFrame(() => {
@@ -141,7 +150,7 @@ export function PoolLogDrawer({
           </div>
         ) : null}
 
-        <div ref={bodyRef} className="ops-drawer-body">
+        <div ref={bodyRef} className="ops-drawer-body" onScroll={handleBodyScroll}>
           {entries.length === 0 ? (
             <div className="flex h-full min-h-[160px] items-center justify-center px-4">
               <Empty

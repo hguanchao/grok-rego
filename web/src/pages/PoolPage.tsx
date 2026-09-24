@@ -952,7 +952,7 @@ export function PoolPage() {
       if (task.id) {
         startPoolPolling(task.id, "inspect");
       }
-      load();
+      void load(true);
     } catch (error) {
       appendLogs([
         {
@@ -1026,21 +1026,11 @@ export function PoolPage() {
           r.status !== "pending" &&
           !(r.status === "skipped" && r.reason === "已认证，无需认证"),
       );
-      const rows: PoolLogInput[] = rest.map((r): PoolLogInput => {
-        const label = accountLabel(r.id);
-        if (r.status === "pending") {
-          return {
-            type: "auth",
-            level: "INFO",
-            message: `[认证] ${label}  正在交换 Token`,
-          };
-        }
-        return {
-          type: "auth",
-          level: r.status === "skipped" ? "WARNING" : "ERROR",
-          message: `[认证] ${label}  ${r.reason || "未发起"}`,
-        };
-      });
+      const rows: PoolLogInput[] = rest.map((r): PoolLogInput => ({
+        type: "auth",
+        level: r.status === "skipped" ? "WARNING" : "ERROR",
+        message: `[认证] ${accountLabel(r.id)}  ${r.reason || "未发起"}`,
+      }));
       if (skippedAuthed.length > 0) {
         rows.unshift({
           type: "auth",
