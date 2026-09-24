@@ -110,6 +110,24 @@ else
   exit 1
 fi
 
+# Camoufox 内核：uv sync 不会自动下载，缺失时注册任务会报 CamoufoxNotInstalled
+if (cd server && uv run camoufox path >/dev/null 2>&1); then
+  ok "Camoufox 内核已就绪"
+else
+  echo "[..]   首次下载 Camoufox 浏览器内核（100MB+，进度如下）"
+  echo "----------------------------------------"
+  (
+    cd server || exit 1
+    uv run camoufox fetch
+  ) || {
+    echo
+    echo "[FAIL] Camoufox 内核下载失败（国内网络可能需要代理后重跑 sh start.sh）"
+    exit 1
+  }
+  echo "----------------------------------------"
+  ok "Camoufox 内核已就绪"
+fi
+
 if [ -d web/node_modules/vite ]; then
   ok "前端依赖已就绪"
 else
