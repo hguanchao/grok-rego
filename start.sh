@@ -84,32 +84,48 @@ else
   ok "server/config.json"
 fi
 
-(
-  cd server || exit 1
-  uv sync >/dev/null 2>&1 || exit 1
-  uv run python -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 13) else 1)" >/dev/null 2>&1 || {
-    echo "[FAIL] Python 需要 >= 3.13"
+# 后端依赖：已就绪则静默校验（快），否则流式显示安装进度
+if [ -d server/.venv ] && (cd server && uv sync >/dev/null 2>&1); then
+  ok "后端依赖已就绪"
+else
+  echo "[..]   安装后端依赖（首次会下载 Python 3.13 与依赖包，进度如下）"
+  echo "----------------------------------------"
+  (
+    cd server || exit 1
+    uv sync
+  ) || {
+    echo
+    echo "[FAIL] 后端 uv sync 失败"
     exit 1
   }
-  py_ver="$(uv run python -c "import sys; print(sys.version.split()[0])" 2>/dev/null)"
-  echo "[OK]   Python ${py_ver}"
-) || {
-  echo "[FAIL] 后端 uv sync 失败"
-  exit 1
-}
-ok "后端依赖已就绪"
+  echo "----------------------------------------"
+  ok "后端依赖已就绪"
+fi
 
-if [ ! -d web/node_modules/vite ]; then
-  echo "[..]   前端依赖缺失，执行 npm install"
+if (cd server && uv run python -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 13) else 1)" >/dev/null 2>&1); then
+  py_ver="$(cd server && uv run python -c "import sys; print(sys.version.split()[0])" 2>/dev/null)"
+  ok "Python ${py_ver}"
+else
+  bad "Python 需要 >= 3.13"
+  exit 1
+fi
+
+if [ -d web/node_modules/vite ]; then
+  ok "前端依赖已就绪"
+else
+  echo "[..]   安装前端依赖（npm install，进度如下）"
+  echo "----------------------------------------"
   (
     cd web || exit 1
-    npm install >/dev/null 2>&1
+    npm install --no-fund --no-audit
   ) || {
+    echo
     echo "[FAIL] npm install 失败"
     exit 1
   }
+  echo "----------------------------------------"
+  ok "前端依赖已就绪"
 fi
-ok "前端依赖已就绪"
 
 echo
 echo "----------------------------------------"
@@ -145,16 +161,23 @@ wait_port() {
   timeout="${4:-30}"
   n=0
   max=$((timeout * 5))
+  printf "[..]   等待 %s:%s 就绪 " "$host" "$port"
   while [ "$n" -lt "$max" ]; do
     if ! kill -0 "$pid" 2>/dev/null; then
+      printf "x\n"
       return 1
     fi
     if port_open "$host" "$port"; then
+      printf "ok\n"
       return 0
     fi
     sleep 0.2
     n=$((n + 1))
+    if [ $((n % 5)) -eq 0 ]; then
+      printf "."
+    fi
   done
+  printf "超时\n"
   return 1
 }
 
