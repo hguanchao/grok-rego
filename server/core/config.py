@@ -44,7 +44,7 @@ API_PORT: int = 8787
 # Zen 网关鉴权密钥：非空时客户端必须携带（Authorization: Bearer <key> 或 x-api-key）
 GATEWAY_API_KEY: str = ""
 # 打上游的 x-grok-client-version / User-Agent，对齐 grok-build（默认取其 crate 版本）
-GROK_VERSION: str = "1.0.16"
+GROK_VERSION: str = "1.0.41"
 # 号池探活：GET /billing 上游
 UPSTREAM_BASE: str = "https://cli-chat-proxy.grok.com/v1"
 

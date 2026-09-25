@@ -3,7 +3,7 @@
 
 浏览器阶段：注册页 → 邮箱（创建临时邮箱）→ 验证码 → 资料表单 → 等 sso cookie 落地
             → 入库（status=REAUTH）→ 入认证池 → grok.com 风控体检。
-认证池阶段：run_auth_pool 用 20 个 worker 消化队列，每个 worker 做完一个号再隔 1 秒接下一个。
+认证池阶段：run_auth_pool 串行消化队列，一个账号完成后再接下一个。
 
 重试策略：邮箱/验证码/资料阶段失败关闭浏览器重启重试（邮箱与资料复用，最多 MAX_ATTEMPTS 次）；
          仅 SSO 阶段失败在当前浏览器内刷新页面重试（POST_EMAIL_RETRIES 次，不重启浏览器）。
@@ -25,12 +25,10 @@ from curl_cffi import requests
 from core import config
 from core.logger import logger
 from core.util import (
-    ACCOUNT_WORKER_GAP_SEC,
-    ACCOUNT_WORKERS,
     decode_jwt_exp,
     elapsed_label,
     format_exp,
-    run_account_workers,
+    upstream_text,
 )
 from db import (
     STATUS_ACTIVE,
@@ -281,6 +279,38 @@ def _camoufox_kwargs(headless: bool) -> dict[str, Any]:
             "dom.min_background_timeout_value_without_budget": 4,
         },
     }
+
+    # A failed UBO download can leave an empty cache directory. Camoufox treats
+    # that directory as an installed extension and then raises InvalidAddonPath.
+    # Use UBO only when its extracted manifest is present.
+    from camoufox.addons import ADDONS_DIR, DefaultAddons
+
+    ubo_path = ADDONS_DIR / DefaultAddons.UBO.name
+    if not (ubo_path / "manifest.json").is_file():
+        kwargs["exclude_addons"] = [DefaultAddons.UBO]
+
+    # Some minimal Linux images lack libasound2. If it was installed alongside
+    # this Camoufox build, make both its bundled libraries and the private ALSA
+    # compatibility library visible to the browser process.
+    try:
+        from camoufox.multiversion import get_active_path
+
+        browser_dir = get_active_path()
+        if browser_dir:
+            alsa_lib_dir = browser_dir / "host-libs/usr/lib/x86_64-linux-gnu"
+            if (alsa_lib_dir / "libasound.so.2").exists():
+                library_paths = [str(browser_dir), str(alsa_lib_dir)]
+                existing = os.environ.get("LD_LIBRARY_PATH")
+                if existing:
+                    library_paths.append(existing)
+                kwargs["env"] = {
+                    **os.environ,
+                    "LD_LIBRARY_PATH": os.pathsep.join(library_paths),
+                }
+    except Exception:
+        # Let Camoufox handle missing installs and unusual cache layouts.
+        pass
+
     from core import proxypool
 
     proxy = proxypool.current()
@@ -321,7 +351,7 @@ def _dump_page(page: Any, tag: str) -> None:
     except Exception:
         url = "?"
     try:
-        body = _page_text(page)[:800].replace("\n", " ")
+        body = _page_text(page)
     except Exception:
         body = ""
     inputs: list[Any] = []
@@ -344,14 +374,14 @@ def _dump_page(page: Any, tag: str) -> None:
                 inputs.extend(items)
         except Exception:
             continue
-    logger.warning(f"[诊断] {tag} | URL: {url} | BODY: {body}")
+    logger.warning(f"[诊断] {tag} | URL: {url}\n{upstream_text(body)}")
     logger.warning(f"[诊断] {tag} | controls={inputs}")
     try:
         os.makedirs(DEBUG_DIR, exist_ok=True)
         stamp = time.strftime("%Y%m%d_%H%M%S")
         path = os.path.join(DEBUG_DIR, f"{stamp}_{tag}.png")
         page.screenshot(path=path, full_page=True)
-        logger.info(f"[诊断] 截图: {path}")
+        logger.debug(f"[诊断] 截图: {path}")
     except Exception as exc:
         logger.warning(f"[诊断] 截图失败: {type(exc).__name__}: {exc}")
 
@@ -399,21 +429,22 @@ def click(
                     if "TargetClosed" in type(e).__name__:
                         logger.debug(f"[注册] 页面已关闭，停止点击: {text}")
                         return False
-                    logger.debug(f"[注册] 点击失败 {selector}: {type(e).__name__} {str(e)[:120]}")
+                    logger.debug(f"[注册] 点击失败 {selector}: {type(e).__name__}: {e}")
         try:
             page.wait_for_timeout(2000)
         except Exception:
             logger.debug(f"[注册] 页面已关闭，停止点击: {text}")
             return False
         if not quiet:
-            logger.info(
+            logger.debug(
                 f"[注册] 「{text}」第 {round_no + 1}/{retries + 1} 轮未命中，等待重试"
             )
     if _is_closed(page) or quiet:
         return False
     url = page.url
-    body = _page_text(page)[:300].replace("\n", " ")
-    logger.warning(f"[注册] 未找到可点击元素: {text} | URL: {url} | BODY: {body}")
+    logger.warning(
+        f"[注册] 未找到可点击元素: {text} | URL: {url}\n{upstream_text(_page_text(page))}"
+    )
     return False
 
 
@@ -440,7 +471,7 @@ def fill(page: Any, value: str, selectors: list[str], timeout: int = 20000) -> b
                     if "TargetClosed" in type(e).__name__:
                         logger.debug("[注册] 页面已关闭，停止填写")
                         return False
-                    logger.debug(f"[注册] 填入失败 {selector}: {type(e).__name__} {str(e)[:120]}")
+                    logger.debug(f"[注册] 填入失败 {selector}: {type(e).__name__}: {e}")
         time.sleep(0.5)
 
     # 兜底：JS 直接赋值 + input 事件（输入框存在但点击/键入异常时使用）
@@ -524,7 +555,7 @@ def _enter_signup_page(page: Any) -> bool:
     # 落地页为社交登录入口时点「Sign up with email」；已是表单页则跳过
     if _has_input(page, "input[type='email']"):
         return True
-    logger.info("[注册] 落地页未直接出现邮箱框，尝试点击邮箱注册入口")
+    logger.debug("[注册] 落地页未直接出现邮箱框，尝试点击邮箱注册入口")
     # 进页面先看两眼再找入口，不做「落地即点」
     human_reading_pause(page, scale=0.5)
     for label in ("Sign up with email", "Continue with email", "Sign up with Email"):
@@ -562,13 +593,14 @@ def _ensure_email(
             email, jwt = create_temp_email(_email_local_part(first_name, last_name))
         except Exception as exc:
             logger.error(
-                f"[邮箱] 邮箱创建失败  {type(exc).__name__}  · {elapsed_label(create_t0)}"
+                f"[邮箱] 邮箱创建失败  {type(exc).__name__}: {exc}"
+                f"  · {elapsed_label(create_t0)}"
             )
             return None
         if not email:
             logger.error(f"[邮箱] 邮箱创建失败  · {elapsed_label(create_t0)}")
             return None
-        logger.info(f"[邮箱] 已创建 {email}  · {elapsed_label(create_t0)}")
+        logger.success(f"[邮箱] 已创建 {email}  · {elapsed_label(create_t0)}")
     if not first_name or not last_name:
         first_name, last_name = _generate_profile_name()
     return email, jwt, first_name, last_name
@@ -595,7 +627,11 @@ def _has_page_fatal_error(page: Any) -> bool:
 def _ensure_no_page_fatal(page: Any) -> None:
     """命中致命页错则抛 PageFatalError，由 _run_attempt 关浏览器复用账号重试。"""
     if _has_page_fatal_error(page):
-        logger.warning("[注册] 检测到页面错误: Something went wrong. Please try again.")
+        try:
+            shown = upstream_text(_page_text(page))
+        except Exception:
+            shown = ""
+        logger.warning(f"[注册] 检测到页面错误\n{shown}")
         try:
             _dump_page(page, "page-fatal-error")
         except Exception:
@@ -621,7 +657,13 @@ def _submit_email(page: Any, email: str) -> tuple[str, bool]:
     page.wait_for_timeout(1500)
     _ensure_no_page_fatal(page)
     if _has_risk_prompt(page):
-        logger.warning(f"[邮箱] 提交后触发风控  {log_email}  · {elapsed_label(t0)}")
+        try:
+            shown = upstream_text(_page_text(page))
+        except Exception:
+            shown = ""
+        logger.warning(
+            f"[邮箱] 提交后触发风控  {log_email}  · {elapsed_label(t0)}\n{shown}"
+        )
         return "email", False
     logger.success(f"[邮箱] 已填写并提交 {log_email}  · {elapsed_label(t0)}")
     return "post", True
@@ -639,7 +681,7 @@ def _type_otp(page: Any, selector: str, value: str) -> bool:
             return True
         except Exception as exc:
             logger.debug(
-                f"[验证码] 键入失败 {selector}: {type(exc).__name__} {str(exc)[:120]}"
+                f"[验证码] 键入失败 {selector}: {type(exc).__name__}: {exc}"
             )
     return False
 
@@ -871,7 +913,7 @@ def _check_marketing_opt_in(page: Any) -> None:
                     human_click_locator(page, target)
                 page.wait_for_timeout(350)
                 if _marketing_checked(page):
-                    logger.info("[资料] 已勾选 Receive email updates")
+                    logger.debug("[资料] 已勾选 Receive email updates")
                     return
             except Exception:
                 continue
@@ -895,13 +937,13 @@ def _check_marketing_opt_in(page: Any) -> None:
         )
         page.wait_for_timeout(350)
         if clicked and _marketing_checked(page):
-            logger.info("[资料] 已勾选 Receive email updates（DOM）")
+            logger.debug("[资料] 已勾选 Receive email updates（DOM）")
             return
     except Exception:
         pass
 
     if _marketing_checked(page):
-        logger.info("[资料] 已勾选 Receive email updates")
+        logger.debug("[资料] 已勾选 Receive email updates")
         return
     logger.warning("[资料] 营销邮件勾选未成功，提交前仍未勾上")
 
@@ -1014,8 +1056,12 @@ def _wait_sso_ready(
         human_fidget(page, chance=0.15)
         time.sleep(SSO_POLL_INTERVAL)
     who = email or ""
+    try:
+        shown = upstream_text(_page_text(page))
+    except Exception:
+        shown = ""
     logger.error(
-        f"[SSO] {who} 等待超时（已等 {SSO_WAIT_TIMEOUT}s）  · {elapsed_label(t0)}"
+        f"[SSO] {who} 等待超时（已等 {SSO_WAIT_TIMEOUT}s）  · {elapsed_label(t0)}\n{shown}"
     )
     return False
 
@@ -1087,7 +1133,7 @@ def _run_attempt(
     try:
         launch_t0 = time.monotonic()
         with Camoufox(**_camoufox_kwargs(headless)) as browser:
-            logger.info(
+            logger.debug(
                 f"[注册] 浏览器已启动（首次启动需下载内核/生成指纹，可能较慢）"
                 f"  · {elapsed_label(launch_t0)}"
             )
@@ -1136,7 +1182,7 @@ def _run_attempt(
                     if email_submitted:
                         # SPA 刷新后前端状态归零，页面回到注册入口落地页：
                         # 自动重新进入邮箱流程（复用已创建的邮箱）
-                        logger.info(
+                        logger.debug(
                             f"[注册] 页面已回到注册入口（刷新重置 SPA 状态），重新进入邮箱流程: {email}"
                         )
                     if not _enter_signup_page(page):
@@ -1177,8 +1223,8 @@ def _run_attempt(
                         page.reload()
                         page.wait_for_timeout(RELOAD_SETTLE_MS)
                     except Exception as exc:
-                        logger.debug(
-                            f"[注册] 刷新失败（浏览器可能已关闭）: {type(exc).__name__}"
+                        logger.warning(
+                            f"[注册] 刷新失败: {type(exc).__name__}: {exc}"
                         )
                         return fail("post")
             else:
@@ -1217,7 +1263,7 @@ def _run_attempt(
         return fail("form" if email_submitted else "email")
     except Exception as exc:
         if "TargetClosed" in type(exc).__name__ or "closed" in str(exc).lower():
-            logger.debug(f"[注册] 浏览器已关闭: {type(exc).__name__}: {str(exc)[:160]}")
+            logger.warning(f"[注册] 浏览器已关闭: {type(exc).__name__}: {exc}")
             return fail("post" if email_submitted else "email")
         raise
 
@@ -1301,7 +1347,7 @@ def preflight_check() -> bool:
     只做 HTTP 探测，不开浏览器。人机验证由正式注册窗口处理。
     任一项不通过返回 False，调用方应中止注册任务。
     """
-    logger.info(f"[预检] {human_describe()}")
+    logger.debug(f"[预检] {human_describe()}")
     mail_base = _mail_base_url()
     results = {
         "proxy": _check_proxy(),
@@ -1408,7 +1454,7 @@ def run_signups(
         """带随机启动延迟的注册 worker，错开多浏览器并发窗口降低风控概率。"""
         if worker_count > 1:
             delay = random.uniform(3.0, 8.0) * idx
-            logger.info(f"[注册] 线程 {idx + 1} 延迟 {delay:.1f}s 启动")
+            logger.debug(f"[注册] 线程 {idx + 1} 延迟 {delay:.1f}s 启动")
             time.sleep(delay)
         return run_signup(headless=hless)
 
@@ -1439,7 +1485,7 @@ def run_auth_pool(
     stop_when: Callable[[], bool] | None = None,
     on_result: Callable[[str, bool, str], None] | None = None,
 ) -> int:
-    """消化认证池：20 个 worker 并发，每个 worker 做完一个号再隔 1 秒接下一个。
+    """串行消化认证池：一个账号完成后再接下一个。
 
     全自动认证：从账号记录取 sso_cookie，走 device flow 协议级 approve
     （verify + approve 模拟用户授权），再轮询 token 端点。
@@ -1451,15 +1497,13 @@ def run_auth_pool(
     if not auth_entries:
         logger.info("[出池] 队列为空，无需消化")
         return 0
-    logger.info(
-        f"[出池] 开始消化 {len(auth_entries)} 个 / {ACCOUNT_WORKERS} 线程 "
-        f"每线程间隔 {ACCOUNT_WORKER_GAP_SEC:.0f}s"
-    )
+    logger.info(f"[出池] 开始消化 {len(auth_entries)} 个（串行）")
 
-    def work(entry: dict[str, Any]) -> bool:
+    success_count = 0
+    for entry in auth_entries:
         if stop_when is not None and stop_when():
-            return False
-        email = entry["email"]
+            break
+        email = str(entry.get("email") or "")
         log_email = email
         account = get_account_by_email(email)
         if account is None:
@@ -1467,40 +1511,28 @@ def run_auth_pool(
             remove_from_auth_pool(email)
             if on_result is not None:
                 on_result(log_email, False, "账号不存在")
-            return False
+            continue
         from core import proxypool
 
         proxypool.bind()
         try:
-            return _auth_pool_one(account, email, log_email, on_result)
+            try:
+                ok = _auth_pool_one(account, email, log_email, on_result)
+            except Exception as exc:
+                reason = f"{type(exc).__name__}: {exc}"
+                logger.warning(f"[出池] {log_email}  认证异常：{reason}")
+                if on_result is not None:
+                    on_result(log_email, False, reason)
+                ok = False
         finally:
             proxypool.unbind()
-
-    success_count = 0
-    success_lock = threading.Lock()
-
-    def complete(_index: int, entry: dict[str, Any], result: Any) -> None:
-        nonlocal success_count
-        if result is True:
-            with success_lock:
-                success_count += 1
-            return
-        if isinstance(result, Exception):
-            fail_email = str(entry.get("email") or "")
-            reason = f"{type(result).__name__}: {result}"
-            logger.warning(f"[出池] {fail_email}  认证异常：{reason}")
-            if on_result is not None:
-                on_result(fail_email, False, reason)
-
-    run_account_workers(
-        auth_entries,
-        work,
-        workers=ACCOUNT_WORKERS,
-        thread_name_prefix="认证",
-        should_stop=stop_when,
-        on_complete=complete,
+        if ok:
+            success_count += 1
+    done_level = "SUCCESS" if success_count else "WARNING"
+    logger.log(
+        done_level,
+        f"[出池] 消化完成: 成功 {success_count}/{len(auth_entries)}",
     )
-    logger.info(f"[出池] 消化完成: 成功 {success_count}/{len(auth_entries)}")
     return success_count
 
 

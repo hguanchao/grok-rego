@@ -18,6 +18,27 @@ from workflow import register as register_wf
 # 单任务日志条数上限
 _MAX_LOGS = 2000
 
+# 注册页三块面板认的标签。其它标签（数据库、认证池队列、网关）不进任务日志。
+_UI_LOG_TAGS = (
+    "[预检]",
+    "[任务]",
+    "[批量注册]",
+    "[入池]",
+    "[出池]",
+    "[认证]",
+    "[注册]",
+    "[邮箱]",
+    "[邮件]",
+    "[资料]",
+    "[CF挑战]",
+    "[SSO]",
+    "[风控]",
+    "[浏览器]",
+    "[Turnstile]",
+    "[诊断]",
+    "[临时邮箱]",
+)
+
 
 def _now() -> str:
     """当前北京时间 ISO 字符串（YYYY-MM-DDTHH:MM:SS）。"""
@@ -204,14 +225,20 @@ class JobManager:
         return self.get_status()
 
     def _is_relevant_log(self, thread_name: str | None, text: str) -> bool:
-        """只保留主控 / 注册线程 / 认证池相关日志，其余线程日志一律过滤。"""
+        """只保留注册页三块面板能展示的日志。
+
+        主控、注册线程、本任务的认证 worker（线程名前缀「认证」）放行；
+        号池页触发的「认证池」消化、网关和数据库线程一律不进。
+        同线程上的 ``[数据库]`` / ``[认证池]`` 也不进，避免面板被队列流水刷满。
+        """
+        if not text.startswith(_UI_LOG_TAGS):
+            return False
         t = (thread_name or "").strip()
         if not t or t == "主控":
             return True
         if "注册线程" in t or "ThreadPoolExecutor" in t:
             return True
-        # 认证池消化线程或日志内容含认证池/认证阶段标记
-        return "认证池" in t or "认证池" in text or text.startswith("[认证]")
+        return t.startswith("认证") and not t.startswith("认证池")
 
     def _attach_log_sink(self, job: RegisterJob) -> None:
         """把 loguru 输出镜像到任务日志缓冲。"""

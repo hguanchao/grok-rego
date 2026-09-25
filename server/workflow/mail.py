@@ -48,7 +48,7 @@ def _pick_domain() -> str:
         if mode != "random":
             logger.warning(f"[临时邮箱] 未知 cf_domain_mode={mode!r}，回退 random")
         domain = random.choice(domains)
-    logger.info(
+    logger.debug(
         f"[临时邮箱] 选用根域名: {domain} (mode={mode}, pool={len(domains)})"
     )
     return domain
@@ -77,7 +77,7 @@ def _cf_create_temp_email(local_part: str = "") -> tuple[str, str]:
     }
     if config.CF_API_KEY:
         payload["api_key"] = config.CF_API_KEY
-        logger.info("[临时邮箱] 管理员 API 模式创建邮箱")
+        logger.debug("[临时邮箱] 管理员 API 模式创建邮箱")
     resp = requests.post(
         f"{config.CF_API_BASE}/api/new_address",
         json=payload,

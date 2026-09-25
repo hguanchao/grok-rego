@@ -62,6 +62,7 @@ def format_exp(ts: int | None) -> str:
 
 import base64
 import json
+import platform
 import re
 import socket
 import time
@@ -179,6 +180,32 @@ def run_account_workers(
         for fut in as_completed(futs):
             fut.result()
     return results
+
+
+def upstream_text(body: str | bytes | None, limit: int = 4000) -> str:
+    """上游响应或页面正文原样摘录。超长只截断尾部，不改写内容。"""
+    if body is None:
+        return ""
+    if isinstance(body, bytes):
+        text = body.decode("utf-8", errors="replace")
+    else:
+        text = str(body)
+    text = text.replace("\r\n", "\n").replace("\r", "\n").strip()
+    if len(text) <= limit:
+        return text
+    return text[:limit] + f"\n…(truncated {len(text) - limit} chars)"
+
+
+def grok_user_agent(version: str) -> str:
+    """对齐 grok-build sampler：``grok-shell/<version> (<os>; <arch>)``。"""
+    system = platform.system().lower()
+    os_name = "macos" if system == "darwin" else (system or "linux")
+    arch = platform.machine().lower()
+    if arch in ("arm64", "aarch64"):
+        arch = "aarch64"
+    elif arch in ("x86_64", "amd64"):
+        arch = "x86_64"
+    return f"grok-shell/{version} ({os_name}; {arch})"
 
 
 def decode_jwt_exp(token: str | None) -> int | None:

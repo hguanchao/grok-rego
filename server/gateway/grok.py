@@ -29,8 +29,10 @@ from core.logger import logger
 from core.util import (
     curl_error_code,
     decode_jwt_exp,
+    grok_user_agent,
     iso_after_hours,
     now_iso_tz,
+    upstream_text,
 )
 from db import (
     STATUS_LIMITED,
@@ -45,7 +47,7 @@ from gateway.paths import ensure_local_v1, resource_path, upstream_url
 from gateway.usage import StreamUsageAccumulator, extract_nonstream
 
 GROK_BASE = UPSTREAM_BASE.rstrip("/")
-_DEFAULT_CLIENT_VERSION = "1.0.16"
+_DEFAULT_CLIENT_VERSION = "1.0.41"
 
 
 def _client_version() -> str:
@@ -54,14 +56,20 @@ def _client_version() -> str:
 
 
 def _identity_headers() -> dict[str, str]:
-    """对齐 grok-build build_proxy_headers（Authorization 由号池 token 另填）。"""
+    """对齐 grok-build 采样请求头（Authorization 由号池 token 另填）。
+
+    版本门用 x-grok-client-version；cli-chat-proxy 还要 Token-Auth、
+    authenticate-response、client-mode。User-Agent 形状是
+    ``grok-shell/<version> (<os>; <arch>)``。
+    """
     ver = _client_version()
     return {
         "X-XAI-Token-Auth": "xai-grok-cli",
         "x-grok-client-version": ver,
         "x-grok-client-identifier": "grok-shell",
+        "x-grok-client-mode": "headless",
         "x-authenticateresponse": "authenticate-response",
-        "User-Agent": f"xai-grok-workspace/{ver}",
+        "User-Agent": grok_user_agent(ver),
     }
 
 _MAX_BODY = 32 * 1024 * 1024
@@ -722,6 +730,7 @@ def _forward_headers(incoming: Any, token: str) -> dict[str, str]:
             "x-xai-token-auth",
             "x-grok-client-version",
             "x-grok-client-identifier",
+            "x-grok-client-mode",
             "x-authenticateresponse",
             "user-agent",
         }:
@@ -781,13 +790,17 @@ def _openai_error(message: str, status: int = 502) -> bytes:
 
 
 def _proxy_kwargs(proxy: str | None = None) -> dict[str, Any]:
+    """模型与探活走普通 HTTP 客户端，对齐 grok-build CLI，不用浏览器 TLS 指纹。
+
+    注册和协议级批准另走 Chrome 指纹。这里钉 HTTP/1.1，避免代理上的
+    HTTP/2 帧重置（curl 92）。
+    """
     url = proxypool.current() if proxy is None else proxy
     kwargs: dict[str, Any] = {
         "timeout": (_CONNECT_TIMEOUT, _READ_TIMEOUT),
         "allow_redirects": False,
         "verify": True,
-        "impersonate": "chrome",
-        # 强制 HTTP/1.1：规避 HTTP/2 帧层兼容问题（curl 92 PROTOCOL_ERROR reset）
+        "default_headers": False,
         "http_version": "v1",
     }
     if url:
@@ -932,6 +945,11 @@ def _proxy_direct(
                 status = int(upstream.status_code)
                 if status < 400:
                     _mark_account_ok(account_id)
+                else:
+                    logger.warning(
+                        f"[Grok网关] 上游拒绝 {method} {path} {who} HTTP {status}\n"
+                        f"{upstream_text(upstream.content)}"
+                    )
                 content_type = (upstream.headers.get("Content-Type") or "").lower()
                 is_stream = stream_flag and status < 400 and (
                     "text/event-stream" in content_type or not content_type
@@ -954,7 +972,7 @@ def _proxy_direct(
                 logger.warning(
                     f"[Grok网关] 上游请求异常 curl={code or 'unknown'} "
                     f"proxy={proxypool.status_label(used_proxy)} "
-                    f"attempt={request_attempt + 1}/2 retry={can_retry}"
+                    f"attempt={request_attempt + 1}/2 retry={can_retry}\n{exc}"
                 )
                 if used_proxy:
                     proxypool.mark_fail(used_proxy)

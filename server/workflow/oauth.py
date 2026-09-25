@@ -4,7 +4,8 @@
 适配 grok-rego 业务上下文：
 
 - sso_cookie 为字符串（sso 会话凭证 JWT 原值；sso 与 sso-rw value 相同）
-- 使用 curl_cffi impersonate="chrome" 模拟浏览器 TLS 指纹
+- 浏览器步骤（会话校验、授权页、verify、approve）用 curl_cffi impersonate="chrome"
+- 设备码、token 轮询、刷新走普通 HTTP 客户端，对齐 grok CLI
 - 三级降级路径：协议级 device（首选，全自动）→ device code 人工兜底
 - 全程无浏览器、无人工干预，认证失败返回明确原因
 
@@ -20,9 +21,10 @@ from typing import Any
 
 from curl_cffi import requests
 
+from core import config
 from core.config import OAUTH2_CLIENT_ID, OAUTH2_ISSUER, OAUTH2_SCOPES
 from core.logger import logger
-from core.util import curl_error_code, proxy_endpoint_ready
+from core.util import curl_error_code, grok_user_agent, proxy_endpoint_ready, upstream_text
 
 # ─── OAuth2 端点与协议常量 ───────────────────────────────
 _DEVICE_CODE_URL = f"{OAUTH2_ISSUER}/oauth2/device/code"
@@ -31,7 +33,6 @@ _DEVICE_APPROVE_URL = f"{OAUTH2_ISSUER}/oauth2/device/approve"
 _TOKEN_ENDPOINT = f"{OAUTH2_ISSUER}/oauth2/token"
 _DEVICE_GRANT = "urn:ietf:params:oauth:grant-type:device_code"
 _REFERRER = "grok-build"
-_SCOPE_STR = " ".join(OAUTH2_SCOPES)
 
 # 协议级 approve 的宽限时间（invalid_grant 短暂重试窗口）与总轮询上限
 _PROTOCOL_GRACE = 8.0
@@ -40,9 +41,14 @@ _REFRESH_RETRY_DELAYS = (1.0, 2.0)
 # 仅连接建立前失败可安全重试；56 属于响应接收阶段，refresh_token 可能已轮换，禁止盲重试。
 _SAFE_REFRESH_RETRY_CODES = {5, 6, 7}
 
-# 客户端版本头（对齐 grok-cli）
-_CLIENT_VERSION = "1.0.3"
+# 设备码指标面：cli = 有人能完成授权。版本走 config.GROK_VERSION，与网关同一份。
 _CLIENT_SURFACE = "cli"
+
+
+def _client_version() -> str:
+    """与网关同一份 grok-build 版本，避免换票和采样各报一套。"""
+    return (config.GROK_VERSION or "1.0.41").strip() or "1.0.41"
+
 
 # 表单请求通用头
 _FORM_HEADERS = {
@@ -59,22 +65,35 @@ _FORM_HEADERS = {
 def _version_headers() -> dict[str, str]:
     """设备授权码请求用的版本标识头。"""
     return {
-        "x-grok-client-version": _CLIENT_VERSION,
+        "x-grok-client-version": _client_version(),
         "x-grok-client-surface": _CLIENT_SURFACE,
     }
 
 
 def _token_ua() -> str:
-    """token 端点 User-Agent（对齐 grok-shell 风格）。"""
-    return f"grok-shell/{_CLIENT_VERSION}"
+    """token 端点 User-Agent，对齐 grok-shell sampler。"""
+    return grok_user_agent(_client_version())
 
 
 def _chrome_session(proxy: str = "") -> requests.Session:
-    """创建带 chrome TLS 指纹的会话；附代理。"""
+    """浏览器会话：SSO cookie、授权页、verify、approve。"""
     session = requests.Session(impersonate="chrome")
     if proxy:
         session.proxies = {"http": proxy, "https": proxy}
     return session
+
+
+def _cli_session(proxy: str = "") -> requests.Session:
+    """OAuth API 会话：设备码、token 交换、刷新。不用浏览器指纹。"""
+    session = requests.Session()
+    if proxy:
+        session.proxies = {"http": proxy, "https": proxy}
+    return session
+
+
+def _cli_http() -> dict[str, Any]:
+    """关掉 curl_cffi 的浏览器默认头，钉 HTTP/1.1。"""
+    return {"default_headers": False, "http_version": "v1"}
 
 
 # sso cookie 注入域：xAI 全家域（固定写死，sso 与 sso-rw value 相同）
@@ -137,8 +156,14 @@ def _validate_session(session: requests.Session) -> bool:
         return False
 
 
-def _request_device_code(session: requests.Session) -> dict[str, Any] | None:
-    """请求设备授权码，返回 {device_code, user_code, interval, open_url} 或 None。"""
+def _request_device_code() -> dict[str, Any] | None:
+    """请求设备授权码，返回 {device_code, user_code, interval, open_url} 或 None。
+
+    这是 grok CLI 的 OAuth API 调用，不走浏览器指纹，也不带 SSO cookie。
+    """
+    from core import proxypool
+
+    session = _cli_session(proxypool.current())
     try:
         r = session.post(
             _DEVICE_CODE_URL,
@@ -150,21 +175,25 @@ def _request_device_code(session: requests.Session) -> dict[str, Any] | None:
             headers={
                 "Content-Type": "application/x-www-form-urlencoded",
                 "Accept": "application/json",
+                "User-Agent": _token_ua(),
                 **_version_headers(),
             },
-            impersonate="chrome",
             timeout=20,
+            **_cli_http(),
         )
     except Exception as exc:
         logger.error(f"[认证] 请求设备授权码网络异常: {type(exc).__name__}: {exc}")
         return None
     if not (200 <= r.status_code < 300):
-        logger.error(f"[认证] 请求设备授权码失败: HTTP {r.status_code}")
+        logger.error(
+            f"[认证] 请求设备授权码失败: HTTP {r.status_code}\n"
+            f"{upstream_text(r.text)}"
+        )
         return None
     try:
         device = r.json()
     except Exception:
-        logger.error("[认证] 设备授权码响应非 JSON")
+        logger.error(f"[认证] 设备授权码响应非 JSON\n{upstream_text(r.text)}")
         return None
     device_code = str(device.get("device_code") or "")
     user_code = str(device.get("user_code") or "")
@@ -192,6 +221,14 @@ def _request_device_code(session: requests.Session) -> dict[str, Any] | None:
     }
 
 
+def _consent_token(html: str) -> str:
+    """从授权确认页取出 consent_token。缺省返回空串。"""
+    import re
+
+    match = re.search(r'name="consent_token"\s+value="([^"]+)"', html or "")
+    return match.group(1) if match else ""
+
+
 def _protocol_approve(
     session: requests.Session, device: dict[str, Any], principal_id: str
 ) -> bool:
@@ -215,7 +252,7 @@ def _protocol_approve(
             logger.warning(f"[认证] 访问授权页异常（继续尝试）: {exc}")
 
     # 2. POST verify：提交 user_code，进入授权确认页
-    logger.info(f"[认证] 提交 device verify  user_code={user_code}")
+    logger.debug(f"[认证] 提交 device verify  user_code={user_code}")
     try:
         r = session.post(
             _DEVICE_VERIFY_URL,
@@ -232,17 +269,28 @@ def _protocol_approve(
     url = str(r.url or "")
     # 登录会话失效：verify 被拒
     if "sign-in" in url or r.status_code in (401, 403):
-        logger.warning("[认证] device 校验被拒（登录会话失效）")
+        logger.warning(
+            f"[认证] device 校验被拒 HTTP {r.status_code} url={url}\n"
+            f"{upstream_text(r.text)}"
+        )
         return False
 
     # 已直接到 done 页（会话记忆了之前的授权）
     done = "/oauth2/device/done" in url.lower()
     if done:
-        logger.info("[认证] verify 已直接到达 done 页（会话记忆授权）")
+        logger.debug("[认证] verify 已直接到达 done 页（会话记忆授权）")
         return True
 
     # 3. POST approve：模拟用户点击 Allow
-    logger.info(f"[认证] 提交 device approve  principal_id={principal_id}")
+    # consent_token 由确认页下发，缺它时 auth.x.ai 直接 403（Request could not be verified）
+    consent_token = _consent_token(r.text or "")
+    if not consent_token:
+        logger.warning(
+            f"[认证] 授权确认页缺少 consent_token HTTP {r.status_code} url={url}\n"
+            f"{upstream_text(r.text)}"
+        )
+        return False
+    logger.debug(f"[认证] 提交 device approve  principal_id={principal_id}")
     try:
         r = session.post(
             _DEVICE_APPROVE_URL,
@@ -251,6 +299,7 @@ def _protocol_approve(
                 "action": "allow",
                 "principal_type": "User",
                 "principal_id": principal_id,
+                "consent_token": consent_token,
             },
             headers={**_FORM_HEADERS, "Referer": url or "https://accounts.x.ai/"},
             impersonate="chrome",
@@ -262,7 +311,10 @@ def _protocol_approve(
         return False
 
     if "/oauth2/device/done" not in str(r.url or "").lower():
-        logger.warning(f"[认证] device 批准未完成（HTTP {r.status_code} url={r.url}）")
+        logger.warning(
+            f"[认证] device 批准未完成 HTTP {r.status_code} url={r.url}\n"
+            f"{upstream_text(r.text)}"
+        )
         return False
     logger.success("[认证] device 批准完成")
     return True
@@ -281,7 +333,7 @@ def _poll_device_token(
     interval = max(1, int(device.get("interval") or 2))
     from core import proxypool
 
-    session = _chrome_session(proxypool.current())
+    session = _cli_session(proxypool.current())
     round_n = 0
 
     while time.time() < poll_deadline:
@@ -299,8 +351,8 @@ def _poll_device_token(
                     "User-Agent": _token_ua(),
                     **_version_headers(),
                 },
-                impersonate="chrome",
                 timeout=8,
+                **_cli_http(),
             )
         except Exception as exc:
             logger.debug(f"[认证] token 轮询网络异常（继续）: {exc}")
@@ -310,12 +362,15 @@ def _poll_device_token(
         try:
             payload = r.json() if hasattr(r, "json") else {}
         except Exception:
-            logger.debug(f"[认证] token 轮询响应非 JSON: HTTP {r.status_code}")
+            logger.warning(
+                f"[认证] token 轮询响应非 JSON: HTTP {r.status_code}\n"
+                f"{upstream_text(r.text)}"
+            )
             time.sleep(interval)
             continue
 
         if 200 <= r.status_code < 300 and payload.get("access_token"):
-            logger.info("[认证] Token 交换成功")
+            logger.debug("[认证] Token 交换成功")
             return payload
 
         err = str(payload.get("error") or "")
@@ -333,10 +388,17 @@ def _poll_device_token(
         if err == "invalid_grant" and time.time() < grace_deadline:
             time.sleep(interval)
             continue
+        detail = str(payload.get("error_description") or "")
+        raw = upstream_text(r.text)
         if err in ("expired_token", "access_denied", "invalid_grant"):
-            logger.warning(f"[认证] 授权已终止: error={err}")
+            logger.warning(
+                f"[认证] 授权已终止: error={err} {detail}\n{raw}"
+            )
             return None
-        logger.warning(f"[认证] token 响应异常: HTTP {r.status_code} error={err or 'unknown'}")
+        logger.warning(
+            f"[认证] token 响应异常: HTTP {r.status_code} error={err or 'unknown'} "
+            f"{detail}\n{raw}"
+        )
         time.sleep(interval)
 
     logger.warning("[认证] 等待 Token 交换超时")
@@ -370,7 +432,7 @@ def auth_with_sso(sso_cookie: Any) -> tuple[dict[str, Any] | None, str]:
         logger.warning("[认证] 缺少 sso cookie，无法自动认证")
         return None, "缺少 sso cookie，无法自动认证（需重新注册获取 SSO）"
 
-    logger.info("[认证] SSO 协议级自动认证开始")
+    logger.debug("[认证] SSO 协议级自动认证开始")
     from core import proxypool
 
     session = _build_sso_session(sso_value, proxy=proxypool.current())
@@ -384,8 +446,8 @@ def auth_with_sso(sso_cookie: Any) -> tuple[dict[str, Any] | None, str]:
         return None, "sso cookie 已失效（会话过期或被踢）"
 
     logger.info("[认证] sso 会话校验通过")
-    # 2. 请求 device code
-    device = _request_device_code(session)
+    # 2. 请求 device code（CLI API，与浏览器会话分开）
+    device = _request_device_code()
     if device is None:
         logger.error("[认证] 请求设备授权码失败")
         return None, "请求设备授权码失败"
@@ -397,7 +459,7 @@ def auth_with_sso(sso_cookie: Any) -> tuple[dict[str, Any] | None, str]:
         logger.error("[认证] 协议级授权确认失败")
         return None, "协议级授权确认失败（会话可能已失效）"
 
-    logger.info("[认证] 协议级授权确认完成，开始轮询 Token")
+    logger.debug("[认证] 协议级授权确认完成，开始轮询 Token")
     # 4. 轮询 token
     token = _poll_device_token(device)
     if token and token.get("access_token"):
@@ -428,12 +490,15 @@ def refresh_token(token: str) -> tuple[dict[str, Any] | None, int]:
                     "grant_type": "refresh_token",
                     "refresh_token": token,
                     "client_id": OAUTH2_CLIENT_ID,
-                    "scope": _SCOPE_STR,
                 },
-                headers={"referrer": _REFERRER},
+                headers={
+                    "Accept": "application/json",
+                    "User-Agent": _token_ua(),
+                    **_version_headers(),
+                },
                 proxies=proxies,
                 timeout=60,
-                impersonate="chrome",
+                **_cli_http(),
             )
         except requests.RequestsError as exc:
             code = curl_error_code(exc)
@@ -456,7 +521,10 @@ def refresh_token(token: str) -> tuple[dict[str, Any] | None, int]:
             continue
         try:
             if resp.status_code != 200:
-                logger.warning(f"[认证] token 刷新失败 status={resp.status_code}")
+                logger.warning(
+                    f"[认证] token 刷新失败 status={resp.status_code}\n"
+                    f"{upstream_text(resp.text)}"
+                )
                 return None, resp.status_code
             logger.success(f"[认证] token 刷新成功  · HTTP {resp.status_code}")
             return resp.json(), 200

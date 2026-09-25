@@ -137,6 +137,14 @@ export function logLineTone(entry: LogEntry): "fail" | "ok" | "warn" | "info" {
   return "info";
 }
 
+/** 从「消化完成: 成功 N/M」取出成功数；解析不到返回 null。 */
+function authPoolDoneCount(message: string): number | null {
+  const matched = /成功\s+(\d+)/.exec(message);
+  if (!matched) return null;
+  const count = Number(matched[1]);
+  return Number.isFinite(count) ? count : null;
+}
+
 /** 线程组终态。主控：有成功即成功，全部失败才失败；预检成功不算结束。 */
 export function groupStatus(group: ThreadLogGroup): GroupStatus {
   const last = group.entries[group.entries.length - 1];
@@ -154,10 +162,21 @@ export function groupStatus(group: ThreadLogGroup): GroupStatus {
   }
 
   if (group.worker === "auth") {
-    const outOk = group.entries.some(
-      (e) => parseLogTag(e.message) === "出池" && logLineTone(e) === "ok",
-    );
-    if (outOk) return "ok";
+    // 出池成功只代表单个账号换到 Token，不能当作整池结束。
+    // 整池以「消化完成」收口：有成功即完成，成功 0 且有失败才算失败。
+    const done = [...group.entries]
+      .reverse()
+      .find(
+        (e) =>
+          parseLogTag(e.message) === "出池" &&
+          (/消化完成/.test(e.message) || /队列为空/.test(e.message)),
+      );
+    if (done) {
+      if (/队列为空/.test(done.message)) return "ok";
+      const ok = authPoolDoneCount(done.message);
+      if (ok === null) return "running";
+      return ok > 0 ? "ok" : "fail";
+    }
     const tone = logLineTone(last);
     if (tone === "fail") return "fail";
     return group.entries.length ? "running" : "idle";

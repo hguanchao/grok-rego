@@ -13,7 +13,7 @@ from typing import Any
 
 from core.config import GOTO_TIMEOUT
 from core.logger import logger
-from core.util import elapsed_label
+from core.util import elapsed_label, upstream_text
 from workflow import human
 
 # 全页拦截特征：禁止用 challenges.cloudflare.com（Turnstile widget 的 iframe/脚本也会命中）
@@ -112,19 +112,28 @@ def _has_body(page: Any) -> bool:
     return page.query_selector("body") is not None
 
 
+def _visible_text(page: Any) -> str:
+    """失败时摘录页面可见正文；取不到就记下异常原文。"""
+    try:
+        body = page.inner_text("body") if _has_body(page) else ""
+    except Exception as exc:
+        return f"{type(exc).__name__}: {exc}"
+    return upstream_text(body)
+
+
 def safe_goto(page: Any, url: str) -> bool:
     """导航到指定 URL，超时不崩溃；出现 Cloudflare 全页挑战则模拟真人点击。"""
     t0 = time.monotonic()
     try:
         page.goto(url, wait_until="domcontentloaded", timeout=GOTO_TIMEOUT)
-        logger.info(f"[浏览器] 页面导航完成: {url}  · {elapsed_label(t0)}")
+        logger.debug(f"[浏览器] 页面导航完成: {url}  · {elapsed_label(t0)}")
     except Exception as e:
         logger.warning(
-            f"[浏览器] 页面导航超时: {type(e).__name__}  · {elapsed_label(t0)}"
+            f"[浏览器] 页面导航失败: {type(e).__name__}: {e}  · {elapsed_label(t0)}"
         )
         if not _has_body(page):
             return False
-        logger.info("[浏览器] 页面已部分加载，继续尝试")
+        logger.debug("[浏览器] 页面已部分加载，继续尝试")
     handle_cf_challenge(page)
     # 落地后的阅读停顿：真人不会在页面刚出来就立刻动手
     human.reading_pause(page)
@@ -178,7 +187,7 @@ def handle_cf_challenge(page: Any, max_wait: int = 90) -> bool:
         logger.debug(f"[CF挑战] 未出现全页挑战  · {elapsed_label(t0)}")
         return True
 
-    logger.info("[CF挑战] 检测到 Cloudflare 全页拦截，模拟真人点击")
+    logger.debug("[CF挑战] 检测到 Cloudflare 全页拦截，模拟真人点击")
     elapsed = 0.0
     last_click = -10.0
     while elapsed < max_wait:
@@ -194,7 +203,10 @@ def handle_cf_challenge(page: Any, max_wait: int = 90) -> bool:
                 continue
         time.sleep(1.0)
         elapsed += 1.0
-    logger.warning(f"[CF挑战] 全页拦截等待超时（已等 {max_wait}s）  · {elapsed_label(t0)}")
+    logger.warning(
+        f"[CF挑战] 全页拦截等待超时（已等 {max_wait}s）  · {elapsed_label(t0)}\n"
+        f"{_visible_text(page)}"
+    )
     return False
 
 
@@ -229,7 +241,7 @@ def try_click_cookies(page: Any) -> bool:
             }"""
         )
         if clicked:
-            logger.info(f"[浏览器] 已点击 Cookie 同意（{clicked}）")
+            logger.debug(f"[浏览器] 已点击 Cookie 同意（{clicked}）")
             page.wait_for_timeout(600)
             return True
     except Exception:
@@ -245,7 +257,7 @@ def try_click_cookies(page: Any) -> bool:
                 if not locator.is_visible():
                     continue
                 human_click_locator(page, locator)
-                logger.info("[浏览器] 已点击 Cookie 同意")
+                logger.debug("[浏览器] 已点击 Cookie 同意")
                 page.wait_for_timeout(600)
                 return True
             except Exception:
@@ -388,7 +400,7 @@ def _click_turnstile_checkbox(page: Any, widget: Any) -> bool:
             role_box = frame_loc.get_by_role("checkbox").first
             if role_box.count() > 0:
                 human_click_locator(page, role_box)
-                logger.info("[Turnstile] 已点击勾选框（role=checkbox）")
+                logger.debug("[Turnstile] 已点击勾选框（role=checkbox）")
                 return True
         except Exception:
             pass
@@ -398,7 +410,7 @@ def _click_turnstile_checkbox(page: Any, widget: Any) -> bool:
                 if cand.count() == 0:
                     continue
                 human_click_locator(page, cand)
-                logger.info(f"[Turnstile] 已点击勾选框（iframe 内 {sel}）")
+                logger.debug(f"[Turnstile] 已点击勾选框（iframe 内 {sel}）")
                 return True
             except Exception:
                 continue
@@ -413,7 +425,7 @@ def _click_turnstile_checkbox(page: Any, widget: Any) -> bool:
         y = box0["y"] + box0["height"] * 0.50
         try:
             _human_click(page, x, y)
-            logger.info("[Turnstile] 已坐标点击勾选框（页面坐标左侧）")
+            logger.debug("[Turnstile] 已坐标点击勾选框（页面坐标左侧）")
             return True
         except Exception:
             pass
@@ -422,7 +434,7 @@ def _click_turnstile_checkbox(page: Any, widget: Any) -> bool:
                 position={"x": 28, "y": min(32.0, box0["height"] * 0.5)},
                 timeout=2500,
             )
-            logger.info("[Turnstile] 已坐标点击勾选框（iframe 内 (28, mid)）")
+            logger.debug("[Turnstile] 已坐标点击勾选框（iframe 内 (28, mid)）")
             return True
         except Exception:
             pass
@@ -464,7 +476,7 @@ def _click_turnstile_by_response_host(page: Any) -> bool:
     y = float(box["y"]) + float(box["h"]) * 0.50
     try:
         _human_click(page, x, y)
-        logger.info("[Turnstile] 已坐标点击勾选框（response 宿主左侧）")
+        logger.debug("[Turnstile] 已坐标点击勾选框（response 宿主左侧）")
         return True
     except Exception:
         return False
@@ -536,7 +548,7 @@ def handle_turnstile(page: Any, max_wait: int = 60) -> str:
             logger.success(f"[CF挑战] 未出现 Turnstile，跳过  · {elapsed_label(t0)}")
             return "skipped"
 
-    logger.info("[Turnstile] 检测到 Turnstile 验证组件")
+    logger.debug("[Turnstile] 检测到 Turnstile 验证组件")
     elapsed = 0.0
     clicks = 0
     last_click = -10.0
@@ -548,7 +560,7 @@ def handle_turnstile(page: Any, max_wait: int = 60) -> str:
             logger.success(f"[CF挑战] Turnstile 已通过  · {elapsed_label(t0)}")
             return "passed"
         if _page_has_markers(page, _VERIFY_FAIL_MARKERS):
-            logger.warning("[Turnstile] 可见校验失败，需要刷新页面")
+            logger.warning(f"[Turnstile] 可见校验失败\n{_visible_text(page)}")
             return "refresh"
 
         # 宽限期内只等自动通过，不点，避免打断 managed 模式
@@ -566,7 +578,7 @@ def handle_turnstile(page: Any, max_wait: int = 60) -> str:
                 clicks += 1
                 last_click = elapsed
                 if clicked:
-                    logger.info(f"[Turnstile] 已点击勾选框（第 {clicks} 次）")
+                    logger.debug(f"[Turnstile] 已点击勾选框（第 {clicks} 次）")
                 page.wait_for_timeout(2500)
                 elapsed += 2.5
                 continue
@@ -581,7 +593,10 @@ def handle_turnstile(page: Any, max_wait: int = 60) -> str:
         return "passed"
     if _page_has_markers(page, _VERIFY_FAIL_MARKERS):
         return "refresh"
-    logger.warning(f"[CF挑战] Turnstile 等待超时（已等 {max_wait}s）  · {elapsed_label(t0)}")
+    logger.warning(
+        f"[CF挑战] Turnstile 等待超时（已等 {max_wait}s）  · {elapsed_label(t0)}\n"
+        f"{_visible_text(page)}"
+    )
     return "failed"
 
 

@@ -74,7 +74,7 @@ def main() -> None:
     else:
         logger.error("[Main] 注册全部失败")
 
-    # 注册完成后，认证池 20 线程消化，每线程间隔 1s 换 Token
+    # 注册完成后串行消化认证池，一个账号换完 Token 再接下一个
     run_auth_pool()
 
 

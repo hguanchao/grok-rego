@@ -28,13 +28,20 @@ from urllib.parse import urljoin
 
 from curl_cffi import CurlMime, requests
 
+from core import config
 from core.config import OAUTH2_CLIENT_ID, OAUTH2_ISSUER, OAUTH2_SCOPES
 from core.logger import logger
-from core.util import decode_jwt_exp
+from core.util import decode_jwt_exp, grok_user_agent
 
 # CPA auth-file 固定值（与 grok-build 官方导出格式一致）
 _CPA_REDIRECT_URI = "http://127.0.0.1:2468"
-_CPA_CLIENT_VERSION = "1.0.0"
+
+
+def _cpa_client_version() -> str:
+    """导出凭据里的客户端版本，与网关同一份 grok_version。"""
+    return (config.GROK_VERSION or "1.0.41").strip() or "1.0.41"
+
+
 # CPA 下游固定出口
 _CPA_BASE_URL = "https://cli-chat-proxy.grok.com/v1"
 _CPA_TOKEN_ENDPOINT = f"{OAUTH2_ISSUER}/oauth2/token"
@@ -90,14 +97,16 @@ def _extract_error_text(resp: requests.Response, limit: int = 240) -> str:
     return text[:limit] if text else f"HTTP {resp.status_code}"
 
 
-def _client_headers(version: str = _CPA_CLIENT_VERSION) -> dict[str, str]:
-    """grok-shell 客户端指纹头。"""
-    ver = (version or _CPA_CLIENT_VERSION).strip()
+def _client_headers(version: str = "") -> dict[str, str]:
+    """grok-shell 客户端指纹头，对齐采样请求。"""
+    ver = (version or _cpa_client_version()).strip() or _cpa_client_version()
     return {
         "x-grok-client-version": ver,
+        "x-grok-client-identifier": "grok-shell",
+        "x-grok-client-mode": "headless",
         "x-xai-token-auth": "xai-grok-cli",
         "x-authenticateresponse": "authenticate-response",
-        "User-Agent": f"grok-shell/{ver} (windows; x86_64)",
+        "User-Agent": grok_user_agent(ver),
     }
 
 

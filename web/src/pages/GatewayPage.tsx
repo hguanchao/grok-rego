@@ -136,7 +136,7 @@ export function GatewayPage() {
     try {
       const raw: AppConfig = await fetchConfig();
       setApiKey(raw.gateway_api_key || "");
-      setClientVersion(raw.grok_version || "1.0.16");
+      setClientVersion(raw.grok_version || "1.0.41");
       setProxyText(proxiesToText(raw.proxies, raw.proxy || ""));
       setSettingsLoaded(true);
     } catch (err) {
@@ -451,7 +451,7 @@ export function GatewayPage() {
                         tip={
                           <>
                             写入 config.json 的 grok_version，打上游时填
-                            x-grok-client-version 与 User-Agent（xai-grok-workspace/版本）。
+                            x-grok-client-version 与 User-Agent（grok-shell/版本）。
                             对齐 grok-build，Authorization 仍用号池 token。
                           </>
                         }
@@ -482,7 +482,7 @@ export function GatewayPage() {
                         void handleSaveClientVersion();
                       }
                     }}
-                    placeholder="1.0.16"
+                    placeholder="1.0.41"
                     aria-label="Grok客户端版本号"
                     spellCheck={false}
                     autoComplete="off"

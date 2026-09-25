@@ -24,6 +24,7 @@ from core.config import UPSTREAM_BASE
 from core.logger import logger
 from core.mutex import acquire as mutex_acquire, release as mutex_release
 from core.util import (
+    upstream_text,
     ACCOUNT_WORKER_GAP_SEC,
     ACCOUNT_WORKERS,
     decode_jwt_exp,
@@ -78,7 +79,7 @@ class ProbeClient:
     def _session(self, proxy: str) -> requests.Session:
         pair = getattr(_thread_local, "session_pair", None)
         if pair is None or pair[0] != proxy:
-            session = requests.Session(impersonate="chrome")
+            session = requests.Session()
             session.proxies = {"http": proxy, "https": proxy}
             _thread_local.session_pair = (proxy, session)
         return _thread_local.session_pair[1]
@@ -113,6 +114,8 @@ class ProbeClient:
                     f"{self.base_url}/billing?format=credits",
                     headers=headers,
                     timeout=(_PROBE_CONNECT_TIMEOUT, _PROBE_READ_TIMEOUT),
+                    default_headers=False,
+                    http_version="v1",
                 )
                 break
             except requests.RequestsError as exc:
@@ -120,11 +123,11 @@ class ProbeClient:
                     logger.warning(f"[探活] {email} 请求异常（重试中）: {type(exc).__name__}: {exc}")
                     time.sleep(_PROBE_RETRY_DELAY)
                     continue
-                detail = str(exc)[:160]
+                detail = str(exc)
                 if "timed out" in detail or "Timeout" in detail or "Connection" in detail:
                     detail = "网络无响应"
                 result["error"] = detail
-                logger.error(f"[探活] {email} 请求失败: {type(exc).__name__}: {detail}")
+                logger.error(f"[探活] {email} 请求失败: {type(exc).__name__}: {exc}")
                 return result
 
         status = int(response.status_code)
@@ -133,7 +136,10 @@ class ProbeClient:
         if not (200 <= status < 300):
             err = _simplify_error(status, response.text or "")
             result["error"] = err
-            logger.warning(f"[探活] {email} 探活失败 · HTTP {status} {err}")
+            logger.warning(
+                f"[探活] {email} 探活失败 · HTTP {status} {err}\n"
+                f"{upstream_text(response.text)}"
+            )
             return result
         result["error"] = "探活通过"
         logger.debug(f"[探活] {email} 探活通过 · HTTP {status} · {result['elapsed_ms']}ms")
@@ -194,7 +200,7 @@ def _append_auth_pool_log(level: str, message: str) -> None:
 
 
 def kick_auth_pool() -> None:
-    """后台线程消化认证池（20 worker，每 worker 间隔 1s）；已有消化线程则跳过本轮。
+    """后台线程串行消化认证池；已有消化线程则跳过本轮。
 
     全局互斥：其它重任务（推送/号池任务/注册）进行中直接拒绝（API 层转 409）。
     """
