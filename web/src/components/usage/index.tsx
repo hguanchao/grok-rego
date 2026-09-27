@@ -93,20 +93,26 @@ export function UsageTrendChart({
   const wrapRef = useRef<HTMLDivElement>(null);
   const [hover, setHover] = useState<number | null>(null);
   const [width, setWidth] = useState(640);
+  const [height, setHeight] = useState(220);
 
   useEffect(() => {
     const el = wrapRef.current;
     if (!el) return;
     const ro = new ResizeObserver((entries) => {
-      const w = entries[0]?.contentRect.width;
-      if (w && Number.isFinite(w)) setWidth(Math.max(280, Math.floor(w)));
+      const box = entries[0]?.contentRect;
+      if (!box) return;
+      if (box.width && Number.isFinite(box.width)) {
+        setWidth(Math.max(280, Math.floor(box.width)));
+      }
+      if (box.height && Number.isFinite(box.height)) {
+        setHeight(Math.max(140, Math.min(320, Math.floor(box.height))));
+      }
     });
     ro.observe(el);
     setWidth(Math.max(280, Math.floor(el.clientWidth || 640)));
+    setHeight(Math.max(140, Math.min(320, Math.floor(el.clientHeight || 220))));
     return () => ro.disconnect();
   }, []);
-
-  const height = 220;
   const pad = { top: 16, right: 12, bottom: 28, left: 44 };
   const innerW = width - pad.left - pad.right;
   const innerH = height - pad.top - pad.bottom;

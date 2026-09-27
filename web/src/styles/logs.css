@@ -1,13 +1,14 @@
 /* Terminal / logs — 跟随主题，浅色不再黑底 */.terminal {
-  flex: 1;
+  flex: 1 1 auto;
   display: flex;
   flex-direction: column;
-  min-height: 360px;
+  min-height: 0;
   background: var(--terminal-bg);
   border-radius: 0 0 var(--radius-lg) var(--radius-lg);
   color: var(--terminal-fg);
 }.term-bar {
   display: flex;
+  flex-shrink: 0;
   align-items: center;
   justify-content: space-between;
   gap: 12px;
@@ -27,11 +28,10 @@
   gap: 6px;
   flex-wrap: wrap;
 }.log-console {
-  flex: 1;
+  flex: 1 1 auto;
   overflow: auto;
   padding: 8px 0 16px;
-  min-height: 280px;
-  max-height: calc(100svh - 320px);
+  min-height: 0;
 }
 
 /* ── 按线程折叠的日志分组 ── */.log-thread-list {

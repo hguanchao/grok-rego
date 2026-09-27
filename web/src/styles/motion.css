@@ -11,6 +11,12 @@
 /* 弹窗：仅 opacity（Edge 上 scale/translate 大面板易卡；关闭也不留 transform） */
 
 /* 路由页切换 */.page-enter {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
   animation: ap-page-enter var(--ap-dur) var(--ap-ease-out) both;
 }
 
@@ -106,6 +112,40 @@
   .page-enter,
   .nav-tab[data-state="active"]::after {
     transform: none !important;
+  }
+}
+
+/* 短视口（笔记本）：收紧壳层与指标，把高度留给表格 / 日志 */
+@media (max-height: 820px) {
+  .app-frame {
+    padding: 10px 16px;
+  }
+  .metric {
+    padding: 8px 12px;
+  }
+  .metric-k {
+    margin-bottom: 2px;
+  }
+  .metric-v {
+    font-size: 18px;
+  }
+  .metric-sub {
+    margin-top: 2px;
+  }
+  .usage-toolbar {
+    padding: 10px 14px;
+  }
+  .usage-title {
+    font-size: 16px;
+  }
+  .control-rail {
+    padding: 12px;
+  }
+  .rail-actions {
+    bottom: -12px;
+    margin-inline: -12px;
+    margin-bottom: -12px;
+    padding: 10px 12px 12px;
   }
 }
 

@@ -5,13 +5,16 @@
 }
 .usage-workspace {
   display: flex;
+  flex: 1 1 auto;
   flex-direction: column;
   min-width: 0;
+  min-height: 0;
   overflow: hidden;
 }
 
 .usage-toolbar {
   display: flex;
+  flex-shrink: 0;
   flex-wrap: wrap;
   align-items: flex-end;
   justify-content: space-between;
@@ -158,13 +161,30 @@
 .usage-grid {
   display: grid;
   grid-template-columns: minmax(0, 1.55fr) minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr) minmax(180px, 1.15fr);
   gap: 1px;
+  flex: 1 1 auto;
   background: var(--border);
   min-width: 0;
+  min-height: 0;
+  overflow: hidden;
 }
 @media (max-width: 960px) {
+  .usage-workspace {
+    overflow: auto;
+  }
   .usage-grid {
+    flex: none;
     grid-template-columns: 1fr;
+    grid-template-rows: none;
+    overflow: visible;
+  }
+  .usage-panel-chart,
+  .usage-panel-table {
+    min-height: 280px;
+  }
+  .usage-table-wrap {
+    max-height: 360px;
   }
 }
 
@@ -173,21 +193,25 @@
   flex-direction: column;
   min-width: 0;
   min-height: 0;
+  overflow: hidden;
   padding: 14px 16px 16px;
   background: var(--card);
 }
 
 .usage-panel-chart {
-  min-height: 300px;
+  min-height: 0;
+  overflow: auto;
 }
 
 .usage-panel-table {
   grid-column: 1 / -1;
-  min-height: 280px;
+  min-height: 0;
+  overflow: hidden;
 }
 
 .usage-panel-head {
   display: flex;
+  flex-shrink: 0;
   align-items: flex-start;
   justify-content: space-between;
   gap: 10px;
@@ -346,8 +370,9 @@
 
 .usage-empty {
   display: grid;
+  flex: 1 1 auto;
   place-items: center;
-  min-height: 160px;
+  min-height: 80px;
   font-size: 13px;
   color: var(--muted-foreground);
 }
@@ -355,13 +380,14 @@
 .usage-chart {
   position: relative;
   width: 100%;
-  min-height: 220px;
+  flex: 1 1 auto;
+  min-height: 140px;
 }
 
 .usage-chart-svg {
   display: block;
   width: 100%;
-  height: auto;
+  height: 100%;
   overflow: visible;
   cursor: crosshair;
 }
@@ -438,6 +464,7 @@
 
 .usage-peak {
   display: inline-flex;
+  flex-shrink: 0;
   flex-wrap: wrap;
   align-items: center;
   gap: 6px;
@@ -459,8 +486,11 @@
   margin: 0;
   padding: 0;
   display: flex;
+  flex: 1 1 auto;
   flex-direction: column;
   gap: 12px;
+  min-height: 0;
+  overflow: auto;
 }
 
 .usage-model-head {
@@ -528,9 +558,10 @@
 }
 
 .usage-table-wrap {
+  flex: 1 1 auto;
   margin: 0 -4px;
+  min-height: 0;
   overflow: auto;
-  max-height: 420px;
 }
 .usage-table-wrap table {
   width: max-content;
@@ -576,6 +607,7 @@
 
 .usage-foot {
   display: flex;
+  flex-shrink: 0;
   flex-wrap: wrap;
   align-items: center;
   justify-content: space-between;
@@ -609,7 +641,8 @@
 }
 .usage-skel-chart {
   width: 100%;
-  height: 260px;
+  flex: 1 1 auto;
+  min-height: 140px;
 }
 
 @keyframes usage-skel-pulse {

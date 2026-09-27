@@ -45,6 +45,7 @@ import { Empty } from "@/components/ui";
 import {
   DomainListEditor,
   Field,
+  FieldHelp,
   LogLineView,
   Stepper,
   ThreadPanelHeader,
@@ -52,6 +53,7 @@ import {
 import {
   ApiError,
   clearRegisterLogs,
+  fetchAuthPoolStatus,
   fetchConfig,
   fetchRegisterStatus,
   fetchTaskActive,
@@ -158,7 +160,7 @@ export function RegisterPage() {
   const [yydsApiBase, setYydsApiBase] = useState("");
   const [yydsApiKey, setYydsApiKey] = useState("");
 
-  // 推送目标设置
+  // 高级设置（浏览器 / 授权 / 仿真人 / 推送目标）
   const [pushDialogOpen, setPushDialogOpen] = useState(false);
   const [g2aBaseUrl, setG2aBaseUrl] = useState("");
   const [g2aUsername, setG2aUsername] = useState("");
@@ -189,6 +191,7 @@ export function RegisterPage() {
       el.scrollHeight - el.scrollTop - el.clientHeight < 80;
   };
 
+  const [authPool, setAuthPool] = useState({ running: false, queue: 0 });
   const [globalTaskBusy, setGlobalTaskBusy] = useState(false);
   const busy = isActiveStatus(job.status);
   const formDisabled = busy || loadingConfig || starting;
@@ -398,6 +401,25 @@ export function RegisterPage() {
     const id = window.setInterval(() => setTick((n) => n + 1), 1000);
     return () => window.clearInterval(id);
   }, [job.status]);
+
+  // 认证池排队数：注册入库后在此等待 Token 交换，消化中高亮
+  useEffect(() => {
+    let alive = true;
+    const tick = () => {
+      if (!alive) return;
+      fetchAuthPoolStatus(0)
+        .then((snap) => {
+          if (alive) setAuthPool({ running: snap.running, queue: snap.queue_size });
+        })
+        .catch(() => {});
+    };
+    tick();
+    const timer = window.setInterval(tick, 1000);
+    return () => {
+      alive = false;
+      window.clearInterval(timer);
+    };
+  }, []);
 
   // 全局任务互斥：其它任务（推送/巡检/认证/号池）执行中禁用「开始注册」
   useEffect(() => {
@@ -634,153 +656,43 @@ export function RegisterPage() {
             </div>
             <div className="field-block">
               <div className="field-label">
-                <b>浏览器模式</b>
+                <b>代理池</b>
               </div>
-              <ToggleGroup
-                type="single"
-                className="mode-toggle"
-                value={headless ? "headless" : "visible"}
-                onValueChange={(value) => {
-                  if (value === "headless") setHeadless(true);
-                  if (value === "visible") setHeadless(false);
-                }}
+              <textarea
+                className={cn(
+                  "file:text-foreground placeholder:text-muted-foreground flex min-h-[88px] w-full min-w-0 resize-y rounded-md border border-input bg-background px-2.5 py-1.5 text-[12px] leading-relaxed outline-none font-mono",
+                  "focus-visible:border-primary/50 focus-visible:ring-1 focus-visible:ring-primary/20",
+                  "disabled:pointer-events-none disabled:cursor-not-allowed disabled:opacity-50",
+                )}
+                placeholder={"http://127.0.0.1:7890\nhttp://user:pass@host:port"}
+                value={proxy}
                 disabled={formDisabled}
-                aria-label="浏览器模式"
-              >
-                <ToggleGroupItem className="mode-toggle-item" value="visible" aria-label="可视浏览器">
-                  <Eye className="size-3.5" strokeWidth={1.6} />
-                  可视
-                </ToggleGroupItem>
-                <ToggleGroupItem className="mode-toggle-item" value="headless" aria-label="无头浏览器">
-                  <EyeOff className="size-3.5" strokeWidth={1.6} />
-                  无头
-                </ToggleGroupItem>
-              </ToggleGroup>
+                spellCheck={false}
+                onChange={(event) => setProxy(event.target.value)}
+              />
             </div>
-
-            <div className="field-block">
-              <div className="field-label">
-                <b>SSO 授权</b>
-              </div>
-              <ToggleGroup
-                type="single"
-                className="mode-toggle"
-                value={authEnabled ? "auth" : "noauth"}
-                onValueChange={(value) => {
-                  if (value === "auth") setAuthEnabled(true);
-                  if (value === "noauth") setAuthEnabled(false);
-                }}
+            <div className="rail-btn-row">
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                title="浏览器、授权、仿真人与推送目标"
                 disabled={formDisabled}
-                aria-label="注册后自动进行 SSO 授权"
+                onClick={() => setPushDialogOpen(true)}
               >
-                <ToggleGroupItem className="mode-toggle-item" value="auth" aria-label="自动 SSO 授权">
-                  <BadgeCheck className="size-3.5" strokeWidth={1.6} />
-                  开启
-                </ToggleGroupItem>
-                <ToggleGroupItem className="mode-toggle-item" value="noauth" aria-label="不自动 SSO 授权">
-                  <CircleX className="size-3.5" strokeWidth={1.6} />
-                  关闭
-                </ToggleGroupItem>
-              </ToggleGroup>
-            </div>
-
-            <div className="field-block">
-              <div className="field-label">
-                <b>仿真人</b>
-                <span className="field-hint">贝塞尔轨迹 · 拟人键入</span>
-              </div>
-              <ToggleGroup
-                type="single"
-                className="mode-toggle"
-                value={humanSim ? "on" : "off"}
-                onValueChange={(value) => {
-                  if (value === "on") setHumanSim(true);
-                  if (value === "off") setHumanSim(false);
-                }}
-                disabled={formDisabled}
-                aria-label="全局仿真人防风控"
+                <SlidersHorizontal className="size-3.5" strokeWidth={1.6} />
+                高级设置
+              </Button>
+              <Button
+                type="button"
+                variant="default"
+                size="sm"
+                disabled={formDisabled || saving}
+                onClick={() => void handleSaveConfig()}
               >
-                <ToggleGroupItem className="mode-toggle-item" value="on" aria-label="开启仿真人">
-                  <MousePointer2 className="size-3.5" strokeWidth={1.6} />
-                  开启
-                </ToggleGroupItem>
-                <ToggleGroupItem className="mode-toggle-item" value="off" aria-label="关闭仿真人">
-                  <CircleX className="size-3.5" strokeWidth={1.6} />
-                  关闭
-                </ToggleGroupItem>
-              </ToggleGroup>
-            </div>
-
-            <div className="field-block">
-              <div className="field-label">
-                <b>拟人强度</b>
-              </div>
-              <ToggleGroup
-                type="single"
-                className="mode-toggle"
-                value={humanLevel}
-                onValueChange={(value) => {
-                  if (value === "light" || value === "normal" || value === "heavy") {
-                    setHumanLevel(value);
-                  }
-                }}
-                disabled={formDisabled || !humanSim}
-                aria-label="拟人强度"
-              >
-                <ToggleGroupItem className="mode-toggle-item" value="light" aria-label="轻量">
-                  轻量
-                </ToggleGroupItem>
-                <ToggleGroupItem className="mode-toggle-item" value="normal" aria-label="标准">
-                  标准
-                </ToggleGroupItem>
-                <ToggleGroupItem className="mode-toggle-item" value="heavy" aria-label="重度">
-                  重度
-                </ToggleGroupItem>
-              </ToggleGroup>
-            </div>
-
-            <div className="field-block rail-more-body">
-              <div className="field-block">
-                <div className="field-label">
-                  <b>代理池</b>
-                </div>
-                <textarea
-                  className={cn(
-                    "file:text-foreground placeholder:text-muted-foreground flex min-h-[88px] w-full min-w-0 resize-y rounded-md border border-input bg-background px-2.5 py-1.5 text-[12px] leading-relaxed outline-none font-mono",
-                    "focus-visible:border-primary/50 focus-visible:ring-1 focus-visible:ring-primary/20",
-                    "disabled:pointer-events-none disabled:cursor-not-allowed disabled:opacity-50",
-                  )}
-                  placeholder={"http://127.0.0.1:7890\nhttp://user:pass@host:port"}
-                  value={proxy}
-                  disabled={formDisabled}
-                  spellCheck={false}
-                  onChange={(event) => setProxy(event.target.value)}
-                />
-                <p className="field-hint">一行一条。注册线程粘性绑定，网关请求轮询；失败冷却 60 秒。</p>
-              </div>
-              <div className="rail-btn-row">
-                <Button
-                  type="button"
-                  variant="outline"
-                  size="sm"
-                  title="G2A / CPA 推送目标"
-                  disabled={formDisabled}
-                  onClick={() => setPushDialogOpen(true)}
-                >
-                  <SlidersHorizontal className="size-3.5" strokeWidth={1.6} />
-                  推送目标设置
-                </Button>
-                <Button
-                  type="button"
-                  variant="default"
-                  size="sm"
-                  disabled={formDisabled || saving}
-                  onClick={() => void handleSaveConfig()}
-                >
-                  <Save strokeWidth={1.6} />
-                  {saving ? "保存中…" : "保存配置"}
-                </Button>
-              </div>
+                <Save strokeWidth={1.6} />
+                {saving ? "保存中…" : "保存配置"}
+              </Button>
             </div>
           </div>
 
@@ -841,6 +753,21 @@ export function RegisterPage() {
                 {job.running}
               </div>
               <div className="metric-sub">{elapsed}</div>
+            </div>
+            <div className="metric">
+              <div className="metric-k">认证池</div>
+              <div
+                className={cn(
+                  "metric-v",
+                  authPool.running && "is-live is-pulse",
+                  !authPool.running && authPool.queue > 0 && "is-warn",
+                )}
+              >
+                {authPool.queue}
+              </div>
+              <div className="metric-sub">
+                {authPool.running ? "交换 Token" : authPool.queue > 0 ? "排队等待" : "空闲"}
+              </div>
             </div>
           </div>
 
@@ -1058,12 +985,146 @@ export function RegisterPage() {
       <Dialog open={pushDialogOpen} onOpenChange={setPushDialogOpen}>
         <DialogContent className="advanced-dialog sm:max-w-2xl" showClose>
           <DialogHeader>
-            <DialogTitle>推送目标设置</DialogTitle>
+            <DialogTitle>高级设置</DialogTitle>
             <DialogDescription>
-              配置 G2A / CPA 推送目标，保存后可在「号池管理 → 推送」中使用。
+              注册运行参数，以及 G2A / CPA 推送目标。保存后推送可在「号池管理 → 推送」中使用。
             </DialogDescription>
           </DialogHeader>
           <div className="advanced-content">
+            <div className="provider-block">
+              <div className="provider-title">注册</div>
+              <div className="field-pair">
+                <div className="field-block">
+                  <div className="field-label">
+                    <span className="inline-flex items-center gap-1">
+                      <b>浏览器模式</b>
+                      <FieldHelp
+                        label="浏览器模式"
+                        tip="可视会弹出注册窗口，方便盯过程。无头在后台跑，不占屏幕；窗口被挡住或最小化时，可视模式可能卡住，批量更适合无头。"
+                      />
+                    </span>
+                  </div>
+                  <ToggleGroup
+                    type="single"
+                    className="mode-toggle"
+                    value={headless ? "headless" : "visible"}
+                    onValueChange={(value) => {
+                      if (value === "headless") setHeadless(true);
+                      if (value === "visible") setHeadless(false);
+                    }}
+                    disabled={formDisabled}
+                    aria-label="浏览器模式"
+                  >
+                    <ToggleGroupItem className="mode-toggle-item" value="visible" aria-label="可视浏览器">
+                      <Eye className="size-3.5" strokeWidth={1.6} />
+                      可视
+                    </ToggleGroupItem>
+                    <ToggleGroupItem className="mode-toggle-item" value="headless" aria-label="无头浏览器">
+                      <EyeOff className="size-3.5" strokeWidth={1.6} />
+                      无头
+                    </ToggleGroupItem>
+                  </ToggleGroup>
+                </div>
+                <div className="field-block">
+                  <div className="field-label">
+                    <span className="inline-flex items-center gap-1">
+                      <b>SSO 授权</b>
+                      <FieldHelp
+                        label="SSO 授权"
+                        tip="开启后，注册拿到 SSO 会话会自动走 Device Flow，换成 access / refresh token。关闭则账号停在待认证，之后可在号池里手动认证。"
+                      />
+                    </span>
+                  </div>
+                  <ToggleGroup
+                    type="single"
+                    className="mode-toggle"
+                    value={authEnabled ? "auth" : "noauth"}
+                    onValueChange={(value) => {
+                      if (value === "auth") setAuthEnabled(true);
+                      if (value === "noauth") setAuthEnabled(false);
+                    }}
+                    disabled={formDisabled}
+                    aria-label="注册后自动进行 SSO 授权"
+                  >
+                    <ToggleGroupItem className="mode-toggle-item" value="auth" aria-label="自动 SSO 授权">
+                      <BadgeCheck className="size-3.5" strokeWidth={1.6} />
+                      开启
+                    </ToggleGroupItem>
+                    <ToggleGroupItem className="mode-toggle-item" value="noauth" aria-label="不自动 SSO 授权">
+                      <CircleX className="size-3.5" strokeWidth={1.6} />
+                      关闭
+                    </ToggleGroupItem>
+                  </ToggleGroup>
+                </div>
+              </div>
+              <div className="field-pair">
+                <div className="field-block">
+                  <div className="field-label">
+                    <span className="inline-flex items-center gap-1">
+                      <b>仿真人</b>
+                      <FieldHelp
+                        label="仿真人"
+                        tip="开启后，鼠标走曲线、点击和键入带随机停顿，用来降低机械操作特征。关闭则退回浏览器自带的拟人移动。"
+                      />
+                    </span>
+                  </div>
+                  <ToggleGroup
+                    type="single"
+                    className="mode-toggle"
+                    value={humanSim ? "on" : "off"}
+                    onValueChange={(value) => {
+                      if (value === "on") setHumanSim(true);
+                      if (value === "off") setHumanSim(false);
+                    }}
+                    disabled={formDisabled}
+                    aria-label="全局仿真人防风控"
+                  >
+                    <ToggleGroupItem className="mode-toggle-item" value="on" aria-label="开启仿真人">
+                      <MousePointer2 className="size-3.5" strokeWidth={1.6} />
+                      开启
+                    </ToggleGroupItem>
+                    <ToggleGroupItem className="mode-toggle-item" value="off" aria-label="关闭仿真人">
+                      <CircleX className="size-3.5" strokeWidth={1.6} />
+                      关闭
+                    </ToggleGroupItem>
+                  </ToggleGroup>
+                </div>
+                <div className="field-block">
+                  <div className="field-label">
+                    <span className="inline-flex items-center gap-1">
+                      <b>拟人强度</b>
+                      <FieldHelp
+                        label="拟人强度"
+                        tip="轻量更快、不造错字；标准为默认，偶发停顿和错字；重度最慢，也最像人。仿真人关闭时此项不生效。"
+                      />
+                    </span>
+                  </div>
+                  <ToggleGroup
+                    type="single"
+                    className="mode-toggle"
+                    value={humanLevel}
+                    onValueChange={(value) => {
+                      if (value === "light" || value === "normal" || value === "heavy") {
+                        setHumanLevel(value);
+                      }
+                    }}
+                    disabled={formDisabled || !humanSim}
+                    aria-label="拟人强度"
+                  >
+                    <ToggleGroupItem className="mode-toggle-item" value="light" aria-label="轻量">
+                      轻量
+                    </ToggleGroupItem>
+                    <ToggleGroupItem className="mode-toggle-item" value="normal" aria-label="标准">
+                      标准
+                    </ToggleGroupItem>
+                    <ToggleGroupItem className="mode-toggle-item" value="heavy" aria-label="重度">
+                      重度
+                    </ToggleGroupItem>
+                  </ToggleGroup>
+                </div>
+              </div>
+            </div>
+
             <div className="provider-block">
               <div className="provider-title">G2A</div>
               <Field label="地址" hint="管理端地址，如 http://127.0.0.1:8765">

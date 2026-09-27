@@ -213,6 +213,35 @@ function threadStatusBadge(status: GroupStatus) {
   }
 }
 
+/** 标签旁的问号：悬停显示说明，点击不抢弹窗焦点 */
+export function FieldHelp({ label, tip }: { label: string; tip: string }) {
+  return (
+    <Tooltip delayDuration={200}>
+      <TooltipTrigger asChild>
+        <button
+          type="button"
+          tabIndex={-1}
+          className="text-muted-foreground hover:text-foreground inline-flex size-4 shrink-0 items-center justify-center rounded-full outline-none"
+          aria-label={`${label}说明`}
+          onClick={(event) => {
+            event.preventDefault();
+            event.stopPropagation();
+          }}
+        >
+          <CircleHelp className="size-3.5" strokeWidth={1.75} />
+        </button>
+      </TooltipTrigger>
+      <TooltipContent
+        side="top"
+        align="start"
+        className="max-w-xs text-left leading-relaxed"
+      >
+        {tip}
+      </TooltipContent>
+    </Tooltip>
+  );
+}
+
 /** 表单字段：中文 label；说明放在问号 Tooltip 中 */
 export function Field({
   label,
@@ -229,32 +258,7 @@ export function Field({
         <Label className="text-foreground text-[13px] leading-none font-medium">
           {label}
         </Label>
-        {hint ? (
-          <Tooltip delayDuration={200}>
-            <TooltipTrigger asChild>
-              <button
-                type="button"
-                tabIndex={-1}
-                className="text-muted-foreground hover:text-foreground inline-flex size-4 shrink-0 items-center justify-center rounded-full outline-none"
-                aria-label={`${label}说明`}
-                onClick={(event) => {
-                  // 弹窗内阻止抢焦点/冒泡，避免打断输入与 Select
-                  event.preventDefault();
-                  event.stopPropagation();
-                }}
-              >
-                <CircleHelp className="size-3.5" strokeWidth={1.75} />
-              </button>
-            </TooltipTrigger>
-            <TooltipContent
-              side="top"
-              align="start"
-              className="max-w-xs text-left leading-relaxed"
-            >
-              {hint}
-            </TooltipContent>
-          </Tooltip>
-        ) : null}
+        {hint ? <FieldHelp label={label} tip={hint} /> : null}
       </div>
       <div className="w-full min-w-0">{children}</div>
     </div>

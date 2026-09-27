@@ -1612,7 +1612,7 @@ export function PoolPage() {
           <DialogHeader>
             <DialogTitle>推送账号</DialogTitle>
             <DialogDescription>
-              将已认证账号同步到所选目标；未勾选账号时推送全部已认证且状态正常的账号。后台并发执行，进度与巡检探活一致。目标连接信息在「注册页 → 推送目标设置」中配置。
+              将已认证账号同步到所选目标；未勾选账号时推送全部已认证且状态正常的账号。后台并发执行，进度与巡检探活一致。目标连接信息在「注册页 → 高级设置」中配置。
             </DialogDescription>
           </DialogHeader>
           <div className="push-target-list">
@@ -1649,7 +1649,7 @@ export function PoolPage() {
               }}
               title={
                 !anyPushTarget
-                  ? "请先在「注册页 → 推送目标设置」中配置目标"
+                  ? "请先在「注册页 → 高级设置」中配置目标"
                   : selected.size > 0
                     ? "开始推送选中账号（未认证或状态非正常的将被跳过）"
                     : "开始推送全部已认证且状态正常的账号"

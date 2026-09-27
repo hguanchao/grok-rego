@@ -19,9 +19,10 @@
     background: transparent;
   }html {
     @apply antialiased;
+    height: 100%;
     text-rendering: optimizeLegibility;
   }body {
-    @apply min-h-svh bg-background text-foreground font-sans text-[14px] leading-normal;
+    @apply h-svh overflow-hidden bg-background text-foreground font-sans text-[14px] leading-normal;
     letter-spacing: 0.01em;
     -webkit-font-smoothing: antialiased;
     background-image:
@@ -44,7 +45,7 @@
       );
     background-attachment: fixed;
   }#root {
-    @apply relative min-h-svh;
+    @apply relative h-full min-h-0 overflow-hidden;
   }::selection {
     background: color-mix(in srgb, var(--primary) 28%, transparent);
     color: var(--foreground);
@@ -58,12 +59,14 @@
    Shell
    ══════════════════════════════════════════════ */.app-shell {
   position: relative;
-  min-height: 100svh;
+  height: 100%;
+  min-height: 0;
   display: flex;
   flex-direction: column;
+  overflow: hidden;
 }.top-rail {
-  position: sticky;
-  top: 0;
+  position: relative;
+  flex-shrink: 0;
   z-index: 40;
   height: var(--top-h);
   display: grid;
@@ -273,12 +276,16 @@
     gap: 4px;
   }
 }.app-frame {
-  flex: 1;
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
   width: 100%;
   max-width: 1600px;
-  margin: 0 auto;
-  padding: 20px 20px 40px;
   min-width: 0;
+  min-height: 0;
+  margin: 0 auto;
+  padding: 16px 20px;
+  overflow: hidden;
 }
 
 /* ══════════════════════════════════════════════
