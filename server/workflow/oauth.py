@@ -148,11 +148,11 @@ def _validate_session(session: requests.Session) -> bool:
         url = str(r.url or "")
         # 跳转到 sign-in / sign-up 表示 sso 已失效
         if "sign-in" in url or "sign-up" in url or r.status_code == 401:
-            logger.warning("[认证] sso cookie 已失效（跳转登录页）")
+            logger.debug(f"[认证] sso 会话校验未通过（跳转 {url}）")
             return False
         return True
     except Exception as exc:
-        logger.warning(f"[认证] sso 会话校验网络异常: {type(exc).__name__}: {exc}")
+        logger.debug(f"[认证] sso 会话校验网络异常: {type(exc).__name__}: {exc}")
         return False
 
 
@@ -182,23 +182,26 @@ def _request_device_code() -> dict[str, Any] | None:
             **_cli_http(),
         )
     except Exception as exc:
-        logger.error(f"[认证] 请求设备授权码网络异常: {type(exc).__name__}: {exc}")
+        logger.warning(f"[认证] 设备授权码获取失败  {type(exc).__name__}: {exc}")
         return None
     if not (200 <= r.status_code < 300):
-        logger.error(
-            f"[认证] 请求设备授权码失败: HTTP {r.status_code}\n"
+        logger.warning(f"[认证] 设备授权码获取失败  HTTP {r.status_code}")
+        logger.debug(
+            f"[认证] 设备授权码获取失败原文 HTTP {r.status_code}\n"
             f"{upstream_text(r.text)}"
         )
         return None
     try:
         device = r.json()
     except Exception:
-        logger.error(f"[认证] 设备授权码响应非 JSON\n{upstream_text(r.text)}")
+        logger.warning(f"[认证] 设备授权码获取失败  响应非 JSON  HTTP {r.status_code}")
+        logger.debug(f"[认证] 设备授权码响应原文\n{upstream_text(r.text)}")
         return None
     device_code = str(device.get("device_code") or "")
     user_code = str(device.get("user_code") or "")
     if not device_code or not user_code:
-        logger.error("[认证] 设备授权码响应缺少 device_code / user_code")
+        logger.warning("[认证] 设备授权码获取失败  响应缺少 device_code / user_code")
+        logger.debug(f"[认证] 设备授权码响应原文\n{upstream_text(r.text)}")
         return None
     try:
         interval = max(1, int(device.get("interval") or 2))
@@ -249,7 +252,7 @@ def _protocol_approve(
                 allow_redirects=True,
             )
         except Exception as exc:
-            logger.warning(f"[认证] 访问授权页异常（继续尝试）: {exc}")
+            logger.debug(f"[认证] 访问授权页异常（继续尝试）: {exc}")
 
     # 2. POST verify：提交 user_code，进入授权确认页
     logger.debug(f"[认证] 提交 device verify  user_code={user_code}")
@@ -263,14 +266,19 @@ def _protocol_approve(
             allow_redirects=True,
         )
     except Exception as exc:
-        logger.error(f"[认证] verify 请求异常: {type(exc).__name__}: {exc}")
+        logger.warning(
+            f"[认证] 授权确认未完成  verify 请求异常 {type(exc).__name__}: {exc}"
+        )
         return False
 
     url = str(r.url or "")
     # 登录会话失效：verify 被拒
     if "sign-in" in url or r.status_code in (401, 403):
         logger.warning(
-            f"[认证] device 校验被拒 HTTP {r.status_code} url={url}\n"
+            f"[认证] 授权确认未完成  device 校验被拒 HTTP {r.status_code}"
+        )
+        logger.debug(
+            f"[认证] device 校验被拒原文 HTTP {r.status_code} url={url}\n"
             f"{upstream_text(r.text)}"
         )
         return False
@@ -286,7 +294,10 @@ def _protocol_approve(
     consent_token = _consent_token(r.text or "")
     if not consent_token:
         logger.warning(
-            f"[认证] 授权确认页缺少 consent_token HTTP {r.status_code} url={url}\n"
+            f"[认证] 授权确认未完成  确认页缺少 consent_token HTTP {r.status_code}"
+        )
+        logger.debug(
+            f"[认证] 授权确认页原文 HTTP {r.status_code} url={url}\n"
             f"{upstream_text(r.text)}"
         )
         return False
@@ -307,12 +318,15 @@ def _protocol_approve(
             allow_redirects=True,
         )
     except Exception as exc:
-        logger.error(f"[认证] approve 请求异常: {type(exc).__name__}: {exc}")
+        logger.warning(
+            f"[认证] 授权确认未完成  approve 请求异常 {type(exc).__name__}: {exc}"
+        )
         return False
 
     if "/oauth2/device/done" not in str(r.url or "").lower():
-        logger.warning(
-            f"[认证] device 批准未完成 HTTP {r.status_code} url={r.url}\n"
+        logger.warning(f"[认证] 授权确认未完成  device 批准被拒 HTTP {r.status_code}")
+        logger.debug(
+            f"[认证] device 批准原文 HTTP {r.status_code} url={r.url}\n"
             f"{upstream_text(r.text)}"
         )
         return False
@@ -362,7 +376,7 @@ def _poll_device_token(
         try:
             payload = r.json() if hasattr(r, "json") else {}
         except Exception:
-            logger.warning(
+            logger.debug(
                 f"[认证] token 轮询响应非 JSON: HTTP {r.status_code}\n"
                 f"{upstream_text(r.text)}"
             )
@@ -391,11 +405,10 @@ def _poll_device_token(
         detail = str(payload.get("error_description") or "")
         raw = upstream_text(r.text)
         if err in ("expired_token", "access_denied", "invalid_grant"):
-            logger.warning(
-                f"[认证] 授权已终止: error={err} {detail}\n{raw}"
-            )
+            logger.warning(f"[认证] 授权已终止  error={err}  {detail}")
+            logger.debug(f"[认证] 授权终止响应原文\n{raw}")
             return None
-        logger.warning(
+        logger.debug(
             f"[认证] token 响应异常: HTTP {r.status_code} error={err or 'unknown'} "
             f"{detail}\n{raw}"
         )
@@ -449,14 +462,12 @@ def auth_with_sso(sso_cookie: Any) -> tuple[dict[str, Any] | None, str]:
     # 2. 请求 device code（CLI API，与浏览器会话分开）
     device = _request_device_code()
     if device is None:
-        logger.error("[认证] 请求设备授权码失败")
         return None, "请求设备授权码失败"
 
     logger.info(f"[认证] 设备授权码已获取  user_code={device.get('user_code')}")
     # 3. 协议级 approve（模拟用户确认授权）
     principal_id = _decode_jwt_subject(sso_value)
     if not _protocol_approve(session, device, principal_id):
-        logger.error("[认证] 协议级授权确认失败")
         return None, "协议级授权确认失败（会话可能已失效）"
 
     logger.debug("[认证] 协议级授权确认完成，开始轮询 Token")
@@ -465,7 +476,7 @@ def auth_with_sso(sso_cookie: Any) -> tuple[dict[str, Any] | None, str]:
     if token and token.get("access_token"):
         logger.success("[认证] Token 交换成功")
         return token, "200 Token 交换成功"
-    logger.error("[认证] Token 交换超时或被拒绝")
+    logger.debug("[认证] Token 交换未完成（超时或被拒）")
     return None, "Token 交换超时或被拒绝"
 
 
