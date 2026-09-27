@@ -178,6 +178,16 @@ export function RegisterPage() {
   const [openThreads, setOpenThreads] = useState<string[]>([]);
   const seenWorkersRef = useRef<Set<string>>(new Set());
   const userTouchedCollapse = useRef(false);
+  const consoleRef = useRef<HTMLDivElement | null>(null);
+  // 用户上翻查看历史日志时暂停自动滚底，滚回底部附近后恢复
+  const stickToBottomRef = useRef(true);
+
+  const handleConsoleScroll = () => {
+    const el = consoleRef.current;
+    if (!el) return;
+    stickToBottomRef.current =
+      el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+  };
 
   const [globalTaskBusy, setGlobalTaskBusy] = useState(false);
   const busy = isActiveStatus(job.status);
@@ -408,9 +418,9 @@ export function RegisterPage() {
     };
   }, []);
 
-  // 日志自动滚底
+  // 日志自动滚底；用户上翻查看历史时暂停，滚回底部附近后恢复
   useEffect(() => {
-    if (!threadGroups.length) return;
+    if (!threadGroups.length || !stickToBottomRef.current) return;
     logEndRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
   }, [logs, threadGroups.length]);
 
