@@ -518,7 +518,9 @@ export function RegisterPage() {
     try {
       const status = await stopRegister();
       setJob((prev) => ({ ...status, logs: prev.logs }));
-      toast.message("已请求停止", { description: "当前步骤结束后退出" });
+      toast.message("已请求停止", {
+        description: "未点资料提交的账号立即停；已提交的账号会收完当前号",
+      });
     } catch (error) {
       toast.error("停止失败", { description: errMessage(error) });
     } finally {

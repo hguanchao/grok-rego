@@ -10,8 +10,32 @@
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 import math
+import threading
 
 BEIJING_TZ = timezone(timedelta(hours=8))
+_CANCEL_EVENT = threading.Event()
+
+
+def request_cancel() -> None:
+    """置位全局协作取消标志。"""
+    _CANCEL_EVENT.set()
+
+
+def clear_cancel() -> None:
+    """清除全局协作取消标志。"""
+    _CANCEL_EVENT.clear()
+
+
+def is_cancelled() -> bool:
+    """全局协作取消是否已置位。"""
+    return _CANCEL_EVENT.is_set()
+
+
+def wait_or_cancel(seconds: float) -> bool:
+    """可中断等待。已取消返回 True，到期返回 False。"""
+    return _CANCEL_EVENT.wait(timeout=max(0.0, float(seconds)))
+
+
 _STR_FORMAT = "%Y-%m-%d %H:%M:%S"
 _ISO_FORMAT = "%Y-%m-%dT%H:%M:%S"
 

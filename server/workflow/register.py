@@ -28,7 +28,11 @@ from core.util import (
     decode_jwt_exp,
     elapsed_label,
     format_exp,
+    is_cancelled,
+    request_cancel as _set_cancel,
+    clear_cancel as _clear_cancel,
     upstream_text,
+    wait_or_cancel,
 )
 from db import (
     STATUS_ACTIVE,
@@ -59,25 +63,81 @@ from workflow.human import reading_pause as human_reading_pause
 from workflow.mail import create_temp_email, poll_for_code
 
 # ─── 任务协作取消：API 停止时 set，run_signups 协作退出 ────────────────────
-_cancel_event = threading.Event()
+# 资料提交前的浏览器可立刻关掉；提交后要等 SSO，不能硬关。
+_live_browsers: set[Any] = set()
+_committed_browsers: set[Any] = set()
+_live_lock = threading.Lock()
 
 # 单次注册结果回调：(ok, email|None)
 ResultCallback = Callable[[bool, str | None], None]
 
 
 def request_cancel() -> None:
-    """请求取消进行中的批量注册（协作式，当前浏览器步骤结束后生效）。"""
-    _cancel_event.set()
+    """请求取消：关掉尚未点资料提交的浏览器；已提交的号继续收 SSO。"""
+    _set_cancel()
+    _close_live_browsers()
 
 
 def clear_cancel() -> None:
     """清除取消标志，开始新任务前调用。"""
-    _cancel_event.clear()
+    _clear_cancel()
 
 
-def is_cancelled() -> bool:
-    """当前是否已请求取消。"""
-    return _cancel_event.is_set()
+def _track_browser(browser: Any) -> None:
+    with _live_lock:
+        _live_browsers.add(browser)
+
+
+def _untrack_browser(browser: Any) -> None:
+    with _live_lock:
+        _live_browsers.discard(browser)
+        _committed_browsers.discard(browser)
+
+
+def _mark_browser_committed(page: Any) -> None:
+    """资料提交已点下去：该浏览器进入收尾，停止时不再硬关。"""
+    try:
+        browser = page.context.browser if hasattr(page, "context") else None
+    except Exception:
+        browser = None
+    if browser is None:
+        return
+    with _live_lock:
+        _committed_browsers.add(browser)
+
+
+def abort_if_cancelled(page: Any | None = None) -> bool:
+    """提交前取消：关掉当前页所属浏览器。已提交的号返回 False，让调用方收完 SSO。"""
+    if not is_cancelled():
+        return False
+    if page is None:
+        return True
+    try:
+        browser = page.context.browser if hasattr(page, "context") else None
+    except Exception:
+        browser = None
+    with _live_lock:
+        committed = browser is not None and browser in _committed_browsers
+    if committed:
+        return False
+    if browser is not None:
+        try:
+            browser.close()
+        except Exception:
+            pass
+    return True
+
+
+def _close_live_browsers() -> None:
+    with _live_lock:
+        closable = [b for b in _live_browsers if b not in _committed_browsers]
+        for browser in closable:
+            _live_browsers.discard(browser)
+    for browser in closable:
+        try:
+            browser.close()
+        except Exception:
+            pass
 
 
 def _proxies() -> dict[str, str] | None:
@@ -402,7 +462,7 @@ def click(
         f"input[type='submit'][value='{text}']",
     )
     for round_no in range(retries + 1):
-        if _is_closed(page):
+        if abort_if_cancelled(page) or _is_closed(page):
             logger.debug(f"[注册] 页面已关闭，停止点击: {text}")
             return False
         for frame in _frames(page):
@@ -455,7 +515,7 @@ def fill(page: Any, value: str, selectors: list[str], timeout: int = 20000) -> b
     """
     deadline = time.time() + timeout / 1000
     while time.time() < deadline:
-        if _is_closed(page):
+        if abort_if_cancelled(page) or _is_closed(page):
             logger.debug("[注册] 页面已关闭，停止填写")
             return False
         for frame in _frames(page):
@@ -472,7 +532,8 @@ def fill(page: Any, value: str, selectors: list[str], timeout: int = 20000) -> b
                         logger.debug("[注册] 页面已关闭，停止填写")
                         return False
                     logger.debug(f"[注册] 填入失败 {selector}: {type(e).__name__}: {e}")
-        time.sleep(0.5)
+        if wait_or_cancel(0.5):
+            return False
 
     # 兜底：JS 直接赋值 + input 事件（输入框存在但点击/键入异常时使用）
     for frame in _frames(page):
@@ -514,6 +575,8 @@ def wait_until(
     """
     deadline = time.time() + timeout
     while time.time() < deadline:
+        if abort_if_cancelled(page):
+            return False
         _ensure_no_page_fatal(page)
         if done_when is not None:
             try:
@@ -526,7 +589,8 @@ def wait_until(
         try:
             text = _page_text(page)
         except Exception:
-            time.sleep(0.5)
+            if wait_or_cancel(0.5):
+                return False
             continue
         if any(target.lower() in text for target in targets):
             return True
@@ -535,7 +599,8 @@ def wait_until(
             raise PageFatalError("An error occurred")
         # 密集轮询里低频微动，控制开销的同时打散静止态
         human_fidget(page, chance=0.08)
-        time.sleep(0.5)
+        if wait_or_cancel(0.5):
+            return False
     _ensure_no_page_fatal(page)
     if done_when is not None:
         try:
@@ -549,7 +614,10 @@ def wait_until(
 
 def _enter_signup_page(page: Any) -> bool:
     """打开注册页并进入邮箱填写入口（落地页需点 Sign up with email）。"""
-    time.sleep(2)
+    if abort_if_cancelled(page):
+        return False
+    if wait_or_cancel(2):
+        return False
     human_mouse_move(page)
     try_click_cookies(page)
     # 落地页为社交登录入口时点「Sign up with email」；已是表单页则跳过
@@ -578,10 +646,13 @@ def _ensure_email(
     t0 = time.monotonic()
     deadline = time.time() + EMAIL_PAGE_WAIT_SECS
     while time.time() < deadline and not _has_input(page, "input[type='email']"):
+        if abort_if_cancelled(page):
+            return None
         _ensure_no_page_fatal(page)
         # 等待期间让光标偶尔动一下，避免长时间静止被判为自动化
         human_fidget(page, chance=0.10)
-        time.sleep(0.5)
+        if wait_or_cancel(0.5):
+            return None
     _ensure_no_page_fatal(page)
     if not _has_input(page, "input[type='email']"):
         logger.warning(f"[邮箱] 填写页未就绪  · {elapsed_label(t0)}")
@@ -647,6 +718,8 @@ def _submit_email(page: Any, email: str) -> tuple[str, bool]:
     """
     t0 = time.monotonic()
     log_email = email
+    if abort_if_cancelled(page):
+        return "email", False
     if not fill(page, email, EMAIL_INPUT_SELECTORS):
         logger.warning(f"[邮箱] 未找到输入框  {log_email}  · {elapsed_label(t0)}")
         return "email", False
@@ -742,7 +815,8 @@ def _wait_form_ready(page: Any, timeout: int = FORM_READY_TIMEOUT) -> bool:
                 last_click = time.time()
             _ensure_no_page_fatal(page)
         human_fidget(page, chance=0.10)
-        time.sleep(0.5)
+        if wait_or_cancel(0.5):
+            return False
     _ensure_no_page_fatal(page)
     return _on_form_page(page)
 
@@ -785,7 +859,7 @@ def _verify_email(page: Any, email: str, jwt: str) -> bool:
         jwt,
         timeout=OTP_MAIL_TIMEOUT,
         interval=OTP_MAIL_INTERVAL,
-        stop_when=lambda: _on_form_page(page),
+        stop_when=lambda: abort_if_cancelled(page) or _on_form_page(page),
     )
     if _form_ready_skip(page, email, t0):
         return True
@@ -953,6 +1027,9 @@ def _fill_signup_form(page: Any, first_name: str, last_name: str, password: str)
     t0 = time.monotonic()
     full_name = f"{first_name} {last_name}".strip()
     _ensure_no_page_fatal(page)
+    if abort_if_cancelled(page):
+        logger.warning(f"[资料] 已取消，未点击提交  {full_name}  · {elapsed_label(t0)}")
+        return False
     if not _on_form_page(page) and not _wait_form_ready(page, timeout=15):
         logger.warning(f"[资料] 资料表单未就绪  · {elapsed_label(t0)}")
         _dump_page(page, "form-not-ready")
@@ -974,15 +1051,23 @@ def _fill_signup_form(page: Any, first_name: str, last_name: str, password: str)
         _dump_page(page, "password-missing")
         return False
 
+    if abort_if_cancelled(page):
+        logger.warning(f"[资料] 已取消，未点击提交  {full_name}  · {elapsed_label(t0)}")
+        return False
+
     _check_marketing_opt_in(page)
 
     # Turnstile / 填表期间 Cookie 横幅可能再次盖住提交按钮
     try_click_cookies(page)
     human_before_submit(page)
+    if abort_if_cancelled(page):
+        logger.warning(f"[资料] 已取消，未点击提交  {full_name}  · {elapsed_label(t0)}")
+        return False
     if not click(page, "Complete sign up") and not click(page, "Create account") and not click(page, "Continue"):
         logger.warning(f"[资料] 未找到提交按钮  {full_name}  · {elapsed_label(t0)}")
         _dump_page(page, "complete-signup-missing")
         return False
+    _mark_browser_committed(page)
     page.wait_for_timeout(800)
     _ensure_no_page_fatal(page)
     logger.success(f"[资料] 已提交 {full_name}  · {elapsed_label(t0)}")
@@ -1131,129 +1216,137 @@ def _run_attempt(
         return account_id, email, jwt, first_name, last_name, stage
 
     try:
+        if is_cancelled():
+            return fail("email")
         launch_t0 = time.monotonic()
         with Camoufox(**_camoufox_kwargs(headless)) as browser:
-            logger.debug(
-                f"[注册] 浏览器已启动（首次启动需下载内核/生成指纹，可能较慢）"
-                f"  · {elapsed_label(launch_t0)}"
-            )
-            page = _open_page(browser)
-            nav_t0 = time.monotonic()
-            if safe_goto(page, config.SIGNUP_URL):
-                logger.success(
-                    f"[注册] 注册页已打开  · {elapsed_label(nav_t0)}"
+            _track_browser(browser)
+            try:
+                if is_cancelled():
+                    return fail("email")
+                logger.debug(
+                    f"[注册] 浏览器已启动（首次启动需下载内核/生成指纹，可能较慢）"
+                    f"  · {elapsed_label(launch_t0)}"
                 )
-            else:
-                logger.error(
-                    f"[注册] 注册页打开失败  · {elapsed_label(nav_t0)}"
-                )
-
-            for retry in range(POST_EMAIL_RETRIES + 1):
-                if _is_closed(page):
-                    logger.debug("[注册] 浏览器已关闭，中止本次尝试")
-                    return fail("post" if email_submitted else "email")
-
-                # 表单已提交后 SSO cookie 可能已落地（等待阶段超时误报 / SPA 刷新后种下）。
-                # cookie 在即注册已实际完成，直接成功入库，无需任何重试。
-                if email_submitted and _has_sso_cookie(page):
+                page = _open_page(browser)
+                nav_t0 = time.monotonic()
+                if safe_goto(page, config.SIGNUP_URL):
                     logger.success(
-                        f"[SSO] {email} 重试路径检测到 sso cookie 已落地，注册完成"
-                    )
-                    break
-
-                if email_submitted and _on_form_page(page):
-                    # 已在资料表单页：跳过验证码，直接表单 + SSO
-                    if not _fill_signup_form(page, first_name, last_name, password):
-                        fail_stage = "form"
-                    elif not _wait_sso_ready(page, email=email, clock=sso_clock):
-                        fail_stage = "sso"
-                    else:
-                        fail_stage = None
-                elif (
-                    email_submitted
-                    and not _has_input(page, "input[type='email']")
-                    and not _is_signup_landing(page)
-                ):
-                    fail_stage = _post_email_pipeline(
-                        page, email or "", jwt or "", first_name, last_name, password,
-                        sso_clock=sso_clock,
+                        f"[注册] 注册页已打开  · {elapsed_label(nav_t0)}"
                     )
                 else:
-                    if email_submitted:
-                        # SPA 刷新后前端状态归零，页面回到注册入口落地页：
-                        # 自动重新进入邮箱流程（复用已创建的邮箱）
+                    logger.error(
+                        f"[注册] 注册页打开失败  · {elapsed_label(nav_t0)}"
+                    )
+
+                for retry in range(POST_EMAIL_RETRIES + 1):
+                    if abort_if_cancelled(page) or _is_closed(page):
+                        logger.debug("[注册] 已取消或浏览器已关闭，中止本次尝试")
+                        return fail("post" if email_submitted else "email")
+
+                    # 表单已提交后 SSO cookie 可能已落地（等待阶段超时误报 / SPA 刷新后种下）。
+                    # cookie 在即注册已实际完成，直接成功入库，无需任何重试。
+                    if email_submitted and _has_sso_cookie(page):
+                        logger.success(
+                            f"[SSO] {email} 重试路径检测到 sso cookie 已落地，注册完成"
+                        )
+                        break
+
+                    if email_submitted and _on_form_page(page):
+                        # 已在资料表单页：跳过验证码，直接表单 + SSO
+                        if not _fill_signup_form(page, first_name, last_name, password):
+                            fail_stage = "form"
+                        elif not _wait_sso_ready(page, email=email, clock=sso_clock):
+                            fail_stage = "sso"
+                        else:
+                            fail_stage = None
+                    elif (
+                        email_submitted
+                        and not _has_input(page, "input[type='email']")
+                        and not _is_signup_landing(page)
+                    ):
+                        fail_stage = _post_email_pipeline(
+                            page, email or "", jwt or "", first_name, last_name, password,
+                            sso_clock=sso_clock,
+                        )
+                    else:
+                        if email_submitted:
+                            # SPA 刷新后前端状态归零，页面回到注册入口落地页：
+                            # 自动重新进入邮箱流程（复用已创建的邮箱）
+                            logger.debug(
+                                f"[注册] 页面已回到注册入口（刷新重置 SPA 状态），重新进入邮箱流程: {email}"
+                            )
+                        if not _enter_signup_page(page):
+                            stage = "post" if email_submitted else "email"
+                            _dump_page(page, "enter-signup-failed")
+                            return fail(stage)
+                        result = _ensure_email(page, email, jwt, first_name, last_name)
+                        if result is None:
+                            stage = "post" if email_submitted else "email"
+                            return fail(stage)
+                        email, jwt, first_name, last_name = result
+
+                        email_stage, ok = _submit_email(page, email)
+                        if not ok:
+                            return fail(email_stage)
+                        email_submitted = True
+                        fail_stage = _post_email_pipeline(
+                            page, email, jwt or "", first_name, last_name, password,
+                            sso_clock=sso_clock,
+                        )
+
+                    if fail_stage is None:
+                        break
+                    if fail_stage in ("otp", "form"):
+                        # 验证码 / 资料阶段失败：不刷新页面，关闭当前浏览器重启重试（邮箱、验证码与资料姓名复用）
+                        label = "验证码" if fail_stage == "otp" else "资料"
                         logger.debug(
-                            f"[注册] 页面已回到注册入口（刷新重置 SPA 状态），重新进入邮箱流程: {email}"
+                            f"[注册] {label}阶段失败，关闭浏览器重启重试（复用邮箱 {email}）"
                         )
-                    if not _enter_signup_page(page):
-                        stage = "post" if email_submitted else "email"
-                        _dump_page(page, "enter-signup-failed")
-                        return fail(stage)
-                    result = _ensure_email(page, email, jwt, first_name, last_name)
-                    if result is None:
-                        stage = "post" if email_submitted else "email"
-                        return fail(stage)
-                    email, jwt, first_name, last_name = result
-
-                    email_stage, ok = _submit_email(page, email)
-                    if not ok:
-                        return fail(email_stage)
-                    email_submitted = True
-                    fail_stage = _post_email_pipeline(
-                        page, email, jwt or "", first_name, last_name, password,
-                        sso_clock=sso_clock,
-                    )
-
-                if fail_stage is None:
-                    break
-                if fail_stage in ("otp", "form"):
-                    # 验证码 / 资料阶段失败：不刷新页面，关闭当前浏览器重启重试（邮箱、验证码与资料姓名复用）
-                    label = "验证码" if fail_stage == "otp" else "资料"
-                    logger.debug(
-                        f"[注册] {label}阶段失败，关闭浏览器重启重试（复用邮箱 {email}）"
-                    )
-                    return fail(fail_stage)
-                # 仅 SSO 阶段失败：在当前浏览器内刷新页面重试
-                if retry < POST_EMAIL_RETRIES:
-                    logger.debug(
-                        f"[注册] SSO 阶段失败，刷新页面重试（第 {retry + 1}/{POST_EMAIL_RETRIES} 次）"
-                    )
-                    _dump_page(page, f"post-fail-retry-{retry + 1}")
-                    try:
-                        page.reload()
-                        page.wait_for_timeout(RELOAD_SETTLE_MS)
-                    except Exception as exc:
-                        logger.warning(
-                            f"[注册] 刷新失败: {type(exc).__name__}: {exc}"
+                        return fail(fail_stage)
+                    # 仅 SSO 阶段失败：在当前浏览器内刷新页面重试
+                    if retry < POST_EMAIL_RETRIES:
+                        logger.debug(
+                            f"[注册] SSO 阶段失败，刷新页面重试（第 {retry + 1}/{POST_EMAIL_RETRIES} 次）"
                         )
-                        return fail("post")
-            else:
-                logger.warning("[SSO] SSO 阶段刷新重试均失败，放弃该邮箱，不重启浏览器")
-                return fail("post")
+                        _dump_page(page, f"post-fail-retry-{retry + 1}")
+                        try:
+                            page.reload()
+                            page.wait_for_timeout(RELOAD_SETTLE_MS)
+                        except Exception as exc:
+                            logger.warning(
+                                f"[注册] 刷新失败: {type(exc).__name__}: {exc}"
+                            )
+                            return fail("post")
+                else:
+                    logger.warning("[SSO] SSO 阶段刷新重试均失败，放弃该邮箱，不重启浏览器")
+                    return fail("post")
 
-            # SSO cookie 已拿到：立即入库（status=REAUTH，待认证）+ 入认证池
-            sso_value = _take_sso_value(page)
-            if not sso_value or not email:
-                sso_t0 = sso_clock[0] if sso_clock else time.monotonic()
-                logger.error(
-                    f"[SSO] {email or ''} 会话凭证提取失败  · {elapsed_label(sso_t0)}"
+                # SSO cookie 已拿到：立即入库（status=REAUTH，待认证）+ 入认证池
+                sso_value = _take_sso_value(page)
+                if not sso_value or not email:
+                    sso_t0 = sso_clock[0] if sso_clock else time.monotonic()
+                    logger.error(
+                        f"[SSO] {email or ''} 会话凭证提取失败  · {elapsed_label(sso_t0)}"
+                    )
+                    _dump_page(page, "sso-missing")
+                    return fail("post")
+                account_id = save_account(
+                    email, password, first_name, last_name, sso_value,
+                    status=STATUS_REAUTH, reason="待认证池交换 Token",
                 )
-                _dump_page(page, "sso-missing")
-                return fail("post")
-            account_id = save_account(
-                email, password, first_name, last_name, sso_value,
-                status=STATUS_REAUTH, reason="待认证池交换 Token",
-            )
-            add_t0 = time.monotonic()
-            add_to_auth_pool(email, "", 5, account_id)
-            sso_t0 = sso_clock[0] if sso_clock else add_t0
-            logger.success(
-                f"[SSO] {email}  会话已落地，注册完成  · {elapsed_label(sso_t0)}"
-            )
-            logger.success(
-                f"[入池] {email}  · {elapsed_label(add_t0)}"
-            )
-            # 拿到 sso 立即结束本账号浏览器会话，不跳转 grok.com；风控留给后续认证/巡检
+                add_t0 = time.monotonic()
+                add_to_auth_pool(email, "", 5, account_id)
+                sso_t0 = sso_clock[0] if sso_clock else add_t0
+                logger.success(
+                    f"[SSO] {email}  会话已落地，注册完成  · {elapsed_label(sso_t0)}"
+                )
+                logger.success(
+                    f"[入池] {email}  · {elapsed_label(add_t0)}"
+                )
+                # 拿到 sso 立即结束本账号浏览器会话，不跳转 grok.com；风控留给后续认证/巡检
+            finally:
+                _untrack_browser(browser)
     except PageFatalError as exc:
         # with Camoufox 退出即关浏览器；返回可重启阶段，run_signup 复用原邮箱/资料重开
         logger.warning(
@@ -1396,7 +1489,7 @@ def _run_signup_bound(headless: bool = False) -> tuple[bool, str | None]:
     for attempt in range(1, MAX_ATTEMPTS + 1):
         if is_cancelled():
             logger.warning("[注册] 已取消，中止当前账号")
-            break
+            return False, email
         if attempt > 1:
             log_email = email
             logger.debug(
@@ -1408,8 +1501,9 @@ def _run_signup_bound(headless: bool = False) -> tuple[bool, str | None]:
         )
         if account_id is not None:
             break
-        if is_cancelled():
-            break
+        if is_cancelled() and stage != "post":
+            logger.warning("[注册] 已取消，中止当前账号")
+            return False, email
         if stage == "post":
             logger.debug(
                 f"[注册] 第 {attempt} 次尝试在 SSO 阶段失败，不再重启浏览器，"
@@ -1427,6 +1521,8 @@ def _run_signup_bound(headless: bool = False) -> tuple[bool, str | None]:
         logger.debug(f"[SSO] 账号已入库，待认证池交换 Token: {email}")
         return True, email
 
+    if is_cancelled():
+        return False, email
     logger.error(f"[注册] 全部尝试失败，放弃: {email}")
     return False, email
 
@@ -1452,10 +1548,13 @@ def run_signups(
 
     def _delayed_signup(idx: int, hless: bool) -> tuple[bool, str | None]:
         """带随机启动延迟的注册 worker，错开多浏览器并发窗口降低风控概率。"""
+        if is_cancelled():
+            return False, None
         if worker_count > 1:
             delay = random.uniform(3.0, 8.0) * idx
             logger.debug(f"[注册] 线程 {idx + 1} 延迟 {delay:.1f}s 启动")
-            time.sleep(delay)
+            if wait_or_cancel(delay):
+                return False, None
         return run_signup(headless=hless)
 
     with ThreadPoolExecutor(
@@ -1470,6 +1569,8 @@ def run_signups(
             except Exception as e:
                 ok, email = False, None
                 logger.error(f"[注册] 线程任务异常: {type(e).__name__}: {e}")
+            if is_cancelled() and not ok:
+                continue
             if ok:
                 success_count += 1
             if on_result is not None:

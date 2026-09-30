@@ -209,7 +209,10 @@ class JobManager:
             if job is None or job.status not in ("pending", "running"):
                 raise RuntimeError("当前没有可停止的注册任务")
             job.status = "stopping"
-            job.append_log("WARNING", "[任务] 收到停止请求，等待当前步骤结束后退出")
+            job.append_log(
+                "WARNING",
+                "[任务] 收到停止请求：未点资料提交的账号立即停，已提交的账号继续收 SSO",
+            )
             register_wf.request_cancel()
         return self.get_status()
 
@@ -286,7 +289,7 @@ class JobManager:
                 job.done += 1
                 if ok:
                     job.success += 1
-                else:
+                elif not register_wf.is_cancelled():
                     job.failed += 1
 
         try:
@@ -316,7 +319,8 @@ class JobManager:
                 end_level = "ERROR"
             job.append_log(
                 end_level,
-                f"[任务] 结束 成功 {job.success} 失败 {job.failed}",
+                f"[任务] 结束 成功 {job.success} 失败 {job.failed}"
+                + ("（已停止）" if cancelled else ""),
             )
         except Exception as e:
             with job._lock:

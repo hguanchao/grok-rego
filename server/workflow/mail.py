@@ -13,7 +13,7 @@ from curl_cffi import requests
 
 from core import config
 from core.logger import logger
-from core.util import elapsed_label, extract_verification_code
+from core.util import elapsed_label, extract_verification_code, wait_or_cancel
 
 _DOMAIN_LOCK = threading.Lock()
 _domain_index = 0
@@ -115,7 +115,7 @@ def _cf_poll_for_code(
     elapsed = 0
     while elapsed < timeout:
         if stop_when is not None and stop_when():
-            logger.debug(f"[邮件] 页面已进入下一步，停止等验证码  · {elapsed_label(t0)}")
+            logger.debug(f"[邮件] 停止等验证码  · {elapsed_label(t0)}")
             return None
         try:
             resp = requests.get(
@@ -150,7 +150,9 @@ def _cf_poll_for_code(
         except Exception as e:
             logger.debug(f"[邮件] 轮询出错: {e}")
 
-        time.sleep(interval)
+        if wait_or_cancel(interval):
+            logger.debug(f"[邮件] 已取消，停止等验证码  · {elapsed_label(t0)}")
+            return None
         elapsed += interval
 
     logger.error(f"[邮件] 等待验证码超时（已等 {timeout}s）  · {elapsed_label(t0)}")
@@ -215,7 +217,7 @@ def _yyds_poll_for_code(
     elapsed = 0
     while elapsed < timeout:
         if stop_when is not None and stop_when():
-            logger.debug(f"[邮件] 页面已进入下一步，停止等验证码  · {elapsed_label(t0)}")
+            logger.debug(f"[邮件] 停止等验证码  · {elapsed_label(t0)}")
             return None
         round_start = time.time()
         try:
@@ -254,7 +256,9 @@ def _yyds_poll_for_code(
         except Exception as e:
             logger.debug(f"[邮件] 轮询出错: {e}")
 
-        time.sleep(interval)
+        if wait_or_cancel(interval):
+            logger.debug(f"[邮件] 已取消，停止等验证码  · {elapsed_label(t0)}")
+            return None
         elapsed += interval + (time.time() - round_start)
 
     logger.error(f"[邮件] 等待验证码超时（已等 {timeout}s）  · {elapsed_label(t0)}")
