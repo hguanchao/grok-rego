@@ -13,6 +13,7 @@ import json
 import secrets
 import threading
 import time
+import uuid
 from collections import deque
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
@@ -24,7 +25,8 @@ from curl_cffi import requests
 from core import config
 from core import proxypool
 from core.logger import logger
-from core.util import curl_error_code, now_iso_tz
+from core.http_body import RequestBodyTooLarge, read_request_body
+from core.util import compact_text, curl_error_code, now_iso_tz, retry_after_seconds
 from db import insert_usage
 from gateway import egress
 from gateway.paths import ensure_local_v1, resource_path, upstream_url
@@ -43,7 +45,7 @@ from gateway.anthropic import (
     messages_to_responses,
     responses_to_message,
 )
-from gateway.usage import StreamUsageAccumulator, extract_nonstream
+from gateway.usage import StreamOutcome, StreamUsageAccumulator, extract_nonstream
 
 # 上游固定参数（产品约定，不走配置）
 ZEN_BASE = "https://opencode.ai/zen/v1"
@@ -170,9 +172,15 @@ def _record(
     effort: str | None = None,
     ip: str | None = None,
     client_ua: str | None = None,
+    request_id: str | None = None,
+    attempts: list[dict[str, Any]] | None = None,
+    result_ok: bool | None = None,
 ) -> None:
     """写入环形日志、累加计数，并落库一条用量记录。"""
     usage = usage or {"prompt_tokens": 0, "completion_tokens": 0, "cache_tokens": 0, "reasoning_tokens": 0}
+    reason = error
+    if not 200 <= status < 300 and not reason:
+        reason = f"HTTP {status}：非 2xx 响应，上游未提供错误详情"
     entry = {
         "id": _next_id(),
         "ts": now_iso_tz(),
@@ -184,7 +192,9 @@ def _record(
         "ms": ms,
         "bytes_in": bytes_in,
         "bytes_out": bytes_out,
-        "error": error or "",
+        "error": reason or "",
+        "request_id": request_id or "",
+        "attempts": attempts or [],
         "prompt_tokens": usage.get("prompt_tokens", 0),
         "completion_tokens": usage.get("completion_tokens", 0),
         "cache_tokens": usage.get("cache_tokens", 0),
@@ -193,7 +203,8 @@ def _record(
     with _lock:
         _logs.appendleft(entry)
         _stats["total"] += 1
-        if 200 <= status < 400:
+        succeeded = result_ok if result_ok is not None else 200 <= status < 300
+        if succeeded:
             _stats["ok"] += 1
         else:
             _stats["error"] += 1
@@ -204,7 +215,7 @@ def _record(
         _stats["last_status"] = status
         _stats["last_path"] = path
         _stats["last_at"] = entry["ts"]
-        _stats["last_error"] = error or ""
+        _stats["last_error"] = reason or ""
     try:
         insert_usage(
             ip=ip,
@@ -212,8 +223,10 @@ def _record(
             endpoint=path.split("?", 1)[0],
             model=model or "",
             stream=stream,
-            status=1 if 200 <= status < 400 else 0,
-            reason=error or None,
+            status=1 if succeeded else 0,
+            http_status=status,
+            attempts=attempts,
+            reason=reason or None,
             effort=effort,
             prompt_tokens=usage.get("prompt_tokens", 0),
             completion_tokens=usage.get("completion_tokens", 0),
@@ -412,12 +425,7 @@ def _json_object(body: bytes) -> dict[str, Any] | None:
 
 
 def _read_body(handler: BaseHTTPRequestHandler) -> bytes:
-    length = int(handler.headers.get("Content-Length") or 0)
-    if length <= 0:
-        return b""
-    if length > _MAX_BODY:
-        raise ValueError(f"请求体过大（>{_MAX_BODY} bytes）")
-    return handler.rfile.read(length)
+    return read_request_body(handler, max_bytes=_MAX_BODY)
 
 
 def _forward_headers(incoming: Any, client_key: str) -> dict[str, str]:
@@ -637,7 +645,7 @@ def proxy(handler: BaseHTTPRequestHandler, method: str, path: str) -> None:
 
     try:
         body = _read_body(handler)
-    except ValueError as exc:
+    except RequestBodyTooLarge as exc:
         _send_bytes(
             handler,
             413,
@@ -689,7 +697,12 @@ def proxy(handler: BaseHTTPRequestHandler, method: str, path: str) -> None:
     if src is None:
         forward_body = body
     elif plan.request_xform != "none":
-        transformed = apply_request_xform(plan, src)
+        try:
+            transformed = apply_request_xform(plan, src)
+        except ValueError as exc:
+            payload = _anthropic_error(str(exc), 400) if anthropic_client else _openai_error(str(exc), 400)
+            _send_bytes(handler, 400, payload, "application/json; charset=utf-8")
+            return
         stream_flag = bool(transformed.get("stream"))
         effort_flag = _effort_of(plan, transformed)
         forward_body = json.dumps(transformed, ensure_ascii=False).encode("utf-8")
@@ -713,6 +726,9 @@ def proxy(handler: BaseHTTPRequestHandler, method: str, path: str) -> None:
     acc: StreamUsageAccumulator | None = None
     client_ua = str(handler.headers.get("User-Agent") or "")[:255]
     used_proxy = ""
+    request_id = uuid.uuid4().hex[:16]
+    attempts: list[dict[str, Any]] = []
+    stream_outcome = StreamOutcome()
 
     try:
         # 仅客户端声明 stream 时上游才开流；否则整包读取，避免 curl_cffi
@@ -733,8 +749,19 @@ def proxy(handler: BaseHTTPRequestHandler, method: str, path: str) -> None:
                     **_proxy_kwargs(used_proxy),
                 )
                 status = int(upstream.status_code)
+                attempts.append(
+                    {
+                        "status": status,
+                        "error": "" if 200 <= status < 300 else compact_text(upstream.content, 180),
+                        "wait_seconds": 0,
+                        "retry_after_seconds": retry_after_seconds(
+                            upstream.headers.get("Retry-After")
+                        ),
+                        "proxy": proxypool.status_label(used_proxy),
+                    }
+                )
                 content_type = (upstream.headers.get("Content-Type") or "").lower()
-                is_stream = stream_flag and status < 400 and (
+                is_stream = stream_flag and 200 <= status < 300 and (
                     "text/event-stream" in content_type or not content_type
                 )
                 if is_stream and method != "HEAD":
@@ -750,10 +777,18 @@ def proxy(handler: BaseHTTPRequestHandler, method: str, path: str) -> None:
                     request_attempt == 0
                     and bytes_out == 0
                     and code in _UPSTREAM_RETRY_CODES
-                    and (stream_flag or method in {"GET", "HEAD"})
+                    and method in {"GET", "HEAD"}
+                )
+                attempts.append(
+                    {
+                        "status": 0,
+                        "error": f"{type(exc).__name__} curl={code or 'unknown'}: {exc}"[:255],
+                        "wait_seconds": _UPSTREAM_RETRY_DELAY if can_retry else 0,
+                        "proxy": proxypool.status_label(used_proxy),
+                    }
                 )
                 logger.warning(
-                    f"[网关] 上游请求异常 curl={code or 'unknown'} "
+                    f"[网关] request={request_id} 上游请求异常 curl={code or 'unknown'} "
                     f"proxy={proxypool.status_label(used_proxy)} "
                     f"attempt={request_attempt + 1}/2 retry={can_retry}"
                 )
@@ -797,13 +832,14 @@ def proxy(handler: BaseHTTPRequestHandler, method: str, path: str) -> None:
                         for c in gen:
                             if c:
                                 acc.feed(c)
+                                stream_outcome.feed(c)
                             yield c
 
                     src_chunks = _tee(_with_first_chunk())
                     if plan.response_kind == "responses":
-                        chunks_iter = iter_responses_sse(src_chunks, model)
+                        chunks_iter = iter_responses_sse(src_chunks, model, stream_outcome.fail)
                     else:
-                        chunks_iter = iter_anthropic_sse(src_chunks, model)
+                        chunks_iter = iter_anthropic_sse(src_chunks, model, stream_outcome.fail)
                 else:
                     chunks_iter = _with_first_chunk()
                 for chunk in chunks_iter:
@@ -811,35 +847,61 @@ def proxy(handler: BaseHTTPRequestHandler, method: str, path: str) -> None:
                         continue
                     if plan.response_kind == "none":
                         acc.feed(chunk)
+                        stream_outcome.feed(chunk)
                     handler.wfile.write(chunk)
                     handler.wfile.flush()
                     bytes_out += len(chunk)
                 usage = acc.result()
+                stream_outcome.finish()
+                if stream_outcome.failed:
+                    err = stream_outcome.error
+                    logger.warning(
+                        f"[网关] request={request_id} 流式上游失败 {method} {path}: {err}"
+                    )
+                elif stream_outcome.warning:
+                    err = stream_outcome.warning
+                    logger.warning(
+                        f"[网关] request={request_id} 流式上游警告 {method} {path}: {err}"
+                    )
         else:
             payload = upstream.content or b""
-            if status >= 400 and not payload:
+            if not 200 <= status < 300 and not payload:
                 # stream=True 时部分栈上 4xx 的 .content 为空，把剩余块拼回来才能看到真实错误
                 payload = b"".join(upstream.iter_content(chunk_size=4096) or ())
-            if status >= 400:
-                # 上游拒收（如超窗/坏工具对）：原文只透传给客户端，err 为空会导致
-                # 用量 reason=None、日志只有 status，事后无法定位。截断记入 err。
-                raw_text = payload.decode("utf-8", "replace").strip()
-                snippet = " ".join(raw_text.split())[:240]
-                err = f"upstream_{status}:{snippet}" if snippet else f"upstream_{status}"
+            if not 200 <= status < 300:
+                snippet = compact_text(payload, 220)
+                phrase = str(getattr(upstream, "reason", "") or "").strip()
+                detail = snippet or phrase or "上游未提供错误详情"
+                err = f"upstream_{status}:{detail}"[:255]
                 logger.warning(
-                    f"[网关] 上游拒收 {method} {path} via={forward_path} "
+                    f"[网关] request={request_id} 上游非 2xx {method} {path} via={forward_path} "
                     f"model={model or '-'} status={status} in={len(forward_body)} "
-                    f"out={len(payload)} effort={effort_flag or '-'} err={snippet or '-'}"
+                    f"out={len(payload)} effort={effort_flag or '-'} err={detail}"
                 )
-            if status < 400 and resource_path(path, "/zen") == "/models":
+            if 200 <= status < 300 and resource_path(path, "/zen") == "/models":
                 payload = _filter_free_models(payload)
-            elif status < 400 and plan.response_kind != "none":
+            elif 200 <= status < 300 and plan.response_kind != "none":
                 try:
                     obj = json.loads(payload.decode("utf-8"))
                 except (UnicodeDecodeError, json.JSONDecodeError):
                     obj = {}
                 if isinstance(obj, dict):
-                    if plan.response_kind == "responses":
+                    if plan.response_kind == "responses" and obj.get("status") == "failed":
+                        raw_error = obj.get("error")
+                        if isinstance(raw_error, dict):
+                            code = str(raw_error.get("code") or raw_error.get("type") or "").strip()
+                            message = str(raw_error.get("message") or raw_error.get("detail") or "").strip()
+                            detail = ": ".join(part for part in (code, message) if part)
+                        else:
+                            detail = str(raw_error or "上游 Responses 返回 failed 状态")
+                        err = f"upstream_stream_error:{detail}"[:255]
+                        status = 502
+                        payload = (
+                            _anthropic_error(detail, status)
+                            if anthropic_client
+                            else _openai_error(detail, status)
+                        )
+                    elif plan.response_kind == "responses":
                         payload = json.dumps(
                             responses_to_message(obj, model), ensure_ascii=False
                         ).encode("utf-8")
@@ -855,15 +917,16 @@ def proxy(handler: BaseHTTPRequestHandler, method: str, path: str) -> None:
             if plan.response_kind == "none" and not anthropic_client:
                 ctype = upstream.headers.get("Content-Type") or ctype
             # 非流式：对原始上游响应解析 usage
-            if status < 400:
+            if 200 <= status < 300:
                 usage = extract_nonstream(upstream.content or b"")
             _send_bytes(handler, status, payload, ctype, extra)
     except (BrokenPipeError, ConnectionError, ConnectionResetError, ConnectionAbortedError):
-        err = "client_disconnected"
         # 上游已成功(status<400)时属客户端提前断开（流式 CLI 读完即关），非故障
-        if status < 400:
+        if 200 <= status < 300:
+            err = "client_disconnected"
             logger.info(f"[网关] 客户端提前断开（上游已成功 HTTP {status}）{method} {path}")
         else:
+            err = err or "client_disconnected"
             logger.warning(f"[网关] 客户端断开 {method} {path} HTTP {status}")
     except Exception as exc:
         code = curl_error_code(exc)
@@ -873,13 +936,16 @@ def proxy(handler: BaseHTTPRequestHandler, method: str, path: str) -> None:
             f"bytes_out={bytes_out}: {exc}"
         )
         logger.error(f"[网关] 转发失败 {method} {path} {err}")
+        if response_started:
+            stream_outcome.fail(err)
         if not response_started and not handler.wfile.closed:
             try:
                 fail = _anthropic_error(err, 502) if anthropic_client else _openai_error(err, 502)
                 _send_bytes(handler, 502, fail, "application/json; charset=utf-8")
             except Exception:
                 pass
-        status = 502
+        if not response_started:
+            status = 502
     finally:
         if upstream is not None:
             try:
@@ -901,6 +967,9 @@ def proxy(handler: BaseHTTPRequestHandler, method: str, path: str) -> None:
             effort=effort_flag,
             ip=egress.current_ip(used_proxy),
             client_ua=client_ua,
+            request_id=request_id,
+            attempts=attempts,
+            result_ok=200 <= status < 300 and not stream_outcome.failed,
         )
         if err != "client_disconnected":
             logger.info(

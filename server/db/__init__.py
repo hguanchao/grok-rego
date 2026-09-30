@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import json
 import sqlite3
 from collections.abc import Iterator
 
@@ -32,7 +33,7 @@ from datetime import date, timedelta
 from typing import Any
 
 from core.logger import logger
-from core.util import decode_jwt_exp, now_dt, now_iso_tz
+from core.util import decode_jwt_exp, iso_after_hours, now_dt, now_iso_tz
 
 # 兼容已有数据库：表已存在但缺少新字段时补加
 _ACCOUNT_MIGRATIONS = [
@@ -48,6 +49,7 @@ _ACCOUNT_MIGRATIONS = [
     ("quality_strikes", "INTEGER DEFAULT 0"),
     ("quality_cooldown_until", "TEXT"),
     ("quality_disabled", "INTEGER DEFAULT 0"),
+    ("limited_at", "TEXT"),
 ]
 
 # 历史死字段清理：旧库存在即 DROP（降智展示由质量审计实时推导；
@@ -114,6 +116,20 @@ def init_accounts_table() -> None:
         # 兼容旧库：ALTER 补列的历史数据会留下 NULL，回填为默认状态
         cursor.execute("UPDATE accounts SET status = 1 WHERE status IS NULL")
         cursor.execute("UPDATE accounts SET is_deleted = 0 WHERE is_deleted IS NULL")
+        # 旧版把所有 429 都落为“限额”；已知是限流的记录恢复为 ACTIVE。
+        cursor.execute(
+            "UPDATE accounts SET status=?, limited_at='', updated_at=? "
+            "WHERE COALESCE(status, 1)=? AND COALESCE(reason, '') LIKE ? "
+            "AND lower(COALESCE(reason, '')) NOT LIKE '%subscription:free-usage-exhausted%' "
+            "AND lower(COALESCE(reason, '')) NOT LIKE '%personal-team-blocked:spending-limit%' "
+            "AND lower(COALESCE(reason, '')) NOT LIKE '%run out of credits%'",
+            (STATUS_ACTIVE, now_iso_tz(), STATUS_LIMITED, "限流（429）%"),
+        )
+        cursor.execute(
+            "UPDATE accounts SET limited_at=COALESCE(NULLIF(updated_at, ''), created_at) "
+            "WHERE COALESCE(status, 1)=? AND COALESCE(limited_at, '')=''",
+            (STATUS_LIMITED,),
+        )
         # 兼容旧库：updated_at 补列后回填为创建时间（历史数据无更新时间）
         cursor.execute("UPDATE accounts SET updated_at = created_at WHERE updated_at IS NULL")
         # 历史死字段清理（dumbed 展示值由质量审计字段实时推导，无需存量列）
@@ -141,6 +157,14 @@ def init_accounts_table() -> None:
                SET updated_at = replace(updated_at, ' ', 'T') || '+08:00'
              WHERE updated_at LIKE '% %'
                AND updated_at NOT LIKE '%T%'
+            """
+        )
+        cursor.execute(
+            """
+            UPDATE accounts
+               SET limited_at = replace(limited_at, ' ', 'T') || '+08:00'
+             WHERE limited_at LIKE '% %'
+               AND limited_at NOT LIKE '%T%'
             """
         )
         conn.commit()
@@ -248,6 +272,20 @@ def list_gateway_candidates() -> list[dict[str, Any]]:
     return [dict(row) for row in rows]
 
 
+def list_limited_accounts_due_for_recheck() -> list[int]:
+    """返回限额冻结满 24h 的账号，供服务后台触发探活恢复。"""
+    threshold = iso_after_hours(-LIMITED_HOLD_SECONDS / 3600)
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT id FROM accounts WHERE COALESCE(is_deleted, 0) = 0 "
+            "AND COALESCE(status, 1) = ? AND COALESCE(access_token, '') != '' "
+            "AND COALESCE(NULLIF(limited_at, ''), updated_at, '') <= ? "
+            "ORDER BY COALESCE(NULLIF(limited_at, ''), updated_at), id",
+            (STATUS_LIMITED, threshold),
+        ).fetchall()
+    return [int(row[0]) for row in rows]
+
+
 def clear_quality_flags(account_ids: list[int]) -> int:
     """复位网关质量审计标记（手动启用账号 / 恢复探针通过时调用）。"""
     if not account_ids:
@@ -297,13 +335,13 @@ def update_account_status(
         cursor = conn.cursor()
         if reason is not None:
             cursor.execute(
-                "UPDATE accounts SET status=?, reason=?, updated_at=? WHERE email=?",
-                (status, reason, now_iso_tz(), email),
+                "UPDATE accounts SET status=?, reason=?, updated_at=?, limited_at=? WHERE email=?",
+                (status, reason, now_iso_tz(), now_iso_tz() if status == STATUS_LIMITED else "", email),
             )
         else:
             cursor.execute(
-                "UPDATE accounts SET status=?, updated_at=? WHERE email=?",
-                (status, now_iso_tz(), email),
+                "UPDATE accounts SET status=?, updated_at=?, limited_at=? WHERE email=?",
+                (status, now_iso_tz(), now_iso_tz() if status == STATUS_LIMITED else "", email),
             )
         conn.commit()
         is_updated = cursor.rowcount > 0
@@ -331,15 +369,15 @@ def update_account_status_by_ids(
         cursor = conn.cursor()
         if status is not None and reason is not None:
             cursor.execute(
-                f"UPDATE accounts SET status=?, reason=?, updated_at=? "
+                f"UPDATE accounts SET status=?, reason=?, updated_at=?, limited_at=? "
                 f"WHERE id IN ({placeholders}) AND COALESCE(is_deleted, 0) = 0",
-                [status, reason, now_iso_tz(), *account_ids],
+                [status, reason, now_iso_tz(), now_iso_tz() if status == STATUS_LIMITED else "", *account_ids],
             )
         elif status is not None:
             cursor.execute(
-                f"UPDATE accounts SET status=?, updated_at=? "
+                f"UPDATE accounts SET status=?, updated_at=?, limited_at=? "
                 f"WHERE id IN ({placeholders}) AND COALESCE(is_deleted, 0) = 0",
-                [status, now_iso_tz(), *account_ids],
+                [status, now_iso_tz(), now_iso_tz() if status == STATUS_LIMITED else "", *account_ids],
             )
         elif reason is not None:
             cursor.execute(
@@ -646,6 +684,8 @@ _USAGES_COLUMNS = (
     "cache_tokens",
     "reasoning_tokens",
     "created_at",
+    "http_status",
+    "attempts",
 )
 _USAGES_TOKEN_COLUMNS = (
     "prompt_tokens",
@@ -671,6 +711,8 @@ _USAGES_TYPES = {
     "cache_tokens": "INTEGER",
     "reasoning_tokens": "INTEGER",
     "created_at": "TEXT",
+    "http_status": "INTEGER",
+    "attempts": "TEXT",
 }
 
 _USAGES_SCHEMA = """
@@ -690,7 +732,9 @@ _USAGES_SCHEMA = """
         completion_tokens INTEGER NOT NULL DEFAULT 0,
         cache_tokens INTEGER NOT NULL DEFAULT 0,
         reasoning_tokens INTEGER NOT NULL DEFAULT 0,
-        created_at TEXT NOT NULL
+        created_at TEXT NOT NULL,
+        http_status INTEGER,
+        attempts TEXT NOT NULL DEFAULT '[]'
     )
 """
 
@@ -698,6 +742,12 @@ _USAGES_SCHEMA = """
 def _usages_select_expr(name: str, old_types: dict[str, str]) -> str:
     """旧列 → 新列表达式：毫秒时间戳转北京 ISO，token NULL 填 0。"""
     declared = (old_types.get(name) or "").upper()
+    if name == "attempts" and name not in old_types:
+        return "'[]'"
+    if name == "http_status" and name not in old_types:
+        return "NULL"
+    if name == "attempts":
+        return "COALESCE(attempts, '[]')"
     if name == "created_at" and "TEXT" not in declared and "CHAR" not in declared:
         return (
             "replace(datetime(created_at / 1000, 'unixepoch', '+8 hours'), ' ', 'T')"
@@ -738,10 +788,14 @@ def init_usages_table() -> None:
             old_cols = set(old_types)
             cursor.execute("ALTER TABLE usages RENAME TO usages_old")
             cursor.execute(_USAGES_SCHEMA)
-            copy_cols = [name for name in _USAGES_COLUMNS if name in old_cols]
+            copy_cols = [
+                name for name in _USAGES_COLUMNS
+                if name in old_cols or name in ("http_status", "attempts")
+            ]
             col_sql = ", ".join(copy_cols)
             select_sql = ", ".join(
-                _usages_select_expr(name, old_types) for name in copy_cols
+                _usages_select_expr(name, old_types)
+                for name in copy_cols
             )
             cursor.execute(
                 f"INSERT INTO usages ({col_sql}) SELECT {select_sql} FROM usages_old"
@@ -766,6 +820,8 @@ def insert_usage(
     account_id: int | None = None,
     account_email: str | None = None,
     status: int = 0,
+    http_status: int | None = None,
+    attempts: list[dict[str, Any]] | None = None,
     reason: str | None = None,
     prompt_tokens: int = 0,
     completion_tokens: int = 0,
@@ -775,23 +831,24 @@ def insert_usage(
     """写入一条网关用量记录（每次请求一行，幂等可重复调用）。
 
     落库供前端用量统计（/api/usage）聚合展示；status=1 记成功，其余记失败。
+    http_status 保存客户端实际收到的 HTTP 状态码。
     token 各列均为尽力而为：无法从上游解析时记 0，绝不阻塞转发。
     """
-    init_usages_table()
     with connect() as conn:
         conn.execute(
             """
             INSERT INTO usages (
                 ip, client_ua, endpoint, model, effort, stream,
-                account_id, account_email, status, reason,
+                account_id, account_email, status, reason, http_status, attempts,
                 prompt_tokens, completion_tokens, cache_tokens, reasoning_tokens,
                 created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 ip, client_ua, endpoint, model, effort,
                 1 if stream else 0,
-                account_id, account_email, status, reason,
+                account_id, account_email, status, reason, http_status,
+                json.dumps(attempts or [], ensure_ascii=False, separators=(",", ":")),
                 prompt_tokens, completion_tokens, cache_tokens, reasoning_tokens,
                 now_iso_tz(),
             ),
@@ -891,7 +948,6 @@ _USAGE_BUCKET_SELECT = """
 
 def query_usage_summary(days: int = 1) -> dict[str, Any]:
     """窗口内 KPI + 模型分布 + 日/小时趋势。今日补齐 24 小时桶，多日补齐日历日。"""
-    init_usages_table()
     days, date_from, date_to = _usage_window(days)
     where, params = _usage_date_where(date_from, date_to)
     with connect() as conn:
@@ -997,7 +1053,6 @@ def query_usage_summary(days: int = 1) -> dict[str, Any]:
 
 def query_usage_recent(*, offset: int = 0, limit: int = 20) -> dict[str, Any]:
     """最近用量明细分页，与统计窗口无关。"""
-    init_usages_table()
     offset = max(0, int(offset))
     limit = max(1, min(int(limit), 100))
     with connect() as conn:
@@ -1007,8 +1062,17 @@ def query_usage_recent(*, offset: int = 0, limit: int = 20) -> dict[str, Any]:
             "SELECT * FROM usages ORDER BY id DESC LIMIT ? OFFSET ?",
             (limit, offset),
         ).fetchall()
+    decoded_items = []
+    for row in items:
+        item = dict(row)
+        try:
+            parsed_attempts = json.loads(item.get("attempts") or "[]")
+        except (TypeError, json.JSONDecodeError):
+            parsed_attempts = []
+        item["attempts"] = parsed_attempts if isinstance(parsed_attempts, list) else []
+        decoded_items.append(item)
     return {
-        "items": [dict(row) for row in items],
+        "items": decoded_items,
         "total": int(total or 0),
         "offset": offset,
         "limit": limit,
@@ -1033,7 +1097,6 @@ def query_usage_grouped(
     """
     if dimension not in _GROUPED_KEY:
         raise ValueError(f"dimension 仅支持 {'/'.join(_GROUPED_KEY)}")
-    init_usages_table()
     key_expr = _GROUPED_KEY[dimension]
     offset = max(0, int(offset))
     limit = max(0, int(limit))
@@ -1104,7 +1167,6 @@ def query_channel_usage_24h() -> dict[str, dict[str, int]]:
     返回形如 {"zen": {"requests", "failed", "tokens"}, "grok": {...}}；
     无记录的通道值为全零，不缺键。
     """
-    init_usages_table()
     where, params = _usages_since(24)
     with connect() as conn:
         conn.row_factory = sqlite3.Row
@@ -1139,7 +1201,6 @@ def query_channel_usage_24h() -> dict[str, dict[str, int]]:
 
 def query_account_usage_24h() -> dict[int, int]:
     """近 24h Grok 通道各账号请求数（account_id 分组，供号池运行态展示）。"""
-    init_usages_table()
     where, params = _usages_since(24)
     with connect() as conn:
         conn.row_factory = sqlite3.Row

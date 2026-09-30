@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import json
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from typing import Any
 
 from core.logger import logger
@@ -131,6 +131,24 @@ def _text_of(content: Any) -> str:
     return str(content)
 
 
+def _anthropic_image_url(block: dict[str, Any]) -> str:
+    """Anthropic image source → OpenAI-compatible image URL。"""
+    source = block.get("source") if isinstance(block.get("source"), dict) else {}
+    source_type = str(source.get("type") or "")
+    if source_type == "base64":
+        media_type = str(source.get("media_type") or "application/octet-stream").strip()
+        data = str(source.get("data") or "").strip()
+        if not data:
+            raise ValueError("Anthropic image 缺少 base64 data")
+        return f"data:{media_type};base64,{data}"
+    if source_type == "url":
+        url = str(source.get("url") or "").strip()
+        if url.startswith(("https://", "http://", "data:")):
+            return url
+        raise ValueError("Anthropic image URL 必须是 http(s) 或 data URL")
+    raise ValueError(f"不支持的 Anthropic image source 类型：{source_type or '缺失'}")
+
+
 def _estimate_tokens(text: str) -> int:
     raw = text or ""
     return max(1, (len(raw) + 3) // 4)
@@ -155,6 +173,14 @@ def count_tokens(body: bytes) -> bytes:
 
 
 def _system_to_text(system: Any) -> str:
+    if isinstance(system, list):
+        unsupported = [
+            str(block.get("type") or "未知类型")
+            for block in system
+            if isinstance(block, dict) and block.get("type") != "text"
+        ]
+        if unsupported:
+            raise ValueError(f"Anthropic system 暂不支持 content block：{unsupported[0]}")
     return _text_of(system).strip()
 
 
@@ -330,14 +356,25 @@ def messages_to_chat(payload: dict[str, Any]) -> dict[str, Any]:
             messages.append({"role": role, "content": _text_of(content)})
             continue
 
-        texts: list[str] = []
+        text_parts: list[str] = []
+        content_parts: list[dict[str, Any]] = []
+        has_image = False
         tool_calls: list[dict[str, Any]] = []
         for block in content:
             if not isinstance(block, dict):
                 continue
             btype = str(block.get("type") or "")
             if btype == "text":
-                texts.append(str(block.get("text") or ""))
+                text = str(block.get("text") or "")
+                text_parts.append(text)
+                content_parts.append({"type": "text", "text": text})
+            elif btype == "image":
+                if role != "user":
+                    raise ValueError("Anthropic assistant image 暂不支持转换")
+                has_image = True
+                content_parts.append(
+                    {"type": "image_url", "image_url": {"url": _anthropic_image_url(block)}}
+                )
             elif btype == "tool_use":
                 tool_calls.append(
                     {
@@ -352,20 +389,29 @@ def messages_to_chat(payload: dict[str, Any]) -> dict[str, Any]:
             elif btype == "tool_result":
                 # chat 上游宽松匹配：孤儿 result 仅影响本轮，不 400，原样透传
                 # （responses 路由才需丢弃，见 messages_to_responses）。
+                result_content = block.get("content")
+                if isinstance(result_content, list) and any(
+                    isinstance(part, dict) and part.get("type") == "image"
+                    for part in result_content
+                ):
+                    raise ValueError("Anthropic tool_result 中的图片暂不支持转换")
                 messages.append(
                     {
                         "role": "tool",
                         "tool_call_id": str(block.get("tool_use_id") or ""),
-                        "content": _text_of(block.get("content")),
+                        "content": _text_of(result_content),
                     }
                 )
-        if role == "assistant" and (texts or tool_calls):
-            msg: dict[str, Any] = {"role": "assistant", "content": "".join(texts) or None}
+            elif btype not in ("thinking", "redacted_thinking"):
+                raise ValueError(f"Anthropic message 暂不支持 content block：{btype or '未知类型'}")
+        content: Any = content_parts if has_image else "".join(text_parts)
+        if role == "assistant" and (text_parts or tool_calls):
+            msg: dict[str, Any] = {"role": "assistant", "content": content or None}
             if tool_calls:
                 msg["tool_calls"] = tool_calls
             messages.append(msg)
-        elif texts:
-            messages.append({"role": role, "content": "".join(texts)})
+        elif text_parts or has_image:
+            messages.append({"role": role, "content": content})
 
     out: dict[str, Any] = {
         "model": payload.get("model"),
@@ -454,7 +500,11 @@ def _sse(event: str, data: dict[str, Any]) -> bytes:
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n".encode("utf-8")
 
 
-def iter_anthropic_sse(openai_chunks: Iterator[bytes], model: str | None) -> Iterator[bytes]:
+def iter_anthropic_sse(
+    openai_chunks: Iterator[bytes],
+    model: str | None,
+    on_error: Callable[[str], None] | None = None,
+) -> Iterator[bytes]:
     """把 OpenAI SSE 块转成 Anthropic Messages SSE。"""
     buf = b""
     started = False
@@ -469,6 +519,7 @@ def iter_anthropic_sse(openai_chunks: Iterator[bytes], model: str | None) -> Ite
     stop = "end_turn"
     tool_blocks: dict[int, int] = {}
     tool_args: dict[int, str] = {}
+    saw_finish = False
 
     def ensure_message() -> Iterator[bytes]:
         nonlocal started
@@ -593,12 +644,15 @@ def iter_anthropic_sse(openai_chunks: Iterator[bytes], model: str | None) -> Ite
     for chunk in openai_chunks:
         if not chunk:
             continue
-        buf += chunk
+        buf = (buf + chunk).replace(b"\r\n", b"\n")
         while b"\n\n" in buf:
             part, buf = buf.split(b"\n\n", 1)
             data_lines = []
+            event_name = ""
             for line in part.split(b"\n"):
-                if line.startswith(b"data:"):
+                if line.startswith(b"event:"):
+                    event_name = line[6:].strip().decode("utf-8", "replace")
+                elif line.startswith(b"data:"):
                     data_lines.append(line[5:].strip())
             if not data_lines:
                 continue
@@ -612,6 +666,20 @@ def iter_anthropic_sse(openai_chunks: Iterator[bytes], model: str | None) -> Ite
                 continue
             if not isinstance(obj, dict):
                 continue
+            if event_name.lower() == "error" or obj.get("type") == "error" or obj.get("error"):
+                raw_error = obj.get("error")
+                if isinstance(raw_error, dict):
+                    code = str(raw_error.get("code") or raw_error.get("type") or "").strip()
+                    message = str(raw_error.get("message") or raw_error.get("detail") or "").strip()
+                    detail = ": ".join(part for part in (code, message) if part)
+                elif isinstance(raw_error, str):
+                    detail = raw_error
+                else:
+                    detail = str(raw_error or obj.get("message") or "上游 SSE 返回错误")
+                if on_error:
+                    on_error(detail)
+                yield _sse("error", {"type": "error", "error": {"type": "api_error", "message": detail}})
+                return
             if obj.get("id"):
                 msg_id = str(obj["id"])
             usage = obj.get("usage") if isinstance(obj.get("usage"), dict) else {}
@@ -628,6 +696,7 @@ def iter_anthropic_sse(openai_chunks: Iterator[bytes], model: str | None) -> Ite
             choice = choices[0] if isinstance(choices[0], dict) else {}
             finish = choice.get("finish_reason")
             if finish:
+                saw_finish = True
                 stop = _stop_reason(str(finish))
             delta = choice.get("delta") if isinstance(choice.get("delta"), dict) else {}
             think = delta.get("reasoning_content")
@@ -677,6 +746,12 @@ def iter_anthropic_sse(openai_chunks: Iterator[bytes], model: str | None) -> Ite
                                 "delta": {"type": "input_json_delta", "partial_json": frag},
                             },
                         )
+    if not saw_finish:
+        detail = "上游 Chat SSE 流提前结束（未收到结束标记）"
+        if on_error:
+            on_error(detail)
+        yield _sse("error", {"type": "error", "error": {"type": "api_error", "message": detail}})
+        return
     yield from close_all()
 
 
@@ -743,16 +818,33 @@ def messages_to_responses(payload: dict[str, Any]) -> dict[str, Any]:
         # function_call / function_call_output 项（上游按 call_id 校验配对，
         # 拼进普通文本会 400 No tool output found）
         text_parts: list[str] = []
+        content_parts: list[dict[str, Any]] = []
+        has_image = False
         tool_items: list[dict[str, Any]] = []
         for block in content:
             if not isinstance(block, dict):
                 continue
             btype = str(block.get("type") or "")
             if btype == "text":
-                text_parts.append(str(block.get("text") or ""))
+                text = str(block.get("text") or "")
+                text_parts.append(text)
+                content_parts.append({"type": "input_text", "text": text})
+            elif btype == "image":
+                if role != "user":
+                    raise ValueError("Anthropic assistant image 暂不支持转换")
+                has_image = True
+                content_parts.append(
+                    {"type": "input_image", "image_url": _anthropic_image_url(block)}
+                )
             elif btype == "tool_result":
                 call_id = str(block.get("tool_use_id") or "")
                 output_text = _text_of(block.get("content"))
+                nested = block.get("content")
+                if isinstance(nested, list) and any(
+                    isinstance(part, dict) and part.get("type") == "image"
+                    for part in nested
+                ):
+                    raise ValueError("Anthropic tool_result 中的图片暂不支持转换")
                 if not call_id:
                     # 异常历史（缺 tool_use_id）：回退普通文本，保证请求可解析
                     text_parts.append(output_text)
@@ -776,8 +868,15 @@ def messages_to_responses(payload: dict[str, Any]) -> dict[str, Any]:
                         "call_id": str(block.get("id") or ""),
                     }
                 )
-        if text_parts:
-            messages.append({"role": role, "content": "".join(text_parts)})
+            elif btype not in ("thinking", "redacted_thinking"):
+                raise ValueError(f"Anthropic message 暂不支持 content block：{btype or '未知类型'}")
+        if text_parts or has_image:
+            messages.append(
+                {
+                    "role": role,
+                    "content": content_parts if has_image else "".join(text_parts),
+                }
+            )
         messages.extend(tool_items)
     out: dict[str, Any] = {
         "model": payload.get("model"),
@@ -874,7 +973,11 @@ def responses_to_message(payload: dict[str, Any], model: str | None) -> dict[str
     }
 
 
-def iter_responses_sse(gen: Iterator[bytes], model: str | None) -> Iterator[bytes]:
+def iter_responses_sse(
+    gen: Iterator[bytes],
+    model: str | None,
+    on_error: Callable[[str], None] | None = None,
+) -> Iterator[bytes]:
     """把 OpenAI Responses SSE 块转成 Anthropic Messages SSE。
 
 
@@ -1012,12 +1115,15 @@ def iter_responses_sse(gen: Iterator[bytes], model: str | None) -> Iterator[byte
     for chunk in gen:
         if not chunk:
             continue
-        buf += chunk
+        buf = (buf + chunk).replace(b"\r\n", b"\n")
         while b"\n\n" in buf:
             part, buf = buf.split(b"\n\n", 1)
             data_lines = []
+            event_name = ""
             for line in part.split(b"\n"):
-                if line.startswith(b"data:"):
+                if line.startswith(b"event:"):
+                    event_name = line[6:].strip().decode("utf-8", "replace")
+                elif line.startswith(b"data:"):
                     data_lines.append(line[5:].strip())
             if not data_lines:
                 continue
@@ -1031,7 +1137,7 @@ def iter_responses_sse(gen: Iterator[bytes], model: str | None) -> Iterator[byte
                 continue
             if not isinstance(obj, dict):
                 continue
-            t = obj.get("type")
+            t = obj.get("type") or event_name
             item = obj.get("item") if isinstance(obj.get("item"), dict) else {}
             # 结束/进度事件携带 response 全量（含 usage / id / incomplete）
             resp = obj.get("response")
@@ -1108,4 +1214,21 @@ def iter_responses_sse(gen: Iterator[bytes], model: str | None) -> Iterator[byte
             elif t in ("response.completed", "response.incomplete"):
                 yield from finish()
                 return
-    yield from finish()  # 循环自然结束未收尾，补收尾
+            elif t == "response.failed":
+                failed = resp.get("error") if isinstance(resp, dict) else None
+                if not failed:
+                    failed = obj.get("error")
+                if isinstance(failed, dict):
+                    code = str(failed.get("code") or failed.get("type") or "").strip()
+                    message = str(failed.get("message") or failed.get("detail") or "").strip()
+                    detail = ": ".join(part for part in (code, message) if part)
+                else:
+                    detail = str(failed or "上游 Responses 返回 response.failed")
+                if on_error:
+                    on_error(detail)
+                yield _sse("error", {"type": "error", "error": {"type": "api_error", "message": detail}})
+                return
+    detail = "上游 Responses SSE 流提前结束（未收到结束事件）"
+    if on_error:
+        on_error(detail)
+    yield _sse("error", {"type": "error", "error": {"type": "api_error", "message": detail}})

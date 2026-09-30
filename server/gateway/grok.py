@@ -12,8 +12,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import threading
 import time
+import uuid
 from collections import deque
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
@@ -25,6 +27,7 @@ from curl_cffi import requests
 from core import config
 from core import proxypool
 from core.config import UPSTREAM_BASE
+from core.http_body import RequestBodyTooLarge, read_request_body
 from core.logger import logger
 from core.util import (
     curl_error_code,
@@ -32,6 +35,7 @@ from core.util import (
     grok_user_agent,
     iso_after_hours,
     now_iso_tz,
+    retry_after_seconds,
     upstream_text,
 )
 from db import (
@@ -44,7 +48,7 @@ from db import (
 )
 from gateway import egress
 from gateway.paths import ensure_local_v1, resource_path, upstream_url
-from gateway.usage import StreamUsageAccumulator, extract_nonstream
+from gateway.usage import StreamOutcome, StreamUsageAccumulator, extract_nonstream
 
 GROK_BASE = UPSTREAM_BASE.rstrip("/")
 _DEFAULT_CLIENT_VERSION = "1.0.41"
@@ -108,9 +112,9 @@ _FRESH_ACCOUNT_SEC = 24 * 3600
 _AUTH_COOLDOWN_SECONDS = 600     # token 无效 / 权限被拒
 _CHANNEL_COOLDOWN_SECONDS = 120  # 通道失效 / 风控拦截
 _RATE_COOLDOWN_SECONDS = 120     # 限流（首次 429：瞬时突发解冻即恢复，避免粘性会话立刻再打同一号）
-_QUOTA_RECHECK_COOLDOWN_SECONDS = 600  # 连续第 2 次 429：复测窗口
-_QUOTA_RESET_SECONDS = 24 * 3600       # 额度耗尽：上游额度按日重置，冻满 24h 再回池
-_QUOTA_STREAK_WINDOW_SECONDS = 1800    # 距上次失败超过该窗口则重新从第 1 次计起
+_RATE_RECHECK_COOLDOWN_SECONDS = 600  # 连续 429：延长限流复测窗口
+_QUOTA_RESET_SECONDS = 24 * 3600       # 明确额度拦截：冻结 24h 后再探活恢复
+_RATE_STREAK_WINDOW_SECONDS = 1800     # 距上次失败超过该窗口则重新从第 1 次计起
 _COOLDOWN_BY_STATUS = {
     401: _AUTH_COOLDOWN_SECONDS,
     403: _AUTH_COOLDOWN_SECONDS,
@@ -120,10 +124,10 @@ _COOLDOWN_BY_STATUS = {
 }
 # 扣流路径的账号级失败（限流/额度/凭据/上游错误）会换号重试（有上限，
 # 防止系统性 429 打光号池）；400/404 等请求级错误不重试
-_RETRYABLE_UPSTREAM_STATUS = {401, 402, 403, 408, 429, 500, 502, 503, 504}
+_RETRYABLE_UPSTREAM_STATUS = {401, 402, 403, 429}
 _MAX_UPSTREAM_FAIL_RETRIES = 6
 _cooldowns: dict[int, float] = {}  # account_id → 冷却解冻的 monotonic 时间
-_quota_streaks: dict[int, tuple[int, float]] = {}  # account_id → (连续 429 次数, 上次时刻)
+_rate_streaks: dict[int, tuple[int, float]] = {}  # account_id → (连续 429 次数, 上次时刻)
 _auth_streaks: dict[int, tuple[int, float]] = {}  # account_id → (连续 401/403 次数, 上次时刻)
 
 # ── 粘性会话（对齐 CLIProxyAPI SessionAffinity）─────────────────
@@ -170,9 +174,15 @@ def _record(
     usage: dict[str, int] | None = None,
     ip: str | None = None,
     client_ua: str | None = None,
+    request_id: str | None = None,
+    attempts: list[dict[str, Any]] | None = None,
+    result_ok: bool | None = None,
 ) -> None:
     """写入环形日志、累加计数，并落库一条用量记录（含号池账号归属）。"""
     usage = usage or {"prompt_tokens": 0, "completion_tokens": 0, "cache_tokens": 0, "reasoning_tokens": 0}
+    reason = error
+    if not 200 <= status < 300 and not reason:
+        reason = f"HTTP {status}：非 2xx 响应，上游未提供错误详情"
     entry = {
         "id": _next_id(),
         "ts": now_iso_tz(),
@@ -184,7 +194,9 @@ def _record(
         "ms": ms,
         "bytes_in": bytes_in,
         "bytes_out": bytes_out,
-        "error": error or "",
+        "error": reason or "",
+        "request_id": request_id or "",
+        "attempts": attempts or [],
         "account_id": account_id or 0,
         "account": account,
         "prompt_tokens": usage.get("prompt_tokens", 0),
@@ -195,7 +207,8 @@ def _record(
     with _lock:
         _logs.appendleft(entry)
         _stats["total"] += 1
-        if 200 <= status < 400:
+        succeeded = result_ok if result_ok is not None else 200 <= status < 300
+        if succeeded:
             _stats["ok"] += 1
         else:
             _stats["error"] += 1
@@ -206,7 +219,7 @@ def _record(
         _stats["last_status"] = status
         _stats["last_path"] = path
         _stats["last_at"] = entry["ts"]
-        _stats["last_error"] = error or ""
+        _stats["last_error"] = reason or ""
         _stats["last_account"] = account
     try:
         insert_usage(
@@ -218,8 +231,10 @@ def _record(
             stream=stream,
             account_id=account_id,
             account_email=account_email or (account if account and "@" in account else None),
-            status=1 if 200 <= status < 400 else 0,
-            reason=error or None,
+            status=1 if succeeded else 0,
+            http_status=status,
+            attempts=attempts,
+            reason=reason or None,
             prompt_tokens=usage.get("prompt_tokens", 0),
             completion_tokens=usage.get("completion_tokens", 0),
             cache_tokens=usage.get("cache_tokens", 0),
@@ -539,12 +554,7 @@ def _extract_meta(body: bytes) -> tuple[str | None, bool, str | None]:
 
 
 def _read_body(handler: BaseHTTPRequestHandler) -> bytes:
-    length = int(handler.headers.get("Content-Length") or 0)
-    if length <= 0:
-        return b""
-    if length > _MAX_BODY:
-        raise ValueError(f"请求体过大（>{_MAX_BODY} bytes）")
-    return handler.rfile.read(length)
+    return read_request_body(handler, max_bytes=_MAX_BODY)
 
 
 def _preferred_pool(
@@ -636,10 +646,26 @@ def _cooldown_account(account_id: int, seconds: float) -> None:
         _cooldowns[int(account_id)] = time.monotonic() + seconds
 
 
+def cooldown_rate_limited_account(account_id: int, retry_after: str | None = None) -> int:
+    """由号池巡检触发短期限流冷却，保留 ACTIVE 状态与账号资格。"""
+    seconds = max(
+        _RATE_COOLDOWN_SECONDS,
+        retry_after_seconds(retry_after) or 0.0,
+    )
+    return cooldown_account_temporarily(account_id, seconds)
+
+
+def cooldown_account_temporarily(account_id: int, seconds: float) -> int:
+    """为巡检账号设置短期探测冷却，避免网络故障时重复探活。"""
+    bounded = max(1.0, min(float(seconds), 7 * 24 * 3600))
+    _cooldown_account(account_id, bounded)
+    return int(bounded)
+
+
 def _mark_account_ok(account_id: int) -> None:
     """上游 2xx 说明该账号凭据与额度均可用，清零失败计数，避免半可用账号被落库处置。"""
     with _lock:
-        _quota_streaks.pop(int(account_id), None)
+        _rate_streaks.pop(int(account_id), None)
         _auth_streaks.pop(int(account_id), None)
 
 
@@ -648,18 +674,55 @@ def _bump_streak(streaks: dict[int, tuple[int, float]], account_id: int) -> int:
     now = time.monotonic()
     with _lock:
         count, last_ts = streaks.get(int(account_id), (0, 0.0))
-        count = count + 1 if now - last_ts <= _QUOTA_STREAK_WINDOW_SECONDS else 1
+        count = count + 1 if now - last_ts <= _RATE_STREAK_WINDOW_SECONDS else 1
         streaks[int(account_id)] = (count, now)
     return count
 
 
-def _apply_upstream_cooldown(account_id: int, who: str, status: int) -> None:
+def _contains_free_usage_exhausted(value: Any) -> bool:
+    """上游该错误码是账号滚动 24h 免费额度耗尽的明确证据。"""
+    if isinstance(value, dict):
+        if value.get("code") == "subscription:free-usage-exhausted":
+            return True
+        return any(_contains_free_usage_exhausted(item) for item in value.values())
+    if isinstance(value, list):
+        return any(_contains_free_usage_exhausted(item) for item in value)
+    return False
+
+
+def _quota_error_reason(status: int, error_body: bytes | str | None) -> str | None:
+    """只识别上游明确的额度错误，避免把普通限流误判成额度耗尽。"""
+    if status == 402:
+        return "上游 HTTP 402（额度/消费上限）"
+
+    text = upstream_text(error_body).lower() if error_body else ""
+    if status == 429:
+        try:
+            payload = json.loads(upstream_text(error_body)) if error_body else None
+        except (TypeError, ValueError):
+            payload = None
+        if _contains_free_usage_exhausted(payload):
+            return "上游 subscription:free-usage-exhausted（免费额度耗尽）"
+        if "personal-team-blocked:spending-limit" in text:
+            return "上游 personal-team-blocked:spending-limit（消费上限）"
+
+    # Grok CLI 兼容的旧版 IC spend-block 响应：403 + 明确的 credits 文案。
+    if status == 403 and "run out of credits" in text:
+        return "上游 HTTP 403（run out of credits，消费上限）"
+    return None
+
+
+def _apply_upstream_cooldown(
+    account_id: int,
+    who: str,
+    status: int,
+    error_body: bytes | str | None = None,
+    retry_after: str | None = None,
+) -> None:
     """按上游状态码处置账号：内存冻结，达到阈值时落库改状态并移出选号池。
 
-    - 429：连续命中逐级升级（120s → 10min 复测 → 24h）。额度按日重置，
-      连续 429 说明额度耗尽（实测同一账号 5 小时内连续 429 十余次零成功），
-      第 3 次起落库 STATUS_LIMITED，选号候选只取 ACTIVE，随即自动移出；
-    - 402：上游明确的配额不足信号，直接 24h + 落库 STATUS_LIMITED；
+    - 402、429 + 明确的额度错误码、403 + 旧版明确额度文案：冷却 24h 并移出选号池；
+    - 其它 429：按限流处理，只延长临时冷却，不据重复次数推断额度耗尽；
     - 401/403：token 失效，首次仅 600s 冷却防瞬时抖动，窗口内再犯落库
       STATUS_REAUTH，由重登任务刷新/重登恢复；
     - 任一次 2xx 成功即清零计数（见 _mark_account_ok），半可用账号不受影响。
@@ -670,20 +733,21 @@ def _apply_upstream_cooldown(account_id: int, who: str, status: int) -> None:
     note = ""
     mark_status: int | None = None
     mark_reason = ""
-    if status == 429:
-        count = _bump_streak(_quota_streaks, account_id)
-        if count == 2:
-            cool_secs = _QUOTA_RECHECK_COOLDOWN_SECONDS
-            note = f"（连续第 {count} 次，复测）"
-        elif count >= 3:
-            cool_secs = _QUOTA_RESET_SECONDS
-            mark_status = STATUS_LIMITED
-            mark_reason = f"额度耗尽（连续 {count} 次 429，冻结 24h 待日额度重置）"
-            note = f"（连续第 {count} 次，疑似额度耗尽，冻结至日额度重置）"
-    elif status == 402:
+    quota_reason = _quota_error_reason(status, error_body)
+    if quota_reason:
+        cool_secs = _QUOTA_RESET_SECONDS
         mark_status = STATUS_LIMITED
-        mark_reason = "额度耗尽（上游 402 配额不足，冻结 24h 待日额度重置）"
-        note = "（配额不足，冻结至日额度重置）"
+        mark_reason = f"额度/消费上限（{quota_reason}，冻结 24h）"
+        note = f"（{quota_reason}，冻结 24h）"
+    elif status == 429:
+        count = _bump_streak(_rate_streaks, account_id)
+        if count >= 2:
+            cool_secs = _RATE_RECHECK_COOLDOWN_SECONDS
+            note = f"（连续第 {count} 次，按限流延长复测）"
+        retry_secs = retry_after_seconds(retry_after)
+        if retry_secs is not None:
+            cool_secs = max(cool_secs, retry_secs)
+            note += f"（Retry-After {int(retry_secs)}s）"
     elif status in (401, 403):
         count = _bump_streak(_auth_streaks, account_id)
         if count >= 2:
@@ -705,6 +769,14 @@ def cooldown_until_map() -> dict[int, float]:
     """当前冷却中账号 id → 解冻的 monotonic 时刻（供运维页逐账号标记冷却）。"""
     with _lock:
         return dict(_cooldowns)
+
+
+def _pool_retry_after() -> int | None:
+    """所有候选号均在短期冷却时，返回最早可复测等待秒数。"""
+    now = time.monotonic()
+    with _lock:
+        remaining = [until - now for until in _cooldowns.values() if until > now]
+    return max(1, math.ceil(min(remaining))) if remaining else None
 
 
 def sticky_bound_account_ids() -> set[int]:
@@ -852,7 +924,7 @@ def proxy(handler: BaseHTTPRequestHandler, method: str, path: str) -> None:
     path = ensure_local_v1(path, "/grok")
     try:
         body = _read_body(handler)
-    except ValueError as exc:
+    except RequestBodyTooLarge as exc:
         _send_bytes(
             handler,
             413,
@@ -904,11 +976,28 @@ def _proxy_direct(
     """直通转发（不参与扣流判定）：单次选号 → 转发 → 记账。"""
     acc, acc_err = _pick_account(session_key)
     if acc is None:
+        error_body = _openai_error(acc_err, 503)
+        retry_after = _pool_retry_after() or 60
         _send_bytes(
             handler,
-            400,
-            _openai_error(acc_err, 400),
+            503,
+            error_body,
             "application/json; charset=utf-8",
+            [("Retry-After", str(retry_after))],
+        )
+        _record(
+            method=method,
+            path=path,
+            model=model,
+            stream=stream_flag,
+            status=503,
+            ms=0,
+            bytes_in=len(body),
+            bytes_out=len(error_body),
+            error=acc_err,
+            effort=effort_flag,
+            ip=client_ip,
+            client_ua=client_ua,
         )
         return
 
@@ -928,11 +1017,19 @@ def _proxy_direct(
     acc_us: StreamUsageAccumulator | None = None
 
     used_proxy = proxypool.pick()
+    request_id = uuid.uuid4().hex[:16]
+    attempts: list[dict[str, Any]] = []
+    stream_outcome = StreamOutcome()
+    tried_account_ids = {account_id}
+    account_retry_count = 0
+    network_retry_done = False
+    rate_limit_attempts = 0
     try:
-        is_stream = False
-        raw_chunks = None
-        first_raw_chunk = b""
-        for request_attempt in range(2):
+        while True:
+            status = 502
+            is_stream = False
+            raw_chunks = None
+            first_raw_chunk = b""
             try:
                 upstream = requests.request(
                     method,
@@ -943,15 +1040,81 @@ def _proxy_direct(
                     **_proxy_kwargs(used_proxy),
                 )
                 status = int(upstream.status_code)
-                if status < 400:
+                if 200 <= status < 300:
                     _mark_account_ok(account_id)
+                    attempts.append({"account": who, "status": status, "error": "", "wait_seconds": 0})
                 else:
-                    logger.warning(
-                        f"[Grok网关] 上游拒绝 {method} {path} {who} HTTP {status}\n"
-                        f"{upstream_text(upstream.content)}"
+                    detail = " ".join(upstream_text(upstream.content).split())[:220]
+                    retry_after = upstream.headers.get("Retry-After")
+                    quota_reason = _quota_error_reason(status, upstream.content)
+                    if status == 429:
+                        rate_limit_attempts += 1
+                    retry_wait = retry_after_seconds(retry_after)
+                    attempts.append(
+                        {
+                            "account": who,
+                            "status": status,
+                            "error": (detail or f"HTTP {status}")[:255],
+                            "wait_seconds": 0,
+                            "retry_after_seconds": int(retry_wait) if retry_wait is not None else None,
+                        }
                     )
+                    logger.warning(
+                        f"[Grok网关] request={request_id} 上游拒绝 {method} {path} {who} HTTP {status} "
+                        f"account_attempt={account_retry_count + 1}\n"
+                        f"{detail or '上游未提供错误详情'}"
+                    )
+                    err = (
+                        f"upstream_{status}:{detail}"
+                        if detail
+                        else f"HTTP {status}：上游未提供错误详情"
+                    )[:255]
+
+                    if status >= 400:
+                        _apply_upstream_cooldown(
+                            account_id, who, status, upstream.content, retry_after
+                        )
+                    if (
+                        status in _RETRYABLE_UPSTREAM_STATUS
+                        and (
+                            status != 429
+                            or quota_reason is not None
+                            or (rate_limit_attempts == 1 and retry_wait is None)
+                        )
+                        and account_retry_count < _MAX_UPSTREAM_FAIL_RETRIES
+                    ):
+                        tried_account_ids.add(account_id)
+                        next_acc, _ = _pick_account(
+                            session_key, exclude_ids=tried_account_ids
+                        )
+                        next_id = int(next_acc["id"]) if next_acc else 0
+                        if next_acc is not None and next_id not in tried_account_ids:
+                            logger.warning(
+                                f"[Grok网关] request={request_id} HTTP {status}，切换账号重试 "
+                                f"{account_retry_count + 1}/{_MAX_UPSTREAM_FAIL_RETRIES}"
+                            )
+                            upstream.close()
+                            upstream = None
+                            acc = next_acc
+                            account_id = next_id
+                            email = str(acc.get("email") or "")
+                            who = email
+                            token = str(acc.get("access_token") or "")
+                            headers = _forward_headers(handler.headers, token)
+                            account_retry_count += 1
+                            network_retry_done = False
+                            status = 502
+                            err = None
+                            bytes_out = 0
+                            usage = {
+                                "prompt_tokens": 0,
+                                "completion_tokens": 0,
+                                "cache_tokens": 0,
+                                "reasoning_tokens": 0,
+                            }
+                            continue
                 content_type = (upstream.headers.get("Content-Type") or "").lower()
-                is_stream = stream_flag and status < 400 and (
+                is_stream = stream_flag and 200 <= status < 300 and (
                     "text/event-stream" in content_type or not content_type
                 )
                 if is_stream and method != "HEAD":
@@ -960,24 +1123,33 @@ def _proxy_direct(
                         if chunk:
                             first_raw_chunk = chunk
                             break
-                break
             except requests.RequestsError as exc:
                 code = curl_error_code(exc)
                 can_retry = (
-                    request_attempt == 0
+                    not network_retry_done
                     and bytes_out == 0
                     and code in _UPSTREAM_RETRY_CODES
-                    and (stream_flag or method in {"GET", "HEAD"})
+                    and method in {"GET", "HEAD"}
+                )
+                attempts.append(
+                    {
+                        "account": who,
+                        "status": 0,
+                        "error": f"{type(exc).__name__} curl={code or 'unknown'}: {exc}"[:255],
+                        "wait_seconds": _UPSTREAM_RETRY_DELAY if can_retry else 0,
+                    }
                 )
                 logger.warning(
-                    f"[Grok网关] 上游请求异常 curl={code or 'unknown'} "
+                    f"[Grok网关] request={request_id} 上游请求异常 curl={code or 'unknown'} "
                     f"proxy={proxypool.status_label(used_proxy)} "
-                    f"attempt={request_attempt + 1}/2 retry={can_retry}\n{exc}"
+                    f"network_attempt={2 if network_retry_done else 1}/2 "
+                    f"retry={can_retry}\n{exc}"
                 )
                 if used_proxy:
                     proxypool.mark_fail(used_proxy)
                 if not can_retry:
                     raise
+                network_retry_done = True
                 nxt = proxypool.pick(exclude=used_proxy)
                 if nxt:
                     used_proxy = nxt
@@ -985,6 +1157,8 @@ def _proxy_direct(
                     upstream.close()
                     upstream = None
                 time.sleep(_UPSTREAM_RETRY_DELAY)
+                continue
+            break
         extra = _response_headers(upstream)
         if is_stream:
             handler.send_response(status)
@@ -1015,26 +1189,39 @@ def _proxy_direct(
                         continue
                     # 旁路采样：喂入块供用量解析，不阻塞转发
                     acc_us.feed(chunk)
+                    stream_outcome.feed(chunk)
                     handler.wfile.write(chunk)
                     handler.wfile.flush()
                     bytes_out += len(chunk)
                 usage = acc_us.result()
+                stream_outcome.finish()
+                if stream_outcome.failed:
+                    err = stream_outcome.error
+                    logger.warning(
+                        f"[Grok网关] request={request_id} 流式上游失败 {method} {path}: {err}"
+                    )
+                elif stream_outcome.warning:
+                    err = stream_outcome.warning
+                    logger.warning(
+                        f"[Grok网关] request={request_id} 流式上游警告 {method} {path}: {err}"
+                    )
         else:
             payload = upstream.content or b""
             bytes_out = len(payload)
             ctype = upstream.headers.get("Content-Type") or "application/json; charset=utf-8"
             # 非流式：对上游响应整包解析 usage
-            if status < 400:
+            if 200 <= status < 300:
                 usage = extract_nonstream(payload)
             _send_bytes(handler, status, payload, ctype, extra)
     except (BrokenPipeError, ConnectionError, ConnectionResetError, ConnectionAbortedError):
-        err = "client_disconnected"
-        # 上游已成功(status<400)时属客户端提前断开（流式 CLI 读完即关），非故障；仅上游失败才报 WARNING
-        if status < 400:
+        # 上游已成功（2xx）时属客户端提前断开；非 2xx 保留上游错误原因。
+        if 200 <= status < 300:
+            err = "client_disconnected"
             logger.info(
                 f"[Grok网关] 客户端提前断开（上游已成功 HTTP {status}）{method} {path} {who}"
             )
         else:
+            err = err or "client_disconnected"
             logger.warning(f"[Grok网关] 客户端断开 {method} {path} {who} HTTP {status}")
     except Exception as exc:
         code = curl_error_code(exc)
@@ -1043,6 +1230,8 @@ def _proxy_direct(
             f"proxy={proxypool.status_label(used_proxy)} bytes_out={bytes_out}: {exc}"
         )
         logger.error(f"[Grok网关] 转发失败 {method} {path} {who} {err}")
+        if response_started:
+            stream_outcome.fail(err)
         if not response_started and not handler.wfile.closed:
             try:
                 _send_bytes(
@@ -1053,7 +1242,8 @@ def _proxy_direct(
                 )
             except Exception:
                 pass
-        status = 502
+        if not response_started:
+            status = 502
     finally:
         if upstream is not None:
             try:
@@ -1078,12 +1268,12 @@ def _proxy_direct(
             usage=usage,
             ip=client_ip,
             client_ua=client_ua,
+            request_id=request_id,
+            attempts=attempts,
+            result_ok=200 <= status < 300 and not stream_outcome.failed,
         )
-        # 上游明确判定的坏号进入临时冷却（网络异常 / 客户端断开不归咎账号）
-        if err is None and status >= 400:
-            _apply_upstream_cooldown(account_id, who, status)
         if err != "client_disconnected":
             logger.info(
                 f"[Grok网关] {method} {path} {who} model={model or '-'} "
-                f"status={status} {ms}ms in={len(body)} out={bytes_out}"
+                f"status={status} {ms}ms in={len(body)} out={bytes_out} request={request_id}"
             )

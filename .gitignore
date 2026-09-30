@@ -59,3 +59,7 @@ server/config.json
 # Frontend
 web/node_modules/
 web/dist/
+
+# Local Camoufox kernel downloads (exceed GitHub 100MB limit)
+camoufox-*.zip
+camoufox-*.zip:Zone.Identifier

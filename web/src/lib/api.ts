@@ -520,8 +520,17 @@ export interface UsageRow {
   stream: number;
   account_id: number | null;
   account_email: string | null;
+  http_status: number | null;
   status: number;
   reason: string | null;
+  attempts?: Array<{
+    account?: string;
+    status: number;
+    error?: string;
+    wait_seconds?: number;
+    retry_after_seconds?: number | null;
+    proxy?: string;
+  }>;
   prompt_tokens: number;
   completion_tokens: number;
   cache_tokens: number;

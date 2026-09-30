@@ -291,9 +291,9 @@
 }
 
 .usage-col-reason {
-  width: 160px;
-  min-width: 160px;
-  max-width: 160px;
+  width: 240px;
+  min-width: 240px;
+  max-width: 240px;
 }
 .usage-reason {
   display: block;
@@ -302,6 +302,35 @@
   text-overflow: ellipsis;
   white-space: nowrap;
   cursor: default;
+}
+.usage-http-status {
+  font-variant-numeric: tabular-nums;
+}
+.usage-http-status.is-2xx {
+  color: var(--ok);
+  border-color: color-mix(in srgb, var(--ok) 42%, var(--border));
+  background: color-mix(in srgb, var(--ok) 10%, transparent);
+}
+.usage-http-status.is-3xx {
+  color: var(--signal);
+  border-color: color-mix(in srgb, var(--signal) 42%, var(--border));
+  background: color-mix(in srgb, var(--signal) 10%, transparent);
+}
+.usage-http-status.is-4xx {
+  color: var(--warn);
+  border-color: color-mix(in srgb, var(--warn) 46%, var(--border));
+  background: color-mix(in srgb, var(--warn) 11%, transparent);
+}
+.usage-http-status.is-5xx {
+  color: var(--destructive);
+  border-color: color-mix(in srgb, var(--destructive) 42%, var(--border));
+  background: color-mix(in srgb, var(--destructive) 10%, transparent);
+}
+.usage-http-status.is-unknown,
+.usage-http-status.is-other {
+  color: var(--muted-foreground);
+  border-color: var(--border);
+  background: var(--secondary);
 }
 
 .usage-token-pair {

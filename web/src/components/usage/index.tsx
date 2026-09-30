@@ -355,6 +355,41 @@ function effortTone(effort: string | null): string {
   return "";
 }
 
+function httpStatusTone(status: number | null): string {
+  if (status == null) return "is-unknown";
+  if (status >= 200 && status < 300) return "is-2xx";
+  if (status >= 300 && status < 400) return "is-3xx";
+  if (status >= 400 && status < 500) return "is-4xx";
+  if (status >= 500 && status < 600) return "is-5xx";
+  return "is-other";
+}
+
+function requestReason(row: UsageRow): string | null {
+  const status = row.http_status;
+  if (status == null) return null;
+  if (status >= 200 && status < 300 && row.status === 1) {
+    return row.reason === "client_disconnected" ? null : row.reason || null;
+  }
+  return row.reason || null;
+}
+
+function AttemptSummary({ row }: { row: UsageRow }) {
+  const attempts = row.attempts || [];
+  if (attempts.length < 2) return <span className="text-muted-foreground">—</span>;
+  const summary = attempts
+    .map((attempt) => {
+      const status = attempt.status || "ERR";
+      const wait = Number(attempt.wait_seconds || 0);
+      return `${status}${wait > 0 ? ` (${wait}s)` : ""}`;
+    })
+    .join(" → ");
+  return (
+    <div className="mt-1 whitespace-nowrap font-mono text-[10px] text-muted-foreground">
+      {summary}
+    </div>
+  );
+}
+
 export function RequestDetailTable({ rows }: { rows: UsageRow[] }) {
   if (!rows.length) return <div className="usage-empty">暂无请求明细</div>;
   return (
@@ -370,7 +405,8 @@ export function RequestDetailTable({ rows }: { rows: UsageRow[] }) {
             <TableHead>流式</TableHead>
             <TableHead>推理等级</TableHead>
             <TableHead className="text-right">Token</TableHead>
-            <TableHead>结果</TableHead>
+            <TableHead>HTTP</TableHead>
+            <TableHead>重试</TableHead>
             <TableHead className="usage-col-reason">原因</TableHead>
           </TableRow>
         </TableHeader>
@@ -463,23 +499,28 @@ export function RequestDetailTable({ rows }: { rows: UsageRow[] }) {
                 </div>
               </TableCell>
               <TableCell>
-                <Badge
-                  variant={row.status === 1 ? "success" : "danger"}
-                  className="font-mono text-[11px]"
-                >
-                  {row.status === 1 ? "成功" : "失败"}
-                </Badge>
+                <div>
+                  <Badge
+                    variant="outline"
+                    className={cn("usage-http-status font-mono text-[11px]", httpStatusTone(row.http_status))}
+                  >
+                    {row.http_status == null ? "—" : row.http_status}
+                  </Badge>
+                </div>
+              </TableCell>
+              <TableCell className="font-mono text-[11px]">
+                <AttemptSummary row={row} />
               </TableCell>
               <TableCell className="usage-col-reason">
-                {row.reason ? (
+                {requestReason(row) ? (
                   <Tooltip>
                     <TooltipTrigger asChild>
                       <span className="usage-reason text-[12px] text-muted-foreground">
-                        {row.reason}
+                        {requestReason(row)}
                       </span>
                     </TooltipTrigger>
                     <TooltipContent side="top" className="max-w-xs">
-                      {row.reason}
+                      {requestReason(row)}
                     </TooltipContent>
                   </Tooltip>
                 ) : (

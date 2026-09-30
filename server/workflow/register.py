@@ -191,8 +191,8 @@ def _frames(page: Any) -> list[Any]:
 
 
 def _page_text(page: Any) -> str:
-    """汇总所有 frame 的 URL 与正文文本（含 iframe 内表单内容）。"""
-    parts = [page.url]
+    """汇总所有 frame 的正文文本（含 iframe 内表单内容），小写便于关键字匹配。"""
+    parts: list[str] = []
     for frame in _frames(page):
         try:
             parts.append(frame.inner_text("body"))

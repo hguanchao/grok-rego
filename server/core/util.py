@@ -8,6 +8,8 @@
 """
 
 from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
+import math
 
 BEIJING_TZ = timezone(timedelta(hours=8))
 _STR_FORMAT = "%Y-%m-%d %H:%M:%S"
@@ -182,18 +184,49 @@ def run_account_workers(
     return results
 
 
-def upstream_text(body: str | bytes | None, limit: int = 4000) -> str:
-    """上游响应或页面正文原样摘录。超长只截断尾部，不改写内容。"""
+_WS = re.compile(r"\s+")
+
+
+def _as_text(body: str | bytes | None) -> str:
+    """把响应/页面内容转成字符串，bytes 按 UTF-8 容错解码。"""
     if body is None:
         return ""
     if isinstance(body, bytes):
-        text = body.decode("utf-8", errors="replace")
-    else:
-        text = str(body)
-    text = text.replace("\r\n", "\n").replace("\r", "\n").strip()
+        return body.decode("utf-8", errors="replace")
+    return str(body)
+
+
+def upstream_text(body: str | bytes | None, limit: int = 4000) -> str:
+    """上游响应或页面正文原样摘录。超长只截断尾部，不改写内容。"""
+    text = _as_text(body).replace("\r\n", "\n").replace("\r", "\n").strip()
     if len(text) <= limit:
         return text
     return text[:limit] + f"\n…(truncated {len(text) - limit} chars)"
+
+
+def compact_text(body: str | bytes | None, limit: int = 160) -> str:
+    """把多段页面/响应文本收成单行摘要，供面板与控制台 WARNING 使用。"""
+    text = _WS.sub(" ", _as_text(body).replace("\u00a0", " ")).strip()
+    if len(text) <= limit:
+        return text
+    return text[:limit].rstrip() + "…"
+
+
+def retry_after_seconds(value: str | None) -> float | None:
+    """解析 Retry-After 秒数或 HTTP 日期，异常值不参与冷却。"""
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        seconds = float(raw)
+    except ValueError:
+        try:
+            seconds = parsedate_to_datetime(raw).timestamp() - time.time()
+        except (TypeError, ValueError, OverflowError):
+            return None
+    if not math.isfinite(seconds):
+        return None
+    return min(7 * 24 * 3600, max(0.0, seconds))
 
 
 def grok_user_agent(version: str) -> str:

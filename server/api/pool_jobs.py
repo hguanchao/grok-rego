@@ -39,11 +39,18 @@ from db import (
     STATUS_LIMITED,
     STATUS_REAUTH,
     get_all_accounts,
+    list_limited_accounts_due_for_recheck,
     touch_inspected,
     update_account_status_by_ids,
     update_account_tokens,
 )
-from gateway.grok import _identity_headers
+from gateway.grok import (
+    _identity_headers,
+    _quota_error_reason,
+    cooldown_account_temporarily,
+    cooldown_rate_limited_account,
+    cooldown_until_map,
+)
 from workflow.oauth import auth_with_sso
 from workflow.oauth import refresh_token as oauth_refresh
 
@@ -58,8 +65,8 @@ _thread_local = threading.local()
 
 
 def _limited_hold_expired(acc: dict[str, Any]) -> bool:
-    """限额账号是否已冻满 24h（以 updated_at 为冻结起点；空/非法视为已过期，放行探活）。"""
-    raw = str(acc.get("updated_at") or "").strip()
+    """限额账号是否已冻满 24h；网络失败更新原因时不重置冻结起点。"""
+    raw = str(acc.get("limited_at") or acc.get("updated_at") or "").strip()
     if not raw:
         return True
     try:
@@ -92,7 +99,12 @@ class ProbeClient:
           error           失败原因摘要
           elapsed_ms      请求耗时（毫秒）
         """
-        result: dict[str, Any] = {"status_code": 0, "error": "", "elapsed_ms": 0}
+        result: dict[str, Any] = {
+            "status_code": 0,
+            "error": "",
+            "elapsed_ms": 0,
+            "retry_after": None,
+        }
         from core import proxypool
 
         use_proxy = str(proxy or proxypool.pick() or "").strip()
@@ -132,6 +144,8 @@ class ProbeClient:
 
         status = int(response.status_code)
         result["status_code"] = status
+        result["retry_after"] = response.headers.get("Retry-After")
+        result["quota_reason"] = _quota_error_reason(status, response.content)
         result["elapsed_ms"] = int((time.monotonic() - t0) * 1000)
         if not (200 <= status < 300):
             err = _simplify_error(status, response.text or "")
@@ -605,6 +619,7 @@ class PoolJobManager:
             result = self._probe_client.probe(acc, proxy=proxypool.pick())
             status = int(result.get("status_code") or 0)
             detail = str(result.get("error") or "").strip()
+            quota_reason = str(result.get("quota_reason") or "").strip()
 
             # 通过：恢复 ACTIVE，刷新探活时间，并对临期 token 续期
             # （降智判定已移交网关被动审计，续期已从自动续期 daemon 并入巡检）
@@ -641,6 +656,17 @@ class PoolJobManager:
                     "cost": elapsed_label(t0),
                 }
 
+            # 明确额度耗尽：限额冻结 24h；/billing 的普通 429 仍按短期限流处理。
+            if quota_reason or status == _HTTP_QUOTA:
+                reason = quota_reason or f"上游 HTTP {status}：{detail or '限额尚未重置'}"
+                update_account_status_by_ids([aid], STATUS_LIMITED, f"额度耗尽（{reason}，冻结 24h）")
+                return {
+                    "aid": aid,
+                    "ok": False,
+                    "message": f"{status} 额度耗尽，重新冻结 24h：{detail or reason}",
+                    "cost": elapsed_label(t0),
+                }
+
             # 凭证失效（401/403）：刷新后再探
             if status in _HTTP_TOKEN_INVALID:
                 refreshed = self._refresh_and_reprobe(job, acc)
@@ -659,13 +685,27 @@ class PoolJobManager:
 
             # 限流 / 配额
             if status == _HTTP_RATE_LIMIT:
-                update_account_status_by_ids([aid], STATUS_LIMITED, f"限流（429）：{detail}")
-                return {"aid": aid, "ok": False, "message": f"{status} 被限流{'：' + detail if detail else ''}", "cost": elapsed_label(t0)}
-            if status == _HTTP_QUOTA:
-                update_account_status_by_ids([aid], STATUS_LIMITED, f"配额不足（402）：{detail}")
-                return {"aid": aid, "ok": False, "message": f"{status} 配额不足{'：' + detail if detail else ''}", "cost": elapsed_label(t0)}
-
-            # 网络 / 5xx / 超时 / status=0：不改状态只记原因
+                if int(acc.get("status") or 1) == STATUS_LIMITED:
+                    # billing 端点本身也可能被限流；保留原 24h 起点，短暂延后再测。
+                    cooldown = cooldown_rate_limited_account(aid, result.get("retry_after"))
+                    update_account_status_by_ids([aid], None, f"限额复测遇到 429：{detail}")
+                    return {
+                        "aid": aid,
+                        "ok": False,
+                        "message": f"{status} 复测被限流，{cooldown}s 后再试{'：' + detail if detail else ''}",
+                        "cost": elapsed_label(t0),
+                    }
+                else:
+                    cooldown = cooldown_rate_limited_account(aid, result.get("retry_after"))
+                    update_account_status_by_ids([aid], STATUS_ACTIVE, f"限流（429）：{detail}")
+                return {
+                    "aid": aid,
+                    "ok": False,
+                    "message": f"{status} 被限流，冷却 {cooldown}s{'：' + detail if detail else ''}",
+                    "cost": elapsed_label(t0),
+                }
+            # 其它异常状态不改账号状态，短暂延后下次自动复测，避免每分钟重复探测。
+            cooldown_account_temporarily(aid, 300)
             update_account_status_by_ids([aid], None, f"探活失败：{detail}")
             return {"aid": aid, "ok": False, "message": f"{status or 'N/A'} {detail or '网络异常'}", "cost": elapsed_label(t0)}
 
@@ -861,3 +901,50 @@ class PoolJobManager:
 
 # 进程内单例（模块级，对齐 push.manager.push_manager 的用法）
 pool_job_manager = PoolJobManager()
+
+_limited_recheck_start_lock = threading.Lock()
+_limited_recheck_started = False
+_LIMITED_RECHECK_INTERVAL = 60
+
+
+def start_limited_recheck_worker() -> None:
+    """定时巡检满 24h 的限额账号；巡检任务被其它重任务占用时下轮再试。"""
+    global _limited_recheck_started
+    with _limited_recheck_start_lock:
+        if _limited_recheck_started:
+            return
+        _limited_recheck_started = True
+
+    def run() -> None:
+        while True:
+            try:
+                account_ids = list_limited_accounts_due_for_recheck()
+                cooling = {
+                    account_id
+                    for account_id, until in cooldown_until_map().items()
+                    if until > time.monotonic()
+                }
+                account_ids = [account_id for account_id in account_ids if account_id not in cooling]
+                if account_ids:
+                    pool_job_manager.start(
+                        kind="inspect",
+                        account_ids=account_ids,
+                        concurrency=min(4, ACCOUNT_WORKERS),
+                    )
+                    logger.info(
+                        f"[限额恢复] 自动巡检已满 24h 的账号 {len(account_ids)} 个"
+                    )
+            except RuntimeError:
+                # 巡检/重登/注册/推送占用全局重任务槽，稍后重试。
+                pass
+            except Exception as exc:
+                logger.warning(
+                    f"[限额恢复] 自动巡检触发失败 {type(exc).__name__}: {exc}"
+                )
+            time.sleep(_LIMITED_RECHECK_INTERVAL)
+
+    threading.Thread(
+        target=run,
+        name="限额账号恢复巡检",
+        daemon=True,
+    ).start()

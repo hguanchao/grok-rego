@@ -8,6 +8,8 @@
 from __future__ import annotations
 
 import json
+import socket
+import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import parse_qs, urlparse
@@ -16,10 +18,12 @@ from api.pool_jobs import (
     auth_pool_state,
     kick_auth_pool,
     pool_job_manager,
+    start_limited_recheck_worker,
 )
 from api.push import push_manager
 from core import config
 from core.config import API_HOST, API_PORT
+from core.http_body import IncompleteRequestBodyError, RequestBodyTooLarge, read_request_body
 from core.logger import logger
 from db import (
     clear_quality_flags,
@@ -66,12 +70,7 @@ def _is_digit_id_list(value: Any, *, allow_empty: bool) -> bool:
 
 
 def _json_body(handler: BaseHTTPRequestHandler) -> Any:
-    length = int(handler.headers.get("Content-Length") or 0)
-    if length <= 0:
-        return {}
-    if length > _MAX_BODY:
-        raise ValueError("请求体过大")
-    raw = handler.rfile.read(length)
+    raw = read_request_body(handler, max_bytes=_MAX_BODY)
     if not raw:
         return {}
     return json.loads(raw.decode("utf-8"))
@@ -546,6 +545,10 @@ class _ApiHandler(BaseHTTPRequestHandler):
     server_version = "grok-rego"
     sys_version = ""
 
+    def handle_one_request(self) -> None:
+        self.connection.settimeout(15.0)
+        super().handle_one_request()
+
     def log_message(self, fmt: str, *args: Any) -> None:
         return  # 管理 API 访问日志静默
 
@@ -582,6 +585,7 @@ class _ApiHandler(BaseHTTPRequestHandler):
         self._dispatch("HEAD")
 
     def _dispatch(self, method: str) -> None:
+        self.connection.settimeout(None)
         parsed = urlparse(self.path)
         path = parsed.path.rstrip("/") or "/"
         query = parse_qs(parsed.query)
@@ -594,6 +598,9 @@ class _ApiHandler(BaseHTTPRequestHandler):
                 return
             if _handle_api(method, path, query, self):
                 return
+        except RequestBodyTooLarge as e:
+            _error_json(self, 413, str(e))
+            return
         except ValueError as e:
             _error_json(self, 400, str(e))
             return
@@ -603,6 +610,10 @@ class _ApiHandler(BaseHTTPRequestHandler):
         except json.JSONDecodeError:
             _error_json(self, 400, "无效 JSON")
             return
+        except (socket.timeout, IncompleteRequestBodyError):
+            self.close_connection = True
+            _error_json(self, 408, "客户端请求读取超时或未完整发送")
+            return
         except Exception as e:
             logger.exception("[API] 未处理异常")
             _error_json(self, 500, f"{type(e).__name__}: {e}")
@@ -610,13 +621,50 @@ class _ApiHandler(BaseHTTPRequestHandler):
         _error_json(self, 404, f"not found: {path}")
 
 
+class _BoundedThreadingHTTPServer(ThreadingHTTPServer):
+    """限制活动请求线程数，容量耗尽时快速返回 503。"""
+
+    request_limit = 32
+
+    def __init__(self, server_address: tuple[str, int], request_handler: type[BaseHTTPRequestHandler]):
+        self._request_slots = threading.BoundedSemaphore(self.request_limit)
+        super().__init__(server_address, request_handler)
+
+    def process_request(self, request: socket.socket, client_address: tuple[str, int]) -> None:
+        if not self._request_slots.acquire(blocking=False):
+            try:
+                request.sendall(
+                    b"HTTP/1.1 503 Service Unavailable\r\n"
+                    b"Retry-After: 2\r\n"
+                    b"Connection: close\r\n"
+                    b"Content-Length: 0\r\n\r\n"
+                )
+            except OSError:
+                pass
+            finally:
+                self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            self._request_slots.release()
+            raise
+
+    def process_request_thread(self, request: socket.socket, client_address: tuple[str, int]) -> None:
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._request_slots.release()
+
+
 def serve(host: str | None = None, port: int | None = None) -> None:
     """启动管理 API 服务（阻塞）。"""
     init_db()
     bind_host = host or API_HOST
     bind_port = port or API_PORT
-    server = ThreadingHTTPServer((bind_host, bind_port), _ApiHandler)
+    server = _BoundedThreadingHTTPServer((bind_host, bind_port), _ApiHandler)
     server.daemon_threads = True
+    start_limited_recheck_worker()
     logger.success(f"[API] 服务启动: http://{bind_host}:{bind_port}")
     logger.info(
         "[API] 路由: /api/* （注册 / 号池 / 网关运维）  /zen/v1/* （Zen）  /grok/v1/* （号池 Grok）"

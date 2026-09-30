@@ -25,6 +25,102 @@ from typing import Any
 _MAX_BUFFER = 8 * 1024 * 1024
 
 
+class StreamOutcome:
+    """观察 SSE 错误与正常终止事件，供透传、协议转换和用量记录共用。"""
+
+    def __init__(self) -> None:
+        self._buf = bytearray()
+        self._frame = bytearray()
+        self.failed = False
+        self.error = ""
+        self.warning = ""
+        self.terminal = False
+
+    def fail(self, message: str) -> None:
+        self.failed = True
+        if message and not self.error:
+            self.error = " ".join(message.split())[:255]
+
+    def feed(self, chunk: bytes) -> None:
+        if not chunk:
+            return
+        self._buf.extend(chunk)
+        while b"\n" in self._buf:
+            line, _, rest = self._buf.partition(b"\n")
+            self._buf = bytearray(rest)
+            line = line.removesuffix(b"\r")
+            if not line:
+                self._consume(bytes(self._frame))
+                self._frame.clear()
+            else:
+                self._frame.extend(line + b"\n")
+        if len(self._buf) + len(self._frame) > 64 * 1024:
+            self._buf.clear()
+            self._frame.clear()
+
+    def _consume(self, event: bytes) -> None:
+        event_name = ""
+        data_lines: list[bytes] = []
+        for line in event.splitlines():
+            if line.startswith(b"event:"):
+                event_name = line[6:].decode("utf-8", "replace").strip()
+            elif line.startswith(b"data:"):
+                data_lines.append(line[5:].strip())
+        if not data_lines:
+            return
+        raw = b"\n".join(data_lines).decode("utf-8", "replace").strip()
+        if raw == "[DONE]":
+            self.terminal = True
+            return
+        try:
+            obj = json.loads(raw)
+        except (json.JSONDecodeError, ValueError):
+            if event_name.lower() == "error":
+                self.fail(raw)
+            return
+        if not isinstance(obj, dict):
+            return
+        kind = str(obj.get("type") or event_name).lower()
+        if kind in ("response.completed", "response.incomplete", "message_stop"):
+            self.terminal = True
+        if kind == "response.incomplete" and not self.warning:
+            response = obj.get("response") if isinstance(obj.get("response"), dict) else {}
+            details = response.get("incomplete_details")
+            reason = details.get("reason") if isinstance(details, dict) else None
+            self.warning = f"响应不完整：{reason or '上游标记为 incomplete'}"[:255]
+        choices = obj.get("choices")
+        if isinstance(choices, list):
+            for choice in choices:
+                finish = choice.get("finish_reason") if isinstance(choice, dict) else None
+                if finish:
+                    self.terminal = True
+                    if finish == "content_filter" and not self.warning:
+                        self.warning = "上游内容过滤导致响应提前结束"
+        if kind in ("error", "response.failed") or obj.get("error"):
+            error = obj.get("error")
+            if not error and isinstance(obj.get("response"), dict):
+                error = obj["response"].get("error")
+            if isinstance(error, dict):
+                code = str(error.get("code") or error.get("type") or "").strip()
+                message = str(error.get("message") or error.get("detail") or "").strip()
+                detail = ": ".join(part for part in (code, message) if part)
+            elif isinstance(error, str):
+                detail = error.strip()
+            else:
+                detail = raw
+            self.fail(detail or f"上游 SSE 事件 {kind}")
+
+    def finish(self) -> None:
+        if self._buf:
+            self._frame.extend(self._buf)
+            self._buf.clear()
+        if self._frame:
+            self._consume(bytes(self._frame))
+            self._frame.clear()
+        if not self.failed and not self.terminal:
+            self.fail("上游 SSE 流提前结束（未收到正常结束事件）")
+
+
 def _to_int(value: Any) -> int:
     """安全转 int，非数字返回 0。"""
     try:
