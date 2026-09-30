@@ -115,7 +115,7 @@
   background: var(--terminal-faint);
 }
 
-.log-line {
+.log-row {
   display: grid;
   grid-template-columns: 64px 72px minmax(0, 1fr);
   gap: 0;
@@ -127,7 +127,7 @@
   border-left: 2px solid transparent;
   color: var(--terminal-fg);
   word-break: break-word;
-}.log-line:hover {
+}.log-row:hover {
   background: var(--terminal-hover);
 }.log-time {
   color: var(--terminal-faint);
@@ -146,50 +146,25 @@
   word-break: break-all;
 }
 
-.log-line.is-ok {
+.log-row.is-ok {
   border-left-color: var(--ok);
-}.log-line.is-ok .log-body {
+}.log-row.is-ok .log-body {
   color: var(--ok);
-}.log-line.is-fail {
+}.log-row.is-fail {
   border-left-color: var(--destructive);
-}.log-line.is-fail .log-body {
+}.log-row.is-fail .log-body {
   color: var(--destructive);
-}.log-line.is-warn {
+}.log-row.is-warn {
   border-left-color: var(--warn);
-}.log-line.is-warn .log-body {
+}.log-row.is-warn .log-body {
   color: var(--warn);
-}
-
-:root:not(.dark):not([data-theme="dark"]) .log-line.is-mail,
-[data-theme="light"]:not(.dark) .log-line.is-mail {
-  color: #0f766e;
-}
-
-:root:not(.dark):not([data-theme="dark"]) .log-line.is-inbox,
-[data-theme="light"]:not(.dark) .log-line.is-inbox {
-  color: #0369a1;
-}
-
-:root:not(.dark):not([data-theme="dark"]) .log-line.is-human,
-[data-theme="light"]:not(.dark) .log-line.is-human {
-  color: #6d28d9;
-}
-
-:root:not(.dark):not([data-theme="dark"]) .log-line.is-signup,
-[data-theme="light"]:not(.dark) .log-line.is-signup {
-  color: #a21caf;
-}
-
-:root:not(.dark):not([data-theme="dark"]) .log-line.is-auth,
-[data-theme="light"]:not(.dark) .log-line.is-auth {
-  color: #0f766e;
 }
 
 /*
  * 注册日志标签色：预检 teal · 任务 muted · 入池/出池 cyan
  * 邮箱 cyan · 邮件 blue · 资料 amber · CF violet · 注册 fuchsia · SSO teal · 风控 indigo
  */
-.log-console .log-line {
+.log-console .log-row {
   display: flex;
   flex-wrap: nowrap;
   align-items: baseline;
@@ -421,7 +396,7 @@
   overscroll-behavior: contain;
   -webkit-overflow-scrolling: touch;
 }
-/* 抽屉内简化日志行：避免 :has() 与复杂 4 列 grid（Edge 选择器/布局更贵） */.ops-drawer-body .log-line {
+/* 抽屉内简化日志行：避免 :has() 与复杂 4 列 grid（Edge 选择器/布局更贵） */.ops-drawer-body .log-row {
   display: flex;
   flex-wrap: nowrap;
   align-items: baseline;

@@ -4,11 +4,9 @@ import * as CheckboxPrimitive from "@radix-ui/react-checkbox";
 import * as CollapsiblePrimitive from "@radix-ui/react-collapsible";
 import * as DialogPrimitive from "@radix-ui/react-dialog";
 import * as LabelPrimitive from "@radix-ui/react-label";
-import * as ProgressPrimitive from "@radix-ui/react-progress";
 import * as SelectPrimitive from "@radix-ui/react-select";
 import * as TabsPrimitive from "@radix-ui/react-tabs";
 import * as ToggleGroupPrimitive from "@radix-ui/react-toggle-group";
-import * as TogglePrimitive from "@radix-ui/react-toggle";
 import * as TooltipPrimitive from "@radix-ui/react-tooltip";
 import { Slot } from "@radix-ui/react-slot";
 import { cva, type VariantProps } from "class-variance-authority";
@@ -41,13 +39,10 @@ const buttonVariants = cva(
         secondary:
           "bg-secondary text-secondary-foreground hover:bg-secondary/85",
         ghost: "text-muted-foreground hover:bg-secondary hover:text-foreground font-medium",
-        soft: "bg-accent text-accent-foreground hover:bg-accent/85",
-        link: "text-primary underline-offset-4 hover:underline font-medium active:scale-100",
       },
       size: {
         default: "h-8 px-3.5",
         sm: "h-[30px] rounded-md px-2.5 text-xs font-medium",
-        lg: "h-9 rounded-md px-4 text-sm",
         icon: "size-8",
       },
     },
@@ -102,9 +97,6 @@ const badgeVariants = cva(
           "bg-destructive/10 text-destructive focus-visible:ring-destructive/20 dark:bg-destructive/20 dark:focus-visible:ring-destructive/40 [a]:hover:bg-destructive/20",
         outline:
           "border-border text-foreground [a]:hover:bg-muted [a]:hover:text-muted-foreground",
-        ghost:
-          "hover:bg-muted hover:text-muted-foreground dark:hover:bg-muted/50",
-        link: "text-primary underline-offset-4 hover:underline",
         /** 业务扩展：健康 / 成功 */
         success: "bg-ok/10 text-ok [a]:hover:bg-ok/15 dark:bg-ok/15",
         /** 业务扩展：警告 / 待处理 */
@@ -138,33 +130,6 @@ function Badge({
       className={cn(badgeVariants({ variant }), className)}
       {...props}
     />
-  );
-}
-
-// ---------- Card ----------
-
-function Card({
-  className,
-  interactive = false,
-  ...props
-}: React.ComponentProps<"div"> & { interactive?: boolean }) {
-  return (
-    <div
-      data-slot="card"
-      className={cn(
-        "bg-card text-card-foreground flex flex-col gap-0 rounded-lg border border-border",
-        interactive &&
-          "hover:border-foreground/15 focus-visible:ring-1 focus-visible:ring-ring/40 focus-visible:outline-none",
-        className,
-      )}
-      {...props}
-    />
-  );
-}
-
-function CardContent({ className, ...props }: React.ComponentProps<"div">) {
-  return (
-    <div data-slot="card-content" className={cn("p-5", className)} {...props} />
   );
 }
 
@@ -238,12 +203,6 @@ function Dialog({
   ...props
 }: React.ComponentProps<typeof DialogPrimitive.Root>) {
   return <DialogPrimitive.Root data-slot="dialog" {...props} />;
-}
-
-function DialogTrigger({
-  ...props
-}: React.ComponentProps<typeof DialogPrimitive.Trigger>) {
-  return <DialogPrimitive.Trigger data-slot="dialog-trigger" {...props} />;
 }
 
 function DialogPortal({
@@ -362,14 +321,6 @@ function AlertDialog({
   ...props
 }: React.ComponentProps<typeof AlertDialogPrimitive.Root>) {
   return <AlertDialogPrimitive.Root data-slot="alert-dialog" {...props} />;
-}
-
-function AlertDialogTrigger({
-  ...props
-}: React.ComponentProps<typeof AlertDialogPrimitive.Trigger>) {
-  return (
-    <AlertDialogPrimitive.Trigger data-slot="alert-dialog-trigger" {...props} />
-  );
 }
 
 function AlertDialogPortal({
@@ -715,33 +666,6 @@ export function Pagination({
         </Select>
       </div>
     </div>
-  );
-}
-
-// ---------- Progress ----------
-
-function Progress({
-  className,
-  value,
-  ...props
-}: React.ComponentProps<typeof ProgressPrimitive.Root>) {
-  const pct = Math.min(100, Math.max(0, value ?? 0));
-  return (
-    <ProgressPrimitive.Root
-      data-slot="progress"
-      className={cn(
-        "bg-primary/15 relative h-2 w-full overflow-hidden rounded-full",
-        className,
-      )}
-      value={pct}
-      {...props}
-    >
-      <ProgressPrimitive.Indicator
-        data-slot="progress-indicator"
-        className="bg-primary h-full w-full flex-1 rounded-full"
-        style={{ transform: `translateX(-${100 - pct}%)` }}
-      />
-    </ProgressPrimitive.Root>
   );
 }
 
@@ -1095,19 +1019,6 @@ function TabsTrigger({
   );
 }
 
-function TabsContent({
-  className,
-  ...props
-}: React.ComponentProps<typeof TabsPrimitive.Content>) {
-  return (
-    <TabsPrimitive.Content
-      data-slot="tabs-content"
-      className={cn("flex-1 outline-none", className)}
-      {...props}
-    />
-  );
-}
-
 // ---------- Toggle ----------
 
 const toggleVariants = cva(
@@ -1131,7 +1042,6 @@ const toggleVariants = cva(
       size: {
         default: "h-9 px-2.5 min-w-9",
         sm: "h-8 px-2 min-w-8",
-        lg: "h-10 px-2.5 min-w-10",
       },
     },
     defaultVariants: {
@@ -1140,22 +1050,6 @@ const toggleVariants = cva(
     },
   },
 );
-
-function Toggle({
-  className,
-  variant,
-  size,
-  ...props
-}: React.ComponentProps<typeof TogglePrimitive.Root> &
-  VariantProps<typeof toggleVariants>) {
-  return (
-    <TogglePrimitive.Root
-      data-slot="toggle"
-      className={cn(toggleVariants({ variant, size, className }))}
-      {...props}
-    />
-  );
-}
 
 // ---------- ToggleGroup ----------
 
@@ -1288,7 +1182,6 @@ function TooltipContent({
 
 export {
   AlertDialog,
-  AlertDialogTrigger,
   AlertDialogContent,
   AlertDialogHeader,
   AlertDialogFooter,
@@ -1299,8 +1192,6 @@ export {
   Badge,
   Button,
   buttonVariants,
-  Card,
-  CardContent,
   Checkbox,
   Collapsible,
   CollapsibleTrigger,
@@ -1311,11 +1202,9 @@ export {
   DialogFooter,
   DialogHeader,
   DialogTitle,
-  DialogTrigger,
   Empty,
   Input,
   Label,
-  Progress,
   Select,
   SelectContent,
   SelectItem,
@@ -1331,8 +1220,6 @@ export {
   Tabs,
   TabsList,
   TabsTrigger,
-  TabsContent,
-  Toggle,
   ToggleGroup,
   ToggleGroupItem,
   Toaster,

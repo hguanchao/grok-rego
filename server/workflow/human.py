@@ -59,7 +59,6 @@ class _Profile:
     think_ms: tuple[int, int]  # 思考停顿时长（毫秒）
     read_ms: tuple[int, int]  # 导航/翻页后的阅读停顿（毫秒）
     fidget_rate: float  # 空闲轮询时触发微动的概率
-    scroll_ms: tuple[int, int]  # 分段滚动段间停顿
 
 
 _PROFILES: dict[str, _Profile] = {
@@ -83,7 +82,6 @@ _PROFILES: dict[str, _Profile] = {
         think_ms=(0, 0),
         read_ms=(300, 900),
         fidget_rate=0.08,
-        scroll_ms=(40, 110),
     ),
     # 标准：默认档，曲线 + 偶发错字 + 思考停顿，速度与拟真的平衡点
     "normal": _Profile(
@@ -105,7 +103,6 @@ _PROFILES: dict[str, _Profile] = {
         think_ms=(280, 900),
         read_ms=(700, 1900),
         fidget_rate=0.18,
-        scroll_ms=(60, 180),
     ),
     # 重度：全量拟真，慢但最像人，适合被风控盯上时降速跑
     "heavy": _Profile(
@@ -127,7 +124,6 @@ _PROFILES: dict[str, _Profile] = {
         think_ms=(400, 1400),
         read_ms=(1200, 3000),
         fidget_rate=0.28,
-        scroll_ms=(90, 260),
     ),
 }
 
@@ -195,14 +191,6 @@ def pause_ms(lo: int, hi: int) -> None:
         time.sleep(max(0, lo) / 1000)
         return
     time.sleep(random.randint(lo, hi) / 1000)
-
-
-def pause_seconds(lo: float, hi: float) -> None:
-    """秒级随机停顿。"""
-    if hi <= lo:
-        time.sleep(max(0.0, lo))
-        return
-    time.sleep(random.uniform(lo, hi))
 
 
 class _PageState:
@@ -573,25 +561,8 @@ def _verify_value(locator: Any, expected: str) -> bool:
 
 
 # ────────────────────────────────────────────────────────────────────────────
-# 滚动 / 空闲微动 / 热身
+# 空闲微动 / 热身
 # ────────────────────────────────────────────────────────────────────────────
-
-
-def scroll(page: Any, total: int, segments: int | None = None) -> bool:
-    """分段拟人滚动：一次滚到底太机械，拆成若干段并段间停顿。"""
-    if not enabled() or not total:
-        return False
-    prof = profile()
-    if segments is None:
-        segments = max(2, min(6, abs(total) // 120 + 2))
-    per = total / segments
-    try:
-        for _ in range(segments):
-            page.mouse.wheel(0, per)
-            pause_ms(*prof.scroll_ms)
-        return True
-    except Exception:
-        return False
 
 
 def fidget(page: Any, chance: float | None = None) -> bool:

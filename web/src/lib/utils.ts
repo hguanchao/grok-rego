@@ -246,12 +246,6 @@ export function groupRegisterLogs(entries: LogEntry[]): RegisterLogGroups {
   };
 }
 
-/** 兼容旧调用：主控 + 认证池 + 线程拍平 */
-export function groupLogsByWorker(entries: LogEntry[]): ThreadLogGroup[] {
-  const { main, auth, workers } = groupRegisterLogs(entries);
-  return [main, auth, ...workers].filter((g): g is ThreadLogGroup => g != null);
-}
-
 /** 配置里的代理列表 ↔ 文本框（一行一条，# 开头忽略）。 */
 export function proxiesToText(list: string[] | undefined, fallback = ""): string {
   if (Array.isArray(list) && list.length > 0) {

@@ -107,13 +107,6 @@ def _blocked(url: str, now: float) -> bool:
     return _cool.get(url, 0) > now
 
 
-def has_other(exclude: str) -> bool:
-    """是否还有可选用的其它代理（跳过冷却中的）。"""
-    now = time.monotonic()
-    with _lock:
-        return any(u != exclude and not _blocked(u, now) for u in urls())
-
-
 def pick(*, exclude: str = "") -> str:
     """轮询一条未冷却代理；全部冷却时仍返回一条，避免网关断流。"""
     pool = urls()

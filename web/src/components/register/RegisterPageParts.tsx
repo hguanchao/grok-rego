@@ -1,15 +1,16 @@
 import { useState, type ReactNode } from "react";
 import { CircleHelp, CircleX, Minus, Plus } from "lucide-react";
-import { Badge } from "@/components/ui";
-import { Button } from "@/components/ui";
-import { Input } from "@/components/ui";
-import { Label } from "@/components/ui";
 import {
+  Badge,
+  Button,
+  Input,
+  Label,
   Tooltip,
   TooltipContent,
   TooltipTrigger,
 } from "@/components/ui";
 import {
+  cn,
   groupStatus,
   logBody,
   logLineTone,
@@ -17,7 +18,6 @@ import {
   type GroupStatus,
   type ThreadLogGroup,
 } from "@/lib/utils";
-import { cn } from "@/lib/utils";
 import type { LogEntry } from "@/lib/api";
 
 /** 解析逗号/换行分隔的域名输入，trim 后去空去重 */
@@ -156,7 +156,7 @@ export function LogLineView({ entry }: { entry: LogEntry }) {
   return (
     <div
       className={cn(
-        "log-line",
+        "log-row",
         tone === "fail" && "is-fail",
         tone === "ok" && "is-ok",
         tone === "warn" && "is-warn",

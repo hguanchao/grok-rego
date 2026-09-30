@@ -26,8 +26,7 @@ import {
   TooltipContent,
   TooltipTrigger,
 } from "@/components/ui";
-import type { PoolAccount } from "@/lib/api";
-import { ACCOUNT_STATUS, STATUS_LABELS } from "@/lib/api";
+import { ACCOUNT_STATUS, STATUS_LABELS, type PoolAccount } from "@/lib/api";
 import { cn, formatAccountTime } from "@/lib/utils";
 import {
   ACCOUNT_STATUS_VARIANT,

@@ -18,30 +18,27 @@ import {
   UsersRound,
 } from "lucide-react";
 import { toast } from "sonner";
-import { Button } from "@/components/ui";
 import {
+  Button,
   Collapsible,
   CollapsibleContent,
   CollapsibleTrigger,
-} from "@/components/ui";
-import {
   Dialog,
   DialogContent,
   DialogDescription,
   DialogFooter,
   DialogHeader,
   DialogTitle,
-} from "@/components/ui";
-import { Input } from "@/components/ui";
-import {
+  Empty,
+  Input,
   Select,
   SelectContent,
   SelectItem,
   SelectTrigger,
   SelectValue,
+  ToggleGroup,
+  ToggleGroupItem,
 } from "@/components/ui";
-import { ToggleGroup, ToggleGroupItem } from "@/components/ui";
-import { Empty } from "@/components/ui";
 import {
   DomainListEditor,
   Field,
@@ -143,7 +140,7 @@ export function RegisterPage() {
   // 表单（本地编辑，保存/启动时提交）
   const [mailProvider, setMailProvider] = useState<MailProvider>("cf");
   const [mode, setMode] = useState<"batch" | "single">("single");
-  const [headless, setHeadless] = useState(false);
+  const [headless, setHeadless] = useState(true);
   const [authEnabled, setAuthEnabled] = useState(true);
   const [humanSim, setHumanSim] = useState(true);
   const [humanLevel, setHumanLevel] = useState<HumanLevel>("normal");

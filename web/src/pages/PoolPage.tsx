@@ -13,9 +13,6 @@ import {
   Square,
   Trash2,
 } from "lucide-react";
-import { Button, buttonVariants } from "@/components/ui";
-import { CardContent } from "@/components/ui";
-import { Checkbox } from "@/components/ui";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -25,19 +22,18 @@ import {
   AlertDialogFooter,
   AlertDialogHeader,
   AlertDialogTitle,
-} from "@/components/ui";
-import {
+  Badge,
+  Button,
+  buttonVariants,
+  Checkbox,
   Dialog,
   DialogContent,
   DialogDescription,
   DialogFooter,
   DialogHeader,
   DialogTitle,
-} from "@/components/ui";
-import { Input } from "@/components/ui";
-import { Pagination } from "@/components/ui";
-import { Badge } from "@/components/ui";
-import {
+  Input,
+  Pagination,
   Select,
   SelectContent,
   SelectItem,
@@ -1450,7 +1446,7 @@ export function PoolPage() {
         </div>
 
         <div className="pool-body">
-          <CardContent className="pool-table-body space-y-0">
+          <div className="pool-table-body space-y-0">
             {/* 任务执行进度条（acorn 风格）：名称 · 状态 + done/total + 百分比 + 细进度条；终态保留展示 10s */}
             {activeTask && (
               <div
@@ -1504,7 +1500,7 @@ export function PoolPage() {
                 }}
               />
             </div>
-          </CardContent>
+          </div>
         </div>
       </div>
 

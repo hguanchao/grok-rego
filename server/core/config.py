@@ -72,8 +72,7 @@ HUMAN_LEVELS: tuple[str, ...] = ("light", "normal", "heavy")
 IS_AUTH: bool = True
 
 # === xAI 账号页面 ===
-# redirect=grok-com：注册完成后直接跳转 grok.com（不再停留账号页）
-SIGNUP_URL = "https://accounts.x.ai/sign-up?redirect=grok-com"
+SIGNUP_URL = "https://accounts.x.ai/sign-up"
 
 # === JSON 配置加载（config.json 覆盖默认值）===
 CONFIG_PATH = os.path.join(SERVER_DIR, "config.json")

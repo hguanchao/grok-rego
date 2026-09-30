@@ -1,9 +1,7 @@
 import { useEffect, useRef } from "react";
 import { createPortal } from "react-dom";
 import { Eraser, ScrollText, X } from "lucide-react";
-import { Badge } from "@/components/ui";
-import { Button } from "@/components/ui";
-import { Empty } from "@/components/ui";
+import { Badge, Button, Empty } from "@/components/ui";
 import { type PoolLogEntry } from "@/components/pool/PoolPageParts";
 import { cn, logBody, parseLogTag } from "@/lib/utils";
 
@@ -172,7 +170,7 @@ export function PoolLogDrawer({
               return (
                 <p
                   key={entry.id}
-                  className={cn("log-line", rowTone(entry.level))}
+                  className={cn("log-row", rowTone(entry.level))}
                 >
                   <span className="log-time">{entry.ts.slice(11, 19)}</span>
                   <span className={cn("log-level", status.cls)}>

@@ -67,8 +67,3 @@ export function usePageCache<T>(key: string, initial: () => T): [T, (v: T | Upda
   const value = useSyncExternalStore(subscribe, getSnapshot);
   return [value, setValue];
 }
-
-/** 清空全部页面缓存（如用户登出/重置场景） */
-export function clearPageCache(): void {
-  pageStores.clear();
-}

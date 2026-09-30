@@ -48,6 +48,7 @@ from db import (
 )
 from workflow.browser import (
     extract_sso_cookies,
+    handle_cf_challenge,
     handle_turnstile,
     human_click_locator,
     human_mouse_move,
@@ -160,6 +161,11 @@ SSO_POLL_INTERVAL = 1.0  # SSO cookie 轮询间隔（秒）
 SSO_CONTINUE_INTERVAL = 6.0  # 等待期间点「继续」推进的间隔（秒）
 RELOAD_SETTLE_MS = 3000  # 刷新页面后的静置等待（毫秒）
 DEBUG_DIR = os.path.join(config.LOG_DIR, "debug")
+PREFLIGHT_CF_WAIT = 45  # 预检全页拦截最长等待（秒）
+PREFLIGHT_TURNSTILE_WAIT = 30  # 预检 Turnstile widget 最长等待（秒）
+PREFLIGHT_TURNSTILE_COOL = 300.0  # 未过 Turnstile 的出口冷却（秒），避免注册线程再绑到坏节点
+PREFLIGHT_TURNSTILE_MAX_NODES = 3  # 预检最多开几次浏览器探测出口
+PREFLIGHT_SIGNUP_WAIT = 12  # Turnstile 过后等待注册落地页出现（秒）
 # 资料表单姓名框：只认明确字段，禁止兜底 input[type=text]（会误填邮箱/验证码）
 FORM_FIRST_SELECTORS = [
     "input[name='givenName']",
@@ -1434,18 +1440,146 @@ def _mail_base_url() -> str:
     return (config.CF_API_BASE or "").strip().rstrip("/")
 
 
-def preflight_check() -> bool:
-    """注册前预检（主控线程调用）：注册入口、grok.com、邮箱 API。
+def _preflight_signup_ready(page: Any) -> bool:
+    """预检通过人机后，注册入口是否已落地（邮箱框或社交注册页）。"""
+    return _has_input(page, "input[type='email']") or _is_signup_landing(page)
 
-    只做 HTTP 探测，不开浏览器。人机验证由正式注册窗口处理。
-    任一项不通过返回 False，调用方应中止注册任务。
+
+def _wait_preflight_signup(page: Any, timeout: float | None = None) -> bool:
+    """Turnstile 跳过后页面可能还在渲染，短等落地页。"""
+    deadline = time.monotonic() + (PREFLIGHT_SIGNUP_WAIT if timeout is None else timeout)
+    while time.monotonic() < deadline:
+        if _is_closed(page) or is_cancelled():
+            return False
+        if _preflight_signup_ready(page):
+            return True
+        time.sleep(0.4)
+    return _preflight_signup_ready(page)
+
+
+def _probe_signup_cf(headless: bool) -> bool:
+    """用当前线程绑定的出口打开注册页，过 Cloudflare 全页拦截 / Turnstile。
+
+    落地页没有 widget 也算通过（节点能打开 accounts.x.ai）。
+    全页拦截卡住或 widget 校验失败则判定该出口过不了人机。
+    """
+    from core import proxypool
+
+    t0 = time.monotonic()
+    node = proxypool.redact(proxypool.current()) or "直连"
+    if is_cancelled():
+        return False
+    try:
+        with Camoufox(**_camoufox_kwargs(headless)) as browser:
+            _track_browser(browser)
+            try:
+                if is_cancelled():
+                    return False
+                page = _open_page(browser)
+                try:
+                    page.goto(
+                        config.SIGNUP_URL,
+                        wait_until="domcontentloaded",
+                        timeout=config.GOTO_TIMEOUT,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"[预检] 注册页导航异常  {type(e).__name__}: {e}  · {elapsed_label(t0)}"
+                    )
+                    try:
+                        dead = page.query_selector("body") is None
+                    except Exception:
+                        dead = True
+                    if dead:
+                        logger.error(
+                            f"[预检] Cloudflare Turnstile 未通过  注册页打开失败  {node}  · {elapsed_label(t0)}"
+                        )
+                        return False
+                try_click_cookies(page)
+                if not handle_cf_challenge(page, max_wait=PREFLIGHT_CF_WAIT):
+                    logger.error(
+                        f"[预检] Cloudflare 全页拦截未通过  {node}  · {elapsed_label(t0)}"
+                    )
+                    _dump_page(page, "preflight-cf-failed")
+                    return False
+                result = handle_turnstile(page, max_wait=PREFLIGHT_TURNSTILE_WAIT)
+                if result not in ("passed", "skipped"):
+                    logger.error(
+                        f"[预检] Cloudflare Turnstile 未通过  {node}  {result}  · {elapsed_label(t0)}"
+                    )
+                    _dump_page(page, "preflight-turnstile-failed")
+                    return False
+                if not _wait_preflight_signup(page):
+                    logger.error(
+                        f"[预检] Cloudflare Turnstile 后未进入注册页  {node}  · {elapsed_label(t0)}"
+                    )
+                    _dump_page(page, "preflight-signup-missing")
+                    return False
+                label = "已通过" if result == "passed" else "未出现（页面可访问）"
+                logger.success(
+                    f"[预检] Cloudflare Turnstile {label}  {node}  · {elapsed_label(t0)}"
+                )
+                return True
+            finally:
+                _untrack_browser(browser)
+    except Exception as e:
+        logger.error(
+            f"[预检] Cloudflare Turnstile 探测异常  {node}  {type(e).__name__}: {e}  · {elapsed_label(t0)}"
+        )
+        return False
+
+
+def _check_turnstile(headless: bool = True) -> bool:
+    """按出口探测 Cloudflare Turnstile：任一条通过即预检通过。
+
+    未通过的远端出口写入冷却，避免注册线程再绑上去。
+    代理池超过 PREFLIGHT_TURNSTILE_MAX_NODES 条时只探前面几条，避免预检拖太久。
+    """
+    from core import proxypool
+
+    pool = proxypool.urls()
+    candidates = (pool or [""])[:PREFLIGHT_TURNSTILE_MAX_NODES]
+    if pool and len(pool) > len(candidates):
+        logger.warning(
+            f"[预检] 代理池 {len(pool)} 条，Cloudflare Turnstile 仅探测前 {len(candidates)} 条"
+        )
+    last_node = ""
+    for index, proxy in enumerate(candidates, start=1):
+        if is_cancelled():
+            logger.warning("[预检] 已取消，跳过 Cloudflare Turnstile 检测")
+            return False
+        last_node = proxypool.redact(proxy) if proxy else "直连"
+        logger.info(
+            f"[预检] Cloudflare Turnstile 出口 {index}/{len(candidates)}  {last_node}"
+        )
+        proxypool.bind(proxy or None)
+        try:
+            if _probe_signup_cf(headless):
+                return True
+        finally:
+            proxypool.unbind()
+        if proxy:
+            proxypool.mark_fail(proxy, PREFLIGHT_TURNSTILE_COOL)
+            logger.warning(
+                f"[预检] 出口未过 Cloudflare Turnstile，已冷却 {int(PREFLIGHT_TURNSTILE_COOL)}s  {last_node}"
+            )
+    logger.error(
+        f"[预检] Cloudflare Turnstile 未通过  {last_node or '全部出口'}"
+    )
+    return False
+
+
+def preflight_check(headless: bool = True) -> bool:
+    """注册前预检（主控线程调用）：代理、注册入口、邮箱 API、Cloudflare Turnstile。
+
+    HTTP 连通通过后再开浏览器走一遍注册页人机：全页拦截或 Turnstile 过不了则中止，
+    避免坏节点把整轮注册任务烧掉。任一项不通过返回 False。
     """
     logger.debug(f"[预检] {human_describe()}")
     mail_base = _mail_base_url()
     results = {
         "proxy": _check_proxy(),
         "注册入口": _check_reachable(config.SIGNUP_URL, "注册入口"),
-        "grok.com": _check_reachable("https://grok.com/", "grok.com"),
         "邮箱服务": _check_reachable(mail_base, "邮箱服务") if mail_base else False,
     }
     if not mail_base:
@@ -1453,6 +1587,9 @@ def preflight_check() -> bool:
     failed = [name for name, ok in results.items() if not ok]
     if failed:
         logger.error(f"[预检] 未通过：{', '.join(failed)}，任务中止")
+        return False
+    if not _check_turnstile(headless=headless):
+        logger.error("[预检] 未通过：Cloudflare Turnstile，任务中止")
         return False
     return True
 
@@ -1541,7 +1678,7 @@ def run_signups(
     init_db()
     worker_count = max(1, min(int(threads), int(count), 20))
     total = max(1, min(int(count), 100))
-    if not preflight_check():
+    if not preflight_check(headless=headless):
         return 0
     logger.info(f"[任务] 注册阶段开始: {total} 账号 / {worker_count} 线程")
     success_count = 0

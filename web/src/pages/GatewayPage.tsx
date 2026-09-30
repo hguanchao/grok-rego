@@ -601,7 +601,7 @@ export function GatewayPage() {
                           a.disabled
                             ? "is-strikes"
                             : a.cooling
-                              ? "is-cool"
+                              ? "is-cooling"
                               : a.dumbed
                                 ? "is-dumbed"
                                 : a.sticky
@@ -638,7 +638,7 @@ export function GatewayPage() {
                             a.disabled
                               ? "is-strikes"
                               : a.cooling
-                                ? "is-cool"
+                                ? "is-cooling"
                                 : a.dumbed
                                   ? "is-dumbed"
                                   : a.sticky

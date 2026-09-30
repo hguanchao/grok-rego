@@ -493,21 +493,6 @@ export async function fetchGatewayOps(): Promise<GatewayOpsData> {
   return request<GatewayOpsData>("/api/gateway/ops");
 }
 
-export interface GatewayProbe {
-  ok: boolean;
-  status: number;
-  ms: number;
-  models: number;
-  error: string;
-}
-
-export async function probeGateway(): Promise<GatewayProbe> {
-  return request<GatewayProbe>("/api/gateway/probe", {
-    method: "POST",
-    body: JSON.stringify({}),
-  });
-}
-
 // ─── 用量统计 ─────────────────────────────────────────────
 
 export interface UsageRow {

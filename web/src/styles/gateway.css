@@ -382,48 +382,8 @@
   overflow: auto;
   flex: 1;
 }
-.gw-acct-card {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px 12px;
-  padding: 10px 12px;
-  border-radius: var(--radius-md);
-  border: 1px solid var(--border);
-  background: color-mix(in srgb, var(--muted) 22%, transparent);
-  transition:
-    border-color var(--ap-dur-fast, 140ms) ease,
-    background-color var(--ap-dur-fast, 140ms) ease;
-}
-.gw-acct-card.is-cooling {
-  border-color: color-mix(in srgb, var(--warn) 40%, var(--border));
-  background: color-mix(in srgb, var(--warn) 8%, transparent);
-}
-.gw-acct-card.is-strikes {
-  border-color: color-mix(in srgb, var(--destructive) 30%, var(--border));
-  background: color-mix(in srgb, var(--destructive) 6%, transparent);
-}
-.gw-acct-main {
-  min-width: 0;
-  flex: 1;
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-}
-.gw-acct-id {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-}
-.gw-acct-badge {
-  font-family: var(--font-mono);
-  font-size: 12px;
-  font-weight: 600;
-  color: var(--foreground);
-  font-variant-numeric: tabular-nums;
-}
 .gw-acct-state {
+  justify-self: end;
   font-size: 10px;
   letter-spacing: 0.06em;
   text-transform: uppercase;
@@ -462,38 +422,6 @@
   color: var(--ok);
   border-color: color-mix(in srgb, var(--ok) 35%, var(--border));
   background: color-mix(in srgb, var(--ok) 10%, transparent);
-}
-.gw-acct-email {
-  font-family: var(--font-mono);
-  font-size: 12px;
-  color: var(--muted-foreground);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  max-width: 100%;
-}
-.gw-acct-meta {
-  display: inline-flex;
-  flex-wrap: wrap;
-  gap: 6px;
-  justify-content: flex-end;
-}
-.gw-acct-tag {
-  font-family: var(--font-mono);
-  font-size: 11px;
-  padding: 2px 7px;
-  border-radius: 4px;
-  border: 1px solid var(--border);
-  color: var(--muted-foreground);
-  font-variant-numeric: tabular-nums;
-}
-.gw-acct-tag.is-warn {
-  color: var(--warn);
-  border-color: color-mix(in srgb, var(--warn) 35%, var(--border));
-}
-.gw-acct-tag.is-sticky {
-  color: var(--primary);
-  border-color: color-mix(in srgb, var(--primary) 35%, var(--border));
 }
 
 /* 账号运行态：三列网格（#ID / 邮箱 / 状态，无表头） */
@@ -540,9 +468,6 @@
 .gw-usage-badge {
   font-family: var(--font-mono);
   font-variant-numeric: tabular-nums;
-}
-.gw-acct-state {
-  justify-self: end;
 }
 
 .gw-empty-sub {

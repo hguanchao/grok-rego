@@ -533,20 +533,6 @@
   }
 }
 
-/* 号池任务进度条：账号列表上方（运行中显示） */
-.pool-task-progress {
-  flex-shrink: 0;
-  padding: 8px 14px;
-  border-bottom: 1px solid var(--border);
-  background: color-mix(in srgb, var(--primary) 4%, var(--card));
-}
-.pool-task-progress-stack > .pool-task-progress:not(:last-child) {
-  border-bottom: 0;
-}
-.pool-task-progress-stack > .pool-task-progress + .pool-task-progress {
-  border-top: 1px solid var(--border);
-}
-
 /* 号池工具栏刷新按钮 */
 .pool-refresh-btn {
   min-width: 4.75rem;

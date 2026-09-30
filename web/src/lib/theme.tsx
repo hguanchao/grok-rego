@@ -15,7 +15,6 @@ type ThemeContextValue = {
   theme: ThemeMode
   resolved: 'light' | 'dark'
   setTheme: (theme: ThemeMode) => void
-  cycleTheme: () => void
 }
 
 const STORAGE_KEY = 'gr-theme'
@@ -77,12 +76,6 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
     applyDomTheme(r)
   }, [])
 
-  const cycleTheme = useCallback(() => {
-    const order: ThemeMode[] = ['light', 'dark', 'system']
-    const idx = order.indexOf(theme)
-    setTheme(order[(idx + 1) % order.length])
-  }, [setTheme, theme])
-
   // paint 前再对齐一次，防止 StrictMode / 热更新丢 class
   useLayoutEffect(() => {
     applyDomTheme(resolved)
@@ -102,8 +95,8 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
   }, [theme])
 
   const value = useMemo(
-    () => ({ theme, resolved, setTheme, cycleTheme }),
-    [theme, resolved, setTheme, cycleTheme],
+    () => ({ theme, resolved, setTheme }),
+    [theme, resolved, setTheme],
   )
 
   return <ThemeContext.Provider value={value}>{children}</ThemeContext.Provider>
