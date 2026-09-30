@@ -32,9 +32,11 @@ from core.logger import logger
 from core.util import (
     curl_error_code,
     decode_jwt_exp,
+    format_upstream_error,
     grok_user_agent,
     iso_after_hours,
     now_iso_tz,
+    read_upstream_body,
     retry_after_seconds,
     upstream_text,
 )
@@ -348,49 +350,18 @@ def _map_body_model(body: bytes) -> bytes:
     return json.dumps(payload, ensure_ascii=False).encode("utf-8")
 
 
-# 粘性选号：请求头 x-grok-session-id（会话稳定）。prompt_cache_key 只给上游缓存，不参与选号
-# （main turn 的 cache_key 是 conv-id，side-call 是 session-id，用体会跳号）
-_SESSION_BODY_KEYS = ("conversation_id", "session_id", "previous_response_id")
-_SESSION_HEADERS = (
-    "x-grok-session-id",
-    "x-grok-conv-id",
+# 粘性选号必须跟上游前缀缓存同一把钥匙：优先 session-id（grok-build 根会话），
+# 再 conv-id。side-call 的 conv-id 是 recap-/btw-/perm- 独立值，用它选号会把
+# 同一会话打到不同账号，缓存命中率被摊薄。
+_SESSION_BODY_KEYS = (
+    "prompt_cache_key",
+    "session_id",
+    "conversation_id",
+    "previous_response_id",
 )
+_PROMPT_CACHE_KEY_MAX = 64
 _REASONING_SUMMARY = "concise"
 _DEFAULT_REASONING_EFFORT = "high"
-
-
-def _session_key(handler: BaseHTTPRequestHandler, body: bytes) -> str:
-    """粘性选号键：优先请求头 x-grok-session-id（grok-build 会话稳定 id）。
-
-    无 grok 头时才用体字段 / 首条用户消息哈希（非 CLI 客户端兜底）。
-    """
-    for name in _SESSION_HEADERS:
-        value = (handler.headers.get(name) or "").strip()
-        if value and value.lower() not in {"null", "undefined", "none"}:
-            return f"h:{name}:{value[:128]}"
-    if not body:
-        return ""
-    try:
-        payload = json.loads(body.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError):
-        return ""
-    if not isinstance(payload, dict):
-        return ""
-    for key in _SESSION_BODY_KEYS:
-        value = payload.get(key)
-        if isinstance(value, str) and value.strip():
-            return f"b:{key}:{value.strip()[:128]}"
-    conversation = payload.get("conversation")
-    if isinstance(conversation, dict):
-        value = conversation.get("id")
-        if isinstance(value, str) and value.strip():
-            return f"b:conversation.id:{value.strip()[:128]}"
-    if isinstance(conversation, str) and conversation.strip():
-        return f"b:conversation:{conversation.strip()[:128]}"
-    digest = _first_user_hash(payload)
-    if digest:
-        return f"c:{digest}"
-    return ""
 
 
 def _header_value(handler: BaseHTTPRequestHandler, name: str) -> str:
@@ -400,20 +371,67 @@ def _header_value(handler: BaseHTTPRequestHandler, name: str) -> str:
     return value
 
 
-def _stable_cache_key(handler: BaseHTTPRequestHandler, payload: dict[str, Any]) -> str:
-    """Responses 前缀缓存键：对齐 grok-build CreateResponse（已有 key，否则 conv-id）。"""
-    existing = payload.get("prompt_cache_key")
-    if isinstance(existing, str) and existing.strip():
-        return existing.strip()
-    for name in ("x-grok-conv-id", "x-grok-session-id", "x-conversation-id"):
-        value = _header_value(handler, name)
-        if value:
-            return value
-    for key in ("conversation_id", "session_id"):
+def _body_session_id(payload: dict[str, Any]) -> str:
+    for key in _SESSION_BODY_KEYS:
         value = payload.get(key)
         if isinstance(value, str) and value.strip():
             return value.strip()
+    conversation = payload.get("conversation")
+    if isinstance(conversation, dict):
+        value = conversation.get("id")
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    if isinstance(conversation, str) and conversation.strip():
+        return conversation.strip()
     return ""
+
+
+def _session_identity(handler: BaseHTTPRequestHandler, payload: dict[str, Any] | None) -> str:
+    """根会话身份：session-id > prompt_cache_key > conv-id > 体字段。"""
+    for name in ("x-grok-session-id", "x-session-id"):
+        value = _header_value(handler, name)
+        if value:
+            return value
+    if payload:
+        existing = payload.get("prompt_cache_key")
+        if isinstance(existing, str) and existing.strip():
+            return existing.strip()
+    for name in ("x-grok-conv-id", "x-conversation-id"):
+        value = _header_value(handler, name)
+        if value:
+            return value
+    if payload:
+        return _body_session_id(payload)
+    return ""
+
+
+def _session_key(handler: BaseHTTPRequestHandler, body: bytes) -> str:
+    """粘性选号键：同一根会话固定同一账号，side-call 也跟主 turn 共用。"""
+    payload: dict[str, Any] | None = None
+    if body:
+        try:
+            parsed = json.loads(body.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            parsed = None
+        if isinstance(parsed, dict):
+            payload = parsed
+    ident = _session_identity(handler, payload)
+    if ident:
+        return f"s:{ident[:128]}"
+    if payload:
+        digest = _first_user_hash(payload)
+        if digest:
+            return f"c:{digest}"
+    return ""
+
+
+def _stable_cache_key(handler: BaseHTTPRequestHandler, payload: dict[str, Any]) -> str:
+    """上游 prompt_cache_key：已有 key 原样保留，否则用根会话身份（限 64 字符）。"""
+    existing = payload.get("prompt_cache_key")
+    if isinstance(existing, str) and existing.strip():
+        return existing.strip()[:_PROMPT_CACHE_KEY_MAX]
+    ident = _session_identity(handler, payload)
+    return ident[:_PROMPT_CACHE_KEY_MAX] if ident else ""
 
 
 def _looks_reasoning_model(model: Any) -> bool:
@@ -424,8 +442,8 @@ def _looks_reasoning_model(model: Any) -> bool:
 def _ensure_prompt_cache_and_reasoning(
     body: bytes, handler: BaseHTTPRequestHandler, path: str
 ) -> bytes:
-    """Responses 缺字段时按 grok-build 补缓存键、reasoning、store、include。"""
-    if not body or "/responses" not in path:
+    """缺字段时补 prompt_cache_key；/responses 再按 grok-build 补 reasoning/store/include。"""
+    if not body:
         return body
     try:
         payload = json.loads(body.decode("utf-8"))
@@ -440,6 +458,11 @@ def _ensure_prompt_cache_and_reasoning(
     if cache_key and (not isinstance(existing, str) or not existing.strip()):
         payload["prompt_cache_key"] = cache_key
         changed = True
+
+    if "/responses" not in path:
+        if not changed:
+            return body
+        return json.dumps(payload, ensure_ascii=False).encode("utf-8")
 
     reasoning = payload.get("reasoning")
     if not isinstance(reasoning, dict):
@@ -1006,6 +1029,7 @@ def _proxy_direct(
     t0 = time.monotonic()
     bytes_out = 0
     status = 502
+    error_body = b""
     err: str | None = None
     upstream: requests.Response | None = None
     response_started = False
@@ -1027,6 +1051,7 @@ def _proxy_direct(
     try:
         while True:
             status = 502
+            error_body = b""
             is_stream = False
             raw_chunks = None
             first_raw_chunk = b""
@@ -1040,13 +1065,21 @@ def _proxy_direct(
                     **_proxy_kwargs(used_proxy),
                 )
                 status = int(upstream.status_code)
+                error_body = b""
                 if 200 <= status < 300:
                     _mark_account_ok(account_id)
                     attempts.append({"account": who, "status": status, "error": "", "wait_seconds": 0})
                 else:
-                    detail = " ".join(upstream_text(upstream.content).split())[:220]
+                    # stream=True 时 .content 为空，必须把 iter_content 队列读完才能看到 429 JSON
+                    error_body = read_upstream_body(upstream)
                     retry_after = upstream.headers.get("Retry-After")
-                    quota_reason = _quota_error_reason(status, upstream.content)
+                    detail = format_upstream_error(
+                        status,
+                        error_body,
+                        reason=str(getattr(upstream, "reason", "") or ""),
+                        retry_after=retry_after,
+                    )
+                    quota_reason = _quota_error_reason(status, error_body)
                     if status == 429:
                         rate_limit_attempts += 1
                     retry_wait = retry_after_seconds(retry_after)
@@ -1054,25 +1087,22 @@ def _proxy_direct(
                         {
                             "account": who,
                             "status": status,
-                            "error": (detail or f"HTTP {status}")[:255],
+                            "error": detail[:255],
                             "wait_seconds": 0,
                             "retry_after_seconds": int(retry_wait) if retry_wait is not None else None,
                         }
                     )
                     logger.warning(
                         f"[Grok网关] request={request_id} 上游拒绝 {method} {path} {who} HTTP {status} "
-                        f"account_attempt={account_retry_count + 1}\n"
-                        f"{detail or '上游未提供错误详情'}"
+                        f"account_attempt={account_retry_count + 1}"
+                        f"{f' Retry-After={retry_after}' if retry_after else ''}\n"
+                        f"{upstream_text(error_body) or detail}"
                     )
-                    err = (
-                        f"upstream_{status}:{detail}"
-                        if detail
-                        else f"HTTP {status}：上游未提供错误详情"
-                    )[:255]
+                    err = f"upstream_{status}:{detail}"[:255]
 
                     if status >= 400:
                         _apply_upstream_cooldown(
-                            account_id, who, status, upstream.content, retry_after
+                            account_id, who, status, error_body, retry_after
                         )
                     if (
                         status in _RETRYABLE_UPSTREAM_STATUS
@@ -1206,12 +1236,15 @@ def _proxy_direct(
                         f"[Grok网关] request={request_id} 流式上游警告 {method} {path}: {err}"
                     )
         else:
-            payload = upstream.content or b""
-            bytes_out = len(payload)
+            payload = error_body or read_upstream_body(upstream)
             ctype = upstream.headers.get("Content-Type") or "application/json; charset=utf-8"
             # 非流式：对上游响应整包解析 usage
             if 200 <= status < 300:
                 usage = extract_nonstream(payload)
+            elif not payload:
+                payload = _openai_error(err or format_upstream_error(status, b""), status)
+                ctype = "application/json; charset=utf-8"
+            bytes_out = len(payload)
             _send_bytes(handler, status, payload, ctype, extra)
     except (BrokenPipeError, ConnectionError, ConnectionResetError, ConnectionAbortedError):
         # 上游已成功（2xx）时属客户端提前断开；非 2xx 保留上游错误原因。

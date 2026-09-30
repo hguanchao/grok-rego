@@ -550,6 +550,9 @@ export interface UsageSummary {
   total_tokens: number;
   success_rate: number;
   cache_hit_rate: number;
+  cache_hit_requests?: number;
+  prompt_requests?: number;
+  cache_request_rate?: number;
   reasoning_share: number;
 }
 

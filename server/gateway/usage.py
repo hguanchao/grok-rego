@@ -121,6 +121,22 @@ class StreamOutcome:
             self.fail("上游 SSE 流提前结束（未收到正常结束事件）")
 
 
+def _sse_line_complete(line: bytes) -> bool:
+    """SSE data 行是否已是完整 JSON。嵌套对象中间的 } 不算完整。"""
+    text = line.decode("utf-8", "replace")
+    marker = text.find("data:")
+    if marker < 0:
+        return True
+    data = text[marker + 5 :].strip()
+    if data in {"", "[DONE]"}:
+        return True
+    try:
+        json.loads(data)
+        return True
+    except (json.JSONDecodeError, ValueError):
+        return False
+
+
 def _to_int(value: Any) -> int:
     """安全转 int，非数字返回 0。"""
     try:
@@ -145,12 +161,20 @@ def _openai_usage(usage: Any) -> dict[str, int]:
     details = usage.get("prompt_tokens_details")
     if isinstance(details, dict):
         cache += _to_int(details.get("cached_tokens"))
+        if not cache:
+            cache += _to_int(details.get("cached_prompt_tokens"))
     # Responses API：缓存命中字段是 input_tokens_details.cached_tokens（OpenAI Chat 才是 prompt_tokens_details）
     # 两者互斥出现，未从 prompt 侧取到缓存时再查 input 侧，避免漏计缓存命中
     if not cache:
         i_details = usage.get("input_tokens_details")
         if isinstance(i_details, dict):
             cache += _to_int(i_details.get("cached_tokens"))
+            if not cache:
+                cache += _to_int(i_details.get("cached_prompt_tokens"))
+    if not cache:
+        cache = _to_int(usage.get("cached_tokens")) or _to_int(
+            usage.get("prompt_cache_hit_tokens")
+        ) or _to_int(usage.get("cached_prompt_tokens"))
     c_details = usage.get("completion_tokens_details")
     if isinstance(c_details, dict):
         reason += _to_int(c_details.get("reasoning_tokens"))
@@ -273,17 +297,19 @@ class StreamUsageAccumulator:
         """喂入一个响应块并解析其中的 usage 片段。"""
         if not chunk:
             return
-        # 上一块末尾可能残留不完整行，拼接到当前第一行（同一 data 行被拆包）
-        lines = chunk.split(b"\n")
-        if self._buf:
-            lines[0] = bytes(self._buf) + lines[0]
-        self._buf = bytearray()
-        for i, line in enumerate(lines):
+        self._buf.extend(chunk)
+        while True:
+            sep = self._buf.find(b"\n")
+            if sep < 0:
+                break
+            line = bytes(self._buf[:sep])
+            del self._buf[: sep + 1]
             if not line.strip():
                 continue
-            # 最后一行且不以 } 结尾 → 可能不完整，暂存等下一块拼接；否则立即解析
-            if i == len(lines) - 1 and not line.rstrip().endswith(b"}"):
-                self._buf.extend(line)
+            if not _sse_line_complete(line):
+                # 半包 JSON：把后续缓冲拼回去，等下一 chunk
+                rest = bytes(self._buf)
+                self._buf = bytearray(line + b"\n" + rest)
                 break
             self._consume_line(line)
         if len(self._buf) > _MAX_BUFFER:
@@ -332,7 +358,12 @@ class StreamUsageAccumulator:
         return None
 
     def result(self) -> dict[str, int]:
-        """流结束后的最终用量。"""
+        """流结束后的最终用量。残留半行若已完整则补解析。"""
+        if self._buf:
+            leftover = bytes(self._buf)
+            self._buf = bytearray()
+            if _sse_line_complete(leftover):
+                self._consume_line(leftover)
         return {
             "prompt_tokens": self._prompt,
             "completion_tokens": self._completion,

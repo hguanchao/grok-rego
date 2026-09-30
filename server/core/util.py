@@ -212,6 +212,60 @@ def compact_text(body: str | bytes | None, limit: int = 160) -> str:
     return text[:limit].rstrip() + "…"
 
 
+def read_upstream_body(response: Any, *, chunk_size: int = 4096) -> bytes:
+    """读完上游 HTTP 正文。
+
+    curl_cffi 在 ``stream=True`` 时 ``response.content`` 保持空字节，
+    429/4xx JSON 只出现在 ``iter_content`` 队列里。非流式响应直接返回
+    已缓存的 ``content``。读完后写回 ``response.content``，后续代码
+    不必再分叉。已排空的流不再二次 ``iter_content``，避免空队列阻塞。
+    """
+    cached = getattr(response, "content", None)
+    if isinstance(cached, (bytes, bytearray)) and cached:
+        return bytes(cached)
+    if getattr(response, "_body_drained", False) or getattr(response, "_stream_closed", False):
+        return bytes(cached) if isinstance(cached, (bytes, bytearray)) else b""
+    queue = getattr(response, "queue", None)
+    curl = getattr(response, "curl", None)
+    if queue is None or curl is None:
+        return bytes(cached) if isinstance(cached, (bytes, bytearray)) else b""
+    try:
+        chunks = response.iter_content(chunk_size=chunk_size)
+    except (AssertionError, AttributeError, TypeError, ValueError):
+        return b""
+    if chunks is None:
+        return b""
+    body = b"".join(chunk for chunk in chunks if chunk)
+    try:
+        response.content = body
+        response._body_drained = True
+    except (AttributeError, TypeError):
+        pass
+    return body
+
+
+def format_upstream_error(
+    status: int,
+    body: str | bytes | None,
+    *,
+    reason: str = "",
+    retry_after: str | None = None,
+    limit: int = 220,
+) -> str:
+    """上游非 2xx 的可读摘要：优先正文，否则状态短语和 Retry-After。"""
+    snippet = compact_text(body, limit)
+    if snippet:
+        return snippet
+    parts = [f"HTTP {status}"]
+    phrase = str(reason or "").strip()
+    if phrase:
+        parts.append(phrase)
+    ra = str(retry_after or "").strip()
+    if ra:
+        parts.append(f"Retry-After={ra}")
+    return " ".join(parts)
+
+
 def retry_after_seconds(value: str | None) -> float | None:
     """解析 Retry-After 秒数或 HTTP 日期，异常值不参与冷却。"""
     raw = str(value or "").strip()

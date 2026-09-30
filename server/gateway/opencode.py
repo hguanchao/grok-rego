@@ -26,7 +26,14 @@ from core import config
 from core import proxypool
 from core.logger import logger
 from core.http_body import RequestBodyTooLarge, read_request_body
-from core.util import compact_text, curl_error_code, now_iso_tz, retry_after_seconds
+from core.util import (
+    curl_error_code,
+    format_upstream_error,
+    now_iso_tz,
+    read_upstream_body,
+    retry_after_seconds,
+    upstream_text,
+)
 from db import insert_usage
 from gateway import egress
 from gateway.paths import ensure_local_v1, resource_path, upstream_url
@@ -718,6 +725,7 @@ def proxy(handler: BaseHTTPRequestHandler, method: str, path: str) -> None:
     t0 = time.monotonic()
     bytes_out = 0
     status = 502
+    error_body = b""
     err: str | None = None
     upstream: requests.Response | None = None
     response_started = False
@@ -749,10 +757,24 @@ def proxy(handler: BaseHTTPRequestHandler, method: str, path: str) -> None:
                     **_proxy_kwargs(used_proxy),
                 )
                 status = int(upstream.status_code)
+                error_body = b""
+                if not (200 <= status < 300):
+                    # stream=True 时 .content 为空，4xx JSON 只在 iter_content 队列里
+                    error_body = read_upstream_body(upstream)
                 attempts.append(
                     {
                         "status": status,
-                        "error": "" if 200 <= status < 300 else compact_text(upstream.content, 180),
+                        "error": (
+                            ""
+                            if 200 <= status < 300
+                            else format_upstream_error(
+                                status,
+                                error_body,
+                                reason=str(getattr(upstream, "reason", "") or ""),
+                                retry_after=upstream.headers.get("Retry-After"),
+                                limit=180,
+                            )
+                        ),
                         "wait_seconds": 0,
                         "retry_after_seconds": retry_after_seconds(
                             upstream.headers.get("Retry-After")
@@ -864,19 +886,20 @@ def proxy(handler: BaseHTTPRequestHandler, method: str, path: str) -> None:
                         f"[网关] request={request_id} 流式上游警告 {method} {path}: {err}"
                     )
         else:
-            payload = upstream.content or b""
-            if not 200 <= status < 300 and not payload:
-                # stream=True 时部分栈上 4xx 的 .content 为空，把剩余块拼回来才能看到真实错误
-                payload = b"".join(upstream.iter_content(chunk_size=4096) or ())
+            payload = error_body or read_upstream_body(upstream)
             if not 200 <= status < 300:
-                snippet = compact_text(payload, 220)
-                phrase = str(getattr(upstream, "reason", "") or "").strip()
-                detail = snippet or phrase or "上游未提供错误详情"
+                detail = format_upstream_error(
+                    status,
+                    payload,
+                    reason=str(getattr(upstream, "reason", "") or ""),
+                    retry_after=upstream.headers.get("Retry-After"),
+                )
                 err = f"upstream_{status}:{detail}"[:255]
                 logger.warning(
                     f"[网关] request={request_id} 上游非 2xx {method} {path} via={forward_path} "
                     f"model={model or '-'} status={status} in={len(forward_body)} "
-                    f"out={len(payload)} effort={effort_flag or '-'} err={detail}"
+                    f"out={len(payload)} effort={effort_flag or '-'} "
+                    f"err={upstream_text(payload) or detail}"
                 )
             if 200 <= status < 300 and resource_path(path, "/zen") == "/models":
                 payload = _filter_free_models(payload)
@@ -909,16 +932,23 @@ def proxy(handler: BaseHTTPRequestHandler, method: str, path: str) -> None:
                         payload = json.dumps(
                             chat_to_message(obj, model), ensure_ascii=False
                         ).encode("utf-8")
-            elif status >= 400 and anthropic_client:
-                # 透传上游真实错误（仅转 Anthropic 错误包络，不吞错误信息）
-                payload = _wrap_upstream_error(payload, True, status)
+            elif status >= 400:
+                # 透传上游真实错误（Anthropic 客户端换包络；空 body 用摘要填上）
+                if anthropic_client:
+                    payload = (
+                        _wrap_upstream_error(payload, True, status)
+                        if payload
+                        else _anthropic_error(err or format_upstream_error(status, b""), status)
+                    )
+                elif not payload:
+                    payload = _openai_error(err or format_upstream_error(status, b""), status)
             bytes_out = len(payload)
             ctype = "application/json; charset=utf-8"
-            if plan.response_kind == "none" and not anthropic_client:
+            if plan.response_kind == "none" and not anthropic_client and 200 <= status < 300:
                 ctype = upstream.headers.get("Content-Type") or ctype
             # 非流式：对原始上游响应解析 usage
             if 200 <= status < 300:
-                usage = extract_nonstream(upstream.content or b"")
+                usage = extract_nonstream(payload)
             _send_bytes(handler, status, payload, ctype, extra)
     except (BrokenPipeError, ConnectionError, ConnectionResetError, ConnectionAbortedError):
         # 上游已成功(status<400)时属客户端提前断开（流式 CLI 读完即关），非故障

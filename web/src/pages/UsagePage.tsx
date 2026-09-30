@@ -309,7 +309,10 @@ export function UsagePage() {
                       : "is-bad",
                 )}
               >
-                命中 {fmtPct(summary?.cache_hit_rate, 1)}
+                Token {fmtPct(summary?.cache_hit_rate, 1)}
+                {(summary?.prompt_requests ?? 0) > 0
+                  ? ` · 请求 ${fmtPct(summary?.cache_request_rate, 0)}`
+                  : ""}
               </span>
             </div>
           </div>

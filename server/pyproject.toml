@@ -13,6 +13,10 @@ dependencies = [
 [tool.uv]
 package = false
 
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+
 [tool.ruff.lint]
 # 以下规则为刻意取舍（浏览器自动化 / 网络容错设计，非疏漏）：
 # - BLE001：浏览器与网络层盲捕获后降级/继续轮询是注册自动化的核心容错策略

@@ -962,7 +962,9 @@ def query_usage_summary(days: int = 1) -> dict[str, Any]:
                 SUM(prompt_tokens) AS prompt_tokens,
                 SUM(completion_tokens) AS completion_tokens,
                 SUM(cache_tokens) AS cache_tokens,
-                SUM(reasoning_tokens) AS reasoning_tokens
+                SUM(reasoning_tokens) AS reasoning_tokens,
+                SUM(CASE WHEN prompt_tokens > 0 THEN 1 ELSE 0 END) AS prompt_requests,
+                SUM(CASE WHEN cache_tokens > 0 THEN 1 ELSE 0 END) AS cache_hit_requests
             FROM usages WHERE {where}
             """,
             params,
@@ -1010,6 +1012,8 @@ def query_usage_summary(days: int = 1) -> dict[str, Any]:
     completion = _usages_int(agg, "completion_tokens")
     cache = _usages_int(agg, "cache_tokens")
     reasoning = _usages_int(agg, "reasoning_tokens")
+    prompt_requests = _usages_int(agg, "prompt_requests")
+    cache_hit_requests = _usages_int(agg, "cache_hit_requests")
     total_tokens = prompt + completion
     by_model: list[dict[str, Any]] = []
     for row in by_model_rows:
@@ -1043,6 +1047,9 @@ def query_usage_summary(days: int = 1) -> dict[str, Any]:
             "total_tokens": total_tokens,
             "success_rate": _usage_rate(success, requests),
             "cache_hit_rate": _usage_rate(cache, prompt),
+            "cache_hit_requests": cache_hit_requests,
+            "prompt_requests": prompt_requests,
+            "cache_request_rate": _usage_rate(cache_hit_requests, prompt_requests),
             "reasoning_share": _usage_rate(reasoning, total_tokens),
         },
         "by_model": by_model,
