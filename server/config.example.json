@@ -9,7 +9,6 @@
   "tempmail_api_base": "https://api.tempmail.lol/v2",
   "tempmail_api_key": "",
   "tempmail_domain": "",
-  "mail_domain_whitelist": "",
   "proxy": "http://127.0.0.1:7890",
   "proxies": ["http://127.0.0.1:7890"],
   "auth_enabled": true,

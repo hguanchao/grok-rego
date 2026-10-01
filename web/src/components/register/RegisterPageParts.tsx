@@ -10,7 +10,6 @@ import {
   TooltipTrigger,
 } from "@/components/ui";
 import {
-  canonicalizeMailDomains,
   cn,
   groupStatus,
   logBody,
@@ -273,25 +272,20 @@ export function DomainListEditor({
   onChange,
   placeholder = "example.com",
   emptyHint = "未指定域名时由邮箱服务端自动分配",
-  secondLevelOnly = false,
 }: {
   value: string[];
   disabled?: boolean;
   onChange: (next: string[]) => void;
   placeholder?: string;
   emptyHint?: string;
-  /** 白名单 / 黑名单：添加时升到完整二级域名并去重 */
-  secondLevelOnly?: boolean;
 }) {
   const [draft, setDraft] = useState("");
 
   const addDomains = () => {
-    const incoming = secondLevelOnly
-      ? canonicalizeMailDomains(parseDomainList(draft))
-      : parseDomainList(draft);
+    const incoming = parseDomainList(draft);
     if (!incoming.length) return;
-    const seen = new Set(secondLevelOnly ? canonicalizeMailDomains(value) : value);
-    const next = secondLevelOnly ? canonicalizeMailDomains(value) : [...value];
+    const seen = new Set(value);
+    const next = [...value];
     for (const domain of incoming) {
       if (seen.has(domain)) continue;
       seen.add(domain);

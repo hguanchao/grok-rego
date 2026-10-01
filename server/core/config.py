@@ -35,8 +35,6 @@ YYDS_API_KEY: str = ""
 TEMPMAIL_API_BASE: str = "https://api.tempmail.lol/v2"
 TEMPMAIL_API_KEY: str = ""
 TEMPMAIL_DOMAIN: str = ""
-# 创建邮箱后按完整二级域名过滤：空列表不限制；非空则地址的二级域名必须命中，否则丢弃重创。
-MAIL_DOMAIN_WHITELIST: list[str] = []
 
 # === 推送目标配置（G2A / CPA）===
 G2A_BASE_URL: str = ""
@@ -97,7 +95,6 @@ _PUBLIC_CONFIG_KEYS = (
     "tempmail_api_base",
     "tempmail_api_key",
     "tempmail_domain",
-    "mail_domain_whitelist",
     "proxy",
     "proxies",
     "auth_enabled",
@@ -153,16 +150,6 @@ def _parse_cf_domains(raw: Any) -> list[str]:
     return domains
 
 
-def _parse_mail_whitelist(raw: Any) -> list[str]:
-    """解析邮箱白名单并升到完整二级域名。"""
-    hosts = _parse_cf_domains(raw)
-    try:
-        from workflow.mail import canonicalize_mail_domains
-    except ImportError:
-        return hosts
-    return canonicalize_mail_domains(hosts)
-
-
 def _read_config_file() -> dict[str, Any]:
     """读取 config.json 原始内容；不存在或损坏返回空 dict。"""
     if not os.path.exists(CONFIG_PATH):
@@ -180,7 +167,6 @@ def _apply_config_data(data: dict[str, Any]) -> None:
     global CF_API_BASE, CF_DOMAINS, CF_API_KEY, CF_DOMAIN_MODE, PROXY, PROXIES, IS_AUTH
     global MAIL_PROVIDER, YYDS_API_BASE, YYDS_API_KEY
     global TEMPMAIL_API_BASE, TEMPMAIL_API_KEY, TEMPMAIL_DOMAIN
-    global MAIL_DOMAIN_WHITELIST
     global G2A_BASE_URL, G2A_USERNAME, G2A_PASSWORD, CPA_BASE_URL, CPA_MANAGEMENT_KEY
     global GATEWAY_API_KEY, GROK_VERSION
     global HUMAN_SIM, HUMAN_LEVEL
@@ -224,8 +210,6 @@ def _apply_config_data(data: dict[str, Any]) -> None:
         TEMPMAIL_API_KEY = str(data["tempmail_api_key"])
     if "tempmail_domain" in data:
         TEMPMAIL_DOMAIN = _normalize_domain(str(data.get("tempmail_domain") or ""))
-    if "mail_domain_whitelist" in data:
-        MAIL_DOMAIN_WHITELIST = _parse_mail_whitelist(data.get("mail_domain_whitelist"))
     if "auth_enabled" in data:
         IS_AUTH = bool(data["auth_enabled"])
     if data.get("g2a_base_url") is not None:
@@ -277,37 +261,15 @@ def load_config() -> None:
             data["grok_version"] = ver
         data.pop("grok_client_version", None)
         rewritten = True
-    if "mail_domain_whitelist" in data:
-        canonical = ",".join(MAIL_DOMAIN_WHITELIST)
-        stored = ",".join(_parse_cf_domains(data.get("mail_domain_whitelist")))
-        if stored != canonical or not isinstance(data.get("mail_domain_whitelist"), str):
-            data["mail_domain_whitelist"] = canonical
-            rewritten = True
+    if "mail_domain_whitelist" in data or "mail_domain_blacklist" in data:
+        data.pop("mail_domain_whitelist", None)
+        data.pop("mail_domain_blacklist", None)
+        rewritten = True
     if rewritten:
         os.makedirs(os.path.dirname(CONFIG_PATH) or ".", exist_ok=True)
         with open(CONFIG_PATH, "w", encoding="utf-8", newline="\n") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
             f.write("\n")
-
-
-def _public_mail_blacklist() -> list[str]:
-    """读库中的邮箱后缀黑名单；库未就绪时返回空列表。"""
-    try:
-        from db import list_banned_mail_domains
-
-        return list_banned_mail_domains()
-    except Exception:
-        return []
-
-
-def _replace_mail_blacklist(raw: Any) -> list[str]:
-    """用给定列表整表替换黑名单，并清空进程内 ban 缓存。"""
-    from db import replace_banned_mail_domains
-    from workflow import mail as mail_wf
-
-    hosts = replace_banned_mail_domains(_parse_mail_whitelist(raw))
-    mail_wf.invalidate_banned_cache()
-    return hosts
 
 
 def get_public_config() -> dict[str, Any]:
@@ -323,8 +285,6 @@ def get_public_config() -> dict[str, Any]:
         "tempmail_api_base": TEMPMAIL_API_BASE,
         "tempmail_api_key": TEMPMAIL_API_KEY,
         "tempmail_domain": TEMPMAIL_DOMAIN,
-        "mail_domain_whitelist": _parse_mail_whitelist(MAIL_DOMAIN_WHITELIST),
-        "mail_domain_blacklist": _public_mail_blacklist(),
         "proxy": PROXY,
         "proxies": list(PROXIES),
         "auth_enabled": IS_AUTH,
@@ -346,10 +306,8 @@ def update_public_config(patch: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("配置体必须是 JSON 对象")
 
     current = _read_config_file()
-    blacklist_patch = False
-    if "mail_domain_blacklist" in patch:
-        _replace_mail_blacklist(patch.get("mail_domain_blacklist"))
-        blacklist_patch = True
+    current.pop("mail_domain_whitelist", None)
+    current.pop("mail_domain_blacklist", None)
     for key in _PUBLIC_CONFIG_KEYS:
         if key not in patch:
             continue
@@ -368,8 +326,6 @@ def update_public_config(patch: dict[str, Any]) -> dict[str, Any]:
             current[key] = provider
         elif key == "tempmail_domain":
             current[key] = _normalize_domain(str(value or ""))
-        elif key == "mail_domain_whitelist":
-            current[key] = ",".join(_parse_mail_whitelist(value))
         elif key == "auth_enabled":
             current[key] = bool(value)
         elif key == "grok_version":
@@ -411,12 +367,11 @@ def update_public_config(patch: dict[str, Any]) -> dict[str, Any]:
         else:
             current[key] = str(value)
 
-    if not blacklist_patch or any(key in patch for key in _PUBLIC_CONFIG_KEYS):
-        os.makedirs(os.path.dirname(CONFIG_PATH) or ".", exist_ok=True)
-        with open(CONFIG_PATH, "w", encoding="utf-8", newline="\n") as f:
-            json.dump(current, f, ensure_ascii=False, indent=2)
-            f.write("\n")
-        _apply_config_data(current)
+    os.makedirs(os.path.dirname(CONFIG_PATH) or ".", exist_ok=True)
+    with open(CONFIG_PATH, "w", encoding="utf-8", newline="\n") as f:
+        json.dump(current, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+    _apply_config_data(current)
     return get_public_config()
 
 

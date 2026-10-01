@@ -63,32 +63,19 @@ def test_verify_email_raises_on_unavailable(monkeypatch):
     page = _BodyPage(
         "email sign-up isn’t available right now. sign up another way."
     )
-    banned: list[tuple[str, str]] = []
     dumps: list[str] = []
-    monkeypatch.setattr(
-        register_wf,
-        "ban_rejected_address",
-        lambda email, reason="xAI invalid": banned.append((email, reason)) or "84.inovel26.com",
-    )
     monkeypatch.setattr(register_wf, "_dump_page", lambda _page, tag: dumps.append(tag))
     monkeypatch.setattr(register_wf, "_on_form_page", lambda _page: False)
 
     with pytest.raises(register_wf.EmailRejectedError):
         register_wf._verify_email(page, "user@84.inovel26.com", "jwt")
 
-    assert banned == [("user@84.inovel26.com", "xAI unavailable")]
     assert dumps == ["email-rejected"]
 
 
 def test_verify_email_raises_when_unavailable_appears_during_wait(monkeypatch):
     page = _BodyPage("sign up with your email")
-    banned: list[tuple[str, str]] = []
     dumps: list[str] = []
-    monkeypatch.setattr(
-        register_wf,
-        "ban_rejected_address",
-        lambda email, reason="xAI invalid": banned.append((email, reason)) or "host",
-    )
     monkeypatch.setattr(register_wf, "_dump_page", lambda _page, tag: dumps.append(tag))
     monkeypatch.setattr(register_wf, "_on_form_page", lambda _page: False)
 
@@ -106,14 +93,12 @@ def test_verify_email_raises_when_unavailable_appears_during_wait(monkeypatch):
     with pytest.raises(register_wf.EmailRejectedError):
         register_wf._verify_email(page, "user@84.inovel26.com", "jwt")
 
-    assert banned == [("user@84.inovel26.com", "xAI unavailable")]
     assert dumps == ["email-rejected"]
 
 
 def test_post_email_pipeline_maps_unavailable_to_reject(monkeypatch):
     page = _BodyPage("email sign-up isn’t available right now.")
     monkeypatch.setattr(register_wf, "_on_form_page", lambda _page: False)
-    monkeypatch.setattr(register_wf, "ban_rejected_address", lambda *a, **k: "host")
     monkeypatch.setattr(register_wf, "_dump_page", lambda *a, **k: None)
 
     stage = register_wf._post_email_pipeline(

@@ -96,7 +96,6 @@ uv run python main.py --serve       # 启动管理 API（默认 8787）
 | `mail_provider` | 邮箱服务商：`cf`（Cloudflare）/ `yyds` / `tempmail`（TempMail.lol） |
 | `yyds_api_base` / `yyds_api_key` | Yyds 邮箱服务配置 |
 | `tempmail_api_base` / `tempmail_api_key` / `tempmail_domain` | TempMail.lol 配置（密钥可选，免费档可留空；域名可选自定义域） |
-| `mail_domain_whitelist` | 邮箱完整二级域名白名单（逗号分隔，只记录二级域名）。留空不限制；填写后创建地址的二级域名须命中名单，否则丢弃重创 |
 | `proxy` | 代理地址（默认 `http://127.0.0.1:7890`） |
 | `auth_enabled` | 注册完成后是否自动执行 SSO 授权与 grok.com 风控体检 |
 | `g2a_base_url` / `g2a_username` / `g2a_password` | G2A 管理端配置（登录后推送 Web 池） |

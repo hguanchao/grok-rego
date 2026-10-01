@@ -1228,126 +1228,6 @@ def query_account_usage_24h() -> dict[int, int]:
 """
 
 
-def init_mail_blacklist_table() -> None:
-    """xAI 判定 invalid 的完整二级域名黑名单。"""
-    with connect() as conn:
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS mail_domain_blacklist (
-                domain TEXT PRIMARY KEY,
-                reason TEXT,
-                created_at TEXT NOT NULL
-            )
-            """
-        )
-        conn.commit()
-    _promote_blacklist_to_second_level()
-
-
-def _promote_blacklist_to_second_level() -> None:
-    """把历史三级主机（d2.inovel26.com）合并升到完整二级域名。"""
-    from workflow.mail import _canonical_ban_host, invalidate_banned_cache
-
-    with connect() as conn:
-        rows = conn.execute(
-            "SELECT domain, reason, created_at FROM mail_domain_blacklist"
-        ).fetchall()
-        if not rows:
-            return
-        by_canon: dict[str, tuple[str, str]] = {}
-        changed = False
-        for domain, reason, created_at in rows:
-            host = str(domain or "").strip().lower().rstrip(".")
-            if not host:
-                changed = True
-                continue
-            canon = _canonical_ban_host(host) or host
-            if canon != host:
-                changed = True
-            prev = by_canon.get(canon)
-            if prev is None or str(created_at or "") < str(prev[1] or ""):
-                by_canon[canon] = (str(reason or ""), str(created_at or ""))
-            elif prev is not None and not prev[0] and reason:
-                by_canon[canon] = (str(reason or ""), prev[1])
-        if not changed and len(by_canon) == len(rows):
-            return
-        conn.execute("DELETE FROM mail_domain_blacklist")
-        if by_canon:
-            conn.executemany(
-                "INSERT INTO mail_domain_blacklist (domain, reason, created_at) "
-                "VALUES (?, ?, ?)",
-                [
-                    (host, reason, created_at)
-                    for host, (reason, created_at) in sorted(by_canon.items())
-                ],
-            )
-        conn.commit()
-    invalidate_banned_cache()
-
-
-def ban_mail_domain(domain: str, reason: str = "") -> bool:
-    """写入完整二级域名黑名单。已存在返回 False。"""
-    from workflow.mail import canonicalize_mail_domains
-
-    hosts = canonicalize_mail_domains([domain])
-    if not hosts:
-        return False
-    host = hosts[0]
-    init_mail_blacklist_table()
-    with connect() as conn:
-        cur = conn.execute(
-            "INSERT OR IGNORE INTO mail_domain_blacklist (domain, reason, created_at) "
-            "VALUES (?, ?, ?)",
-            (host, str(reason or "").strip(), now_iso_tz()),
-        )
-        conn.commit()
-        return cur.rowcount > 0
-
-
-def list_banned_mail_domains() -> list[str]:
-    """当前拉黑的完整二级域名（小写）。"""
-    from workflow.mail import canonicalize_mail_domains
-
-    init_mail_blacklist_table()
-    with connect() as conn:
-        rows = conn.execute(
-            "SELECT domain FROM mail_domain_blacklist ORDER BY domain"
-        ).fetchall()
-    return sorted(canonicalize_mail_domains([str(row[0]) for row in rows]))
-
-
-def mail_domain_is_banned(host: str) -> bool:
-    """host 的完整二级域名是否在黑名单。"""
-    host = str(host or "").strip().lower().rstrip(".")
-    if not host:
-        return False
-    from workflow.mail import _canonical_ban_host
-
-    sld = _canonical_ban_host(host)
-    if not sld:
-        return False
-    return sld in set(list_banned_mail_domains())
-
-
-def replace_banned_mail_domains(domains: list[str] | None) -> list[str]:
-    """用给定列表整表替换黑名单，返回规范化后的完整二级域名。"""
-    init_mail_blacklist_table()
-    from workflow.mail import canonicalize_mail_domains
-
-    hosts = canonicalize_mail_domains(domains)
-    stamped = now_iso_tz()
-    with connect() as conn:
-        conn.execute("DELETE FROM mail_domain_blacklist")
-        if hosts:
-            conn.executemany(
-                "INSERT INTO mail_domain_blacklist (domain, reason, created_at) "
-                "VALUES (?, ?, ?)",
-                [(host, "manual", stamped) for host in hosts],
-            )
-        conn.commit()
-    return hosts
-
-
 def init_db() -> None:
     """初始化全部数据库表结构（自动创建数据目录）。"""
     from core.config import DB_DIR
@@ -1357,4 +1237,11 @@ def init_db() -> None:
     init_accounts_table()
     init_auth_pool_table()
     init_usages_table()
-    init_mail_blacklist_table()
+    _drop_mail_blacklist_table()
+
+
+def _drop_mail_blacklist_table() -> None:
+    """邮箱黑名单已下线，启动时丢掉遗留表。"""
+    with connect() as conn:
+        conn.execute("DROP TABLE IF EXISTS mail_domain_blacklist")
+        conn.commit()

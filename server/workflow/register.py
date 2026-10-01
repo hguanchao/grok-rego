@@ -61,7 +61,7 @@ from workflow.human import before_submit as human_before_submit
 from workflow.human import describe as human_describe
 from workflow.human import fidget as human_fidget
 from workflow.human import reading_pause as human_reading_pause
-from workflow.mail import ban_rejected_address, create_temp_email, poll_for_code
+from workflow.mail import create_temp_email, poll_for_code
 
 # ─── 任务协作取消：API 停止时 set，run_signups 协作退出 ────────────────────
 # 资料提交前的浏览器可立刻关掉；提交后要等 SSO，不能硬关。
@@ -186,7 +186,7 @@ RISK_PROMPT_KEYWORDS = (
     "blocked",
 )
 
-# 提交邮箱后页面仍停在填写页、明确拒绝该地址（临时邮箱域名被拉黑等）
+# 提交邮箱后页面仍停在填写页、明确拒绝该地址
 EMAIL_REJECTED_MARKERS = (
     "email address is invalid",
     "please use a different email",
@@ -744,17 +744,14 @@ def _email_blocked(page: Any) -> bool:
 
 
 def _reject_current_email(page: Any, email: str, t0: float | None = None) -> None:
-    """拉黑当前后缀并打拒绝日志；通道关闭与单地址 invalid 共用。"""
+    """地址被拒或通道关闭：打日志并换新邮箱。"""
     try:
         shown = compact_text(_page_text(page))
     except Exception:
         shown = ""
-    reason = "xAI unavailable" if _email_unavailable(page) else "xAI invalid"
-    banned = ban_rejected_address(email, reason=reason)
-    banned_note = f"  已拉黑 {banned}" if banned else ""
     elapsed = f"  · {elapsed_label(t0)}" if t0 is not None else ""
     logger.warning(
-        f"[邮箱] 地址被拒绝，将换新邮箱  {email}{elapsed}{banned_note}  {shown}"
+        f"[邮箱] 地址被拒绝，将换新邮箱  {email}{elapsed}  {shown}"
     )
     _dump_page(page, "email-rejected")
 

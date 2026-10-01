@@ -65,7 +65,6 @@ import {
   type RegisterJobState,
 } from "@/lib/api";
 import {
-  canonicalizeMailDomains,
   cn,
   groupRegisterLogs,
   proxiesToText,
@@ -179,9 +178,6 @@ export function RegisterPage() {
   const [tempmailApiBase, setTempmailApiBase] = useState("");
   const [tempmailApiKey, setTempmailApiKey] = useState("");
   const [tempmailDomain, setTempmailDomain] = useState("");
-  const [mailWhitelist, setMailWhitelist] = useState<string[]>([]);
-  const [mailBlacklist, setMailBlacklist] = useState<string[]>([]);
-  const [mailBlacklistDirty, setMailBlacklistDirty] = useState(false);
 
   // 高级设置（浏览器 / 授权 / 仿真人 / 推送目标）
   const [pushDialogOpen, setPushDialogOpen] = useState(false);
@@ -292,17 +288,6 @@ export function RegisterPage() {
     setTempmailApiBase(data.tempmail_api_base || "https://api.tempmail.lol/v2");
     setTempmailApiKey(data.tempmail_api_key || "");
     setTempmailDomain(data.tempmail_domain || "");
-    setMailWhitelist(
-      canonicalizeMailDomains(
-        Array.isArray(data.mail_domain_whitelist) ? data.mail_domain_whitelist : [],
-      ),
-    );
-    setMailBlacklist(
-      canonicalizeMailDomains(
-        Array.isArray(data.mail_domain_blacklist) ? data.mail_domain_blacklist : [],
-      ),
-    );
-    setMailBlacklistDirty(false);
     setG2aBaseUrl(data.g2a_base_url || "");
     setG2aUsername(data.g2a_username || "");
     setG2aPassword(data.g2a_password || "");
@@ -326,10 +311,6 @@ export function RegisterPage() {
       tempmail_api_base: tempmailApiBase.trim(),
       tempmail_api_key: tempmailApiKey,
       tempmail_domain: tempmailDomain.trim(),
-      mail_domain_whitelist: canonicalizeMailDomains(mailWhitelist),
-      ...(mailBlacklistDirty
-        ? { mail_domain_blacklist: canonicalizeMailDomains(mailBlacklist) }
-        : {}),
       g2a_base_url: g2aBaseUrl.trim(),
       g2a_username: g2aUsername.trim(),
       g2a_password: g2aPassword,
@@ -351,9 +332,6 @@ export function RegisterPage() {
     tempmailApiBase,
     tempmailApiKey,
     tempmailDomain,
-    mailWhitelist,
-    mailBlacklist,
-    mailBlacklistDirty,
     g2aBaseUrl,
     g2aUsername,
     g2aPassword,
@@ -944,7 +922,7 @@ export function RegisterPage() {
           <DialogHeader>
             <DialogTitle>邮箱设置</DialogTitle>
             <DialogDescription>
-              按当前邮箱服务（{mailProviderLabel(mailProvider)}）配置接口与域名。创建地址后按完整二级域名先过黑名单、再核白名单，未命中则丢弃重创。
+              按当前邮箱服务（{mailProviderLabel(mailProvider)}）配置接口与域名。
             </DialogDescription>
           </DialogHeader>
           <div className="advanced-content">
@@ -1062,38 +1040,6 @@ export function RegisterPage() {
                 </Field>
               </div>
             )}
-            <div className="provider-block">
-              <div className="provider-title">后缀过滤</div>
-              <Field
-                label="白名单"
-                hint="只记录完整二级域名。填写 ss.imagesthere.com 会存成 imagesthere.com；未命中则丢弃重创。"
-              >
-                <DomainListEditor
-                  value={mailWhitelist}
-                  disabled={formDisabled}
-                  onChange={setMailWhitelist}
-                  placeholder="inovel26.com"
-                  emptyHint="未指定时不过滤，服务商返回的任意后缀都可用"
-                  secondLevelOnly
-                />
-              </Field>
-              <Field
-                label="黑名单"
-                hint="只记录完整二级域名。xAI 判定 invalid 时自动写入（如 inovel26.com）；命中则丢弃重创。"
-              >
-                <DomainListEditor
-                  value={mailBlacklist}
-                  disabled={formDisabled}
-                  onChange={(next) => {
-                    setMailBlacklist(canonicalizeMailDomains(next));
-                    setMailBlacklistDirty(true);
-                  }}
-                  placeholder="imagesthere.com"
-                  emptyHint="暂无拉黑后缀"
-                  secondLevelOnly
-                />
-              </Field>
-            </div>
           </div>
           <DialogFooter>
             <Button type="button" variant="outline" onClick={handleMailDialogDone}>

@@ -18,8 +18,6 @@ export interface AppConfig {
   tempmail_api_base: string;
   tempmail_api_key: string;
   tempmail_domain: string;
-  mail_domain_whitelist: string[];
-  mail_domain_blacklist: string[];
   proxy: string;
   proxies?: string[];
   auth_enabled: boolean;
