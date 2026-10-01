@@ -2,7 +2,7 @@
  * 管理 API 客户端（开发态经 Vite 代理到 :8787）。
  */
 
-export type MailProvider = "cf" | "yyds";
+export type MailProvider = "cf" | "yyds" | "tempmail";
 export type DomainMode = "poll" | "random";
 /** 全局仿真人强度：light 快 / normal 平衡 / heavy 最像人 */
 export type HumanLevel = "light" | "normal" | "heavy";
@@ -15,6 +15,11 @@ export interface AppConfig {
   mail_provider: MailProvider;
   yyds_api_base: string;
   yyds_api_key: string;
+  tempmail_api_base: string;
+  tempmail_api_key: string;
+  tempmail_domain: string;
+  mail_domain_whitelist: string[];
+  mail_domain_blacklist: string[];
   proxy: string;
   proxies?: string[];
   auth_enabled: boolean;

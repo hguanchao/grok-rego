@@ -6,7 +6,7 @@ xAI Grok Build 账号自动化工具：**批量注册 → Device Flow 授权 →
 
 ## 功能特性
 
-- **批量注册**：多线程并发注册，支持 Cloudflare / Yyds 邮箱服务与代理配置
+- **批量注册**：多线程并发注册，支持 Cloudflare / Yyds / TempMail.lol 邮箱服务与代理配置
 - **全局仿真人**：注册链路全量拟人化（贝塞尔鼠标轨迹、拟人点击与键入、空闲微动），降低被风控识别概率
 - **Device Flow 授权**：浏览器端 OAuth Device Flow，自动完成 Token 交换
 - **SSO 会话**：注册附带的会话凭证入库，供下游渠道使用
@@ -93,8 +93,10 @@ uv run python main.py --serve       # 启动管理 API（默认 8787）
 | --- | --- |
 | `cf_api_base` / `cf_domains` / `cf_api_key` | Cloudflare 邮箱域名服务配置 |
 | `cf_domain_mode` | 域名分配模式（`random` 等） |
-| `mail_provider` | 邮箱服务商：`cf`（Cloudflare）/ `yyds` |
+| `mail_provider` | 邮箱服务商：`cf`（Cloudflare）/ `yyds` / `tempmail`（TempMail.lol） |
 | `yyds_api_base` / `yyds_api_key` | Yyds 邮箱服务配置 |
+| `tempmail_api_base` / `tempmail_api_key` / `tempmail_domain` | TempMail.lol 配置（密钥可选，免费档可留空；域名可选自定义域） |
+| `mail_domain_whitelist` | 邮箱完整二级域名白名单（逗号分隔，只记录二级域名）。留空不限制；填写后创建地址的二级域名须命中名单，否则丢弃重创 |
 | `proxy` | 代理地址（默认 `http://127.0.0.1:7890`） |
 | `auth_enabled` | 注册完成后是否自动执行 SSO 授权与 grok.com 风控体检 |
 | `g2a_base_url` / `g2a_username` / `g2a_password` | G2A 管理端配置（登录后推送 Web 池） |

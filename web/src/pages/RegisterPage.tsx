@@ -64,7 +64,13 @@ import {
   type MailProvider,
   type RegisterJobState,
 } from "@/lib/api";
-import { cn, groupRegisterLogs, proxiesToText, textToProxies } from "@/lib/utils";
+import {
+  canonicalizeMailDomains,
+  cn,
+  groupRegisterLogs,
+  proxiesToText,
+  textToProxies,
+} from "@/lib/utils";
 
 const IDLE_JOB: RegisterJobState = {
   id: null,
@@ -120,8 +126,22 @@ function statusLabel(status: string): string {
   }
 }
 
+function parseMailProvider(value: string | undefined | null): MailProvider {
+  if (value === "yyds" || value === "tempmail" || value === "cf") return value;
+  return "cf";
+}
+
 function mailProviderLabel(provider: string): string {
-  return provider === "yyds" ? "YYDS" : provider === "cf" ? "Cloudflare" : "邮箱";
+  switch (provider) {
+    case "yyds":
+      return "YYDS";
+    case "tempmail":
+      return "TempMail.lol";
+    case "cf":
+      return "Cloudflare";
+    default:
+      return "邮箱";
+  }
 }
 
 function errMessage(error: unknown): string {
@@ -156,6 +176,12 @@ export function RegisterPage() {
   const [cfDomainMode, setCfDomainMode] = useState<DomainMode>("random");
   const [yydsApiBase, setYydsApiBase] = useState("");
   const [yydsApiKey, setYydsApiKey] = useState("");
+  const [tempmailApiBase, setTempmailApiBase] = useState("");
+  const [tempmailApiKey, setTempmailApiKey] = useState("");
+  const [tempmailDomain, setTempmailDomain] = useState("");
+  const [mailWhitelist, setMailWhitelist] = useState<string[]>([]);
+  const [mailBlacklist, setMailBlacklist] = useState<string[]>([]);
+  const [mailBlacklistDirty, setMailBlacklistDirty] = useState(false);
 
   // 高级设置（浏览器 / 授权 / 仿真人 / 推送目标）
   const [pushDialogOpen, setPushDialogOpen] = useState(false);
@@ -248,7 +274,7 @@ export function RegisterPage() {
 
   const applyConfig = useCallback((data: AppConfig) => {
     hasConfigRef.current = true;
-    setMailProvider(data.mail_provider === "yyds" ? "yyds" : "cf");
+    setMailProvider(parseMailProvider(data.mail_provider));
     setProxy(proxiesToText(data.proxies, data.proxy || ""));
     setAuthEnabled(Boolean(data.auth_enabled));
     setHumanSim(data.human_sim !== false);
@@ -263,6 +289,20 @@ export function RegisterPage() {
     setCfDomainMode(data.cf_domain_mode === "poll" ? "poll" : "random");
     setYydsApiBase(data.yyds_api_base || "");
     setYydsApiKey(data.yyds_api_key || "");
+    setTempmailApiBase(data.tempmail_api_base || "https://api.tempmail.lol/v2");
+    setTempmailApiKey(data.tempmail_api_key || "");
+    setTempmailDomain(data.tempmail_domain || "");
+    setMailWhitelist(
+      canonicalizeMailDomains(
+        Array.isArray(data.mail_domain_whitelist) ? data.mail_domain_whitelist : [],
+      ),
+    );
+    setMailBlacklist(
+      canonicalizeMailDomains(
+        Array.isArray(data.mail_domain_blacklist) ? data.mail_domain_blacklist : [],
+      ),
+    );
+    setMailBlacklistDirty(false);
     setG2aBaseUrl(data.g2a_base_url || "");
     setG2aUsername(data.g2a_username || "");
     setG2aPassword(data.g2a_password || "");
@@ -283,6 +323,13 @@ export function RegisterPage() {
       cf_domain_mode: cfDomainMode,
       yyds_api_base: yydsApiBase.trim(),
       yyds_api_key: yydsApiKey,
+      tempmail_api_base: tempmailApiBase.trim(),
+      tempmail_api_key: tempmailApiKey,
+      tempmail_domain: tempmailDomain.trim(),
+      mail_domain_whitelist: canonicalizeMailDomains(mailWhitelist),
+      ...(mailBlacklistDirty
+        ? { mail_domain_blacklist: canonicalizeMailDomains(mailBlacklist) }
+        : {}),
       g2a_base_url: g2aBaseUrl.trim(),
       g2a_username: g2aUsername.trim(),
       g2a_password: g2aPassword,
@@ -301,6 +348,12 @@ export function RegisterPage() {
     cfDomainMode,
     yydsApiBase,
     yydsApiKey,
+    tempmailApiBase,
+    tempmailApiKey,
+    tempmailDomain,
+    mailWhitelist,
+    mailBlacklist,
+    mailBlacklistDirty,
     g2aBaseUrl,
     g2aUsername,
     g2aPassword,
@@ -482,6 +535,11 @@ export function RegisterPage() {
       setMailDialogOpen(true);
       return;
     }
+    if (mailProvider === "tempmail" && !tempmailApiBase.trim()) {
+      toast.error("请先配置 TempMail.lol API 地址");
+      setMailDialogOpen(true);
+      return;
+    }
     setStarting(true);
     try {
       const status = await startRegister({
@@ -568,7 +626,7 @@ export function RegisterPage() {
                   <Select
                     value={mailProvider}
                     onValueChange={(value) =>
-                      setMailProvider(value === "yyds" ? "yyds" : "cf")
+                      setMailProvider(parseMailProvider(value))
                     }
                     disabled={formDisabled}
                   >
@@ -578,6 +636,7 @@ export function RegisterPage() {
                     <SelectContent>
                       <SelectItem value="yyds">YYDS Mail</SelectItem>
                       <SelectItem value="cf">Cloudflare</SelectItem>
+                      <SelectItem value="tempmail">TempMail.lol</SelectItem>
                     </SelectContent>
                   </Select>
                 </div>
@@ -885,7 +944,7 @@ export function RegisterPage() {
           <DialogHeader>
             <DialogTitle>邮箱设置</DialogTitle>
             <DialogDescription>
-              按当前邮箱服务（{mailProviderLabel(mailProvider)}）配置接口与域名。
+              按当前邮箱服务（{mailProviderLabel(mailProvider)}）配置接口与域名。创建地址后按完整二级域名先过黑名单、再核白名单，未命中则丢弃重创。
             </DialogDescription>
           </DialogHeader>
           <div className="advanced-content">
@@ -941,6 +1000,46 @@ export function RegisterPage() {
                   />
                 </Field>
               </div>
+            ) : mailProvider === "tempmail" ? (
+              <div className="provider-block">
+                <Field
+                  label="API 地址"
+                  hint="TempMail.lol v2 根地址，不含末尾斜杠"
+                >
+                  <Input
+                    value={tempmailApiBase}
+                    disabled={formDisabled}
+                    onChange={(event) => setTempmailApiBase(event.target.value)}
+                    placeholder="https://api.tempmail.lol/v2"
+                    autoComplete="off"
+                  />
+                </Field>
+                <Field
+                  label="API 密钥"
+                  hint="Plus/Ultra 可选；免费档留空即可"
+                >
+                  <Input
+                    type="password"
+                    autoComplete="off"
+                    value={tempmailApiKey}
+                    disabled={formDisabled}
+                    onChange={(event) => setTempmailApiKey(event.target.value)}
+                    placeholder="tm.xxxxxxxx"
+                  />
+                </Field>
+                <Field
+                  label="自定义域名"
+                  hint="Plus/Ultra 自定义域；留空则随机公共域"
+                >
+                  <Input
+                    value={tempmailDomain}
+                    disabled={formDisabled}
+                    onChange={(event) => setTempmailDomain(event.target.value)}
+                    placeholder="example.com"
+                    autoComplete="off"
+                  />
+                </Field>
+              </div>
             ) : (
               <div className="provider-block">
                 <Field label="API 地址">
@@ -963,6 +1062,38 @@ export function RegisterPage() {
                 </Field>
               </div>
             )}
+            <div className="provider-block">
+              <div className="provider-title">后缀过滤</div>
+              <Field
+                label="白名单"
+                hint="只记录完整二级域名。填写 ss.imagesthere.com 会存成 imagesthere.com；未命中则丢弃重创。"
+              >
+                <DomainListEditor
+                  value={mailWhitelist}
+                  disabled={formDisabled}
+                  onChange={setMailWhitelist}
+                  placeholder="inovel26.com"
+                  emptyHint="未指定时不过滤，服务商返回的任意后缀都可用"
+                  secondLevelOnly
+                />
+              </Field>
+              <Field
+                label="黑名单"
+                hint="只记录完整二级域名。xAI 判定 invalid 时自动写入（如 inovel26.com）；命中则丢弃重创。"
+              >
+                <DomainListEditor
+                  value={mailBlacklist}
+                  disabled={formDisabled}
+                  onChange={(next) => {
+                    setMailBlacklist(canonicalizeMailDomains(next));
+                    setMailBlacklistDirty(true);
+                  }}
+                  placeholder="imagesthere.com"
+                  emptyHint="暂无拉黑后缀"
+                  secondLevelOnly
+                />
+              </Field>
+            </div>
           </div>
           <DialogFooter>
             <Button type="button" variant="outline" onClick={handleMailDialogDone}>

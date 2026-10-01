@@ -6,6 +6,7 @@
 认证池阶段：run_auth_pool 串行消化队列，一个账号完成后再接下一个。
 
 重试策略：邮箱/验证码/资料阶段失败关闭浏览器重启重试（邮箱与资料复用，最多 MAX_ATTEMPTS 次）；
+         邮箱被拒 / 邮箱通道关闭（invalid、isn't available）关浏览器并换新地址；
          仅 SSO 阶段失败在当前浏览器内刷新页面重试（POST_EMAIL_RETRIES 次，不重启浏览器）。
 """
 
@@ -25,13 +26,13 @@ from curl_cffi import requests
 from core import config
 from core.logger import logger
 from core.util import (
+    compact_text,
     decode_jwt_exp,
     elapsed_label,
     format_exp,
     is_cancelled,
     request_cancel as _set_cancel,
     clear_cancel as _clear_cancel,
-    upstream_text,
     wait_or_cancel,
 )
 from db import (
@@ -48,7 +49,6 @@ from db import (
 )
 from workflow.browser import (
     extract_sso_cookies,
-    handle_cf_challenge,
     handle_turnstile,
     human_click_locator,
     human_mouse_move,
@@ -61,7 +61,7 @@ from workflow.human import before_submit as human_before_submit
 from workflow.human import describe as human_describe
 from workflow.human import fidget as human_fidget
 from workflow.human import reading_pause as human_reading_pause
-from workflow.mail import create_temp_email, poll_for_code
+from workflow.mail import ban_rejected_address, create_temp_email, poll_for_code
 
 # ─── 任务协作取消：API 停止时 set，run_signups 协作退出 ────────────────────
 # 资料提交前的浏览器可立刻关掉；提交后要等 SSO，不能硬关。
@@ -161,11 +161,6 @@ SSO_POLL_INTERVAL = 1.0  # SSO cookie 轮询间隔（秒）
 SSO_CONTINUE_INTERVAL = 6.0  # 等待期间点「继续」推进的间隔（秒）
 RELOAD_SETTLE_MS = 3000  # 刷新页面后的静置等待（毫秒）
 DEBUG_DIR = os.path.join(config.LOG_DIR, "debug")
-PREFLIGHT_CF_WAIT = 45  # 预检全页拦截最长等待（秒）
-PREFLIGHT_TURNSTILE_WAIT = 30  # 预检 Turnstile widget 最长等待（秒）
-PREFLIGHT_TURNSTILE_COOL = 300.0  # 未过 Turnstile 的出口冷却（秒），避免注册线程再绑到坏节点
-PREFLIGHT_TURNSTILE_MAX_NODES = 3  # 预检最多开几次浏览器探测出口
-PREFLIGHT_SIGNUP_WAIT = 12  # Turnstile 过后等待注册落地页出现（秒）
 # 资料表单姓名框：只认明确字段，禁止兜底 input[type=text]（会误填邮箱/验证码）
 FORM_FIRST_SELECTORS = [
     "input[name='givenName']",
@@ -191,6 +186,27 @@ RISK_PROMPT_KEYWORDS = (
     "blocked",
 )
 
+# 提交邮箱后页面仍停在填写页、明确拒绝该地址（临时邮箱域名被拉黑等）
+EMAIL_REJECTED_MARKERS = (
+    "email address is invalid",
+    "please use a different email",
+    "use a different email address",
+    "invalid email",
+)
+
+# 提交后仍停在邮箱页、通道被关（不是单地址 invalid）：同样换邮箱 + 新会话，禁止空等 OTP
+EMAIL_UNAVAILABLE_MARKERS = (
+    "email sign-up isn’t available",
+    "email sign-up isn't available",
+    "email signup isn’t available",
+    "email signup isn't available",
+    "sign-up isn’t available",
+    "sign-up isn't available",
+    "signup isn’t available",
+    "signup isn't available",
+    "sign up another way",
+)
+
 # 任一注册步骤出现即关浏览器、复用原账号开新会话重试
 PAGE_FATAL_MARKERS = (
     "something went wrong. please try again",
@@ -200,6 +216,10 @@ PAGE_FATAL_MARKERS = (
 
 class PageFatalError(Exception):
     """页面出现 Something went wrong，需关闭浏览器并用原账号重开会话。"""
+
+
+class EmailRejectedError(Exception):
+    """当前临时邮箱被 xAI 拒绝，需换新地址。"""
 EMAIL_INPUT_SELECTORS = [
     "input[type='email']",
     "input[name='email']",
@@ -407,24 +427,13 @@ def _open_page(browser: Any) -> Any:
     return browser.new_page()
 
 
-def _dump_page(page: Any, tag: str) -> None:
-    """失败时记录 URL、可见文本、input 清单并截图，便于对照浏览器。"""
-    if _is_closed(page):
-        logger.warning(f"[诊断] 页面已关闭，无法 dump: {tag}")
-        return
-    try:
-        url = page.url
-    except Exception:
-        url = "?"
-    try:
-        body = _page_text(page)
-    except Exception:
-        body = ""
+def _collect_controls(page: Any) -> list[Any]:
+    """收集各 frame 的 input/button 清单，用于对照注册页元素。"""
     inputs: list[Any] = []
     for frame in _frames(page):
         try:
             items = frame.evaluate(
-                """() => Array.from(document.querySelectorAll('input,button')).slice(0, 40).map(el => ({
+                """() => Array.from(document.querySelectorAll('input,button,a[role="button"]')).slice(0, 50).map(el => ({
                     tag: el.tagName.toLowerCase(),
                     type: el.type || '',
                     name: el.name || '',
@@ -440,8 +449,26 @@ def _dump_page(page: Any, tag: str) -> None:
                 inputs.extend(items)
         except Exception:
             continue
-    logger.warning(f"[诊断] {tag} | URL: {url}\n{upstream_text(body)}")
-    logger.warning(f"[诊断] {tag} | controls={inputs}")
+    return inputs
+
+
+def _dump_page(page: Any, tag: str) -> None:
+    """失败时截图，并给任务面板一行摘要。整页正文与控件清单只进 DEBUG。"""
+    if _is_closed(page):
+        logger.warning(f"[诊断] 页面已关闭，无法 dump: {tag}")
+        return
+    try:
+        url = page.url
+    except Exception:
+        url = "?"
+    try:
+        body = _page_text(page)
+    except Exception:
+        body = ""
+    inputs = _collect_controls(page)
+    logger.warning(f"[诊断] {tag}  {compact_text(body)}")
+    logger.debug(f"[诊断] {tag} | URL: {url}\n{body}")
+    logger.debug(f"[诊断] {tag} | controls={inputs}")
     try:
         os.makedirs(DEBUG_DIR, exist_ok=True)
         stamp = time.strftime("%Y%m%d_%H%M%S")
@@ -509,7 +536,7 @@ def click(
         return False
     url = page.url
     logger.warning(
-        f"[注册] 未找到可点击元素: {text} | URL: {url}\n{upstream_text(_page_text(page))}"
+        f"[注册] 未找到可点击元素: {text}  {compact_text(_page_text(page))}"
     )
     return False
 
@@ -662,6 +689,7 @@ def _ensure_email(
     _ensure_no_page_fatal(page)
     if not _has_input(page, "input[type='email']"):
         logger.warning(f"[邮箱] 填写页未就绪  · {elapsed_label(t0)}")
+        _dump_page(page, "email-page-missing")
         return None
     if email is None:
         first_name, last_name = _generate_profile_name()
@@ -692,6 +720,45 @@ def _has_risk_prompt(page: Any) -> bool:
     return any(keyword in body for keyword in RISK_PROMPT_KEYWORDS)
 
 
+def _email_rejected(page: Any) -> bool:
+    """提交后是否仍停在邮箱页且地址被拒绝（换邮箱，不要空等验证码）。"""
+    try:
+        body = _page_text(page)
+    except Exception:
+        return False
+    return any(marker in body for marker in EMAIL_REJECTED_MARKERS)
+
+
+def _email_unavailable(page: Any) -> bool:
+    """提交后邮箱通道被关（isn't available / sign up another way）。"""
+    try:
+        body = _page_text(page)
+    except Exception:
+        return False
+    return any(marker in body for marker in EMAIL_UNAVAILABLE_MARKERS)
+
+
+def _email_blocked(page: Any) -> bool:
+    """地址被拒或邮箱通道关闭，都应换新地址而不是等 OTP。"""
+    return _email_rejected(page) or _email_unavailable(page)
+
+
+def _reject_current_email(page: Any, email: str, t0: float | None = None) -> None:
+    """拉黑当前后缀并打拒绝日志；通道关闭与单地址 invalid 共用。"""
+    try:
+        shown = compact_text(_page_text(page))
+    except Exception:
+        shown = ""
+    reason = "xAI unavailable" if _email_unavailable(page) else "xAI invalid"
+    banned = ban_rejected_address(email, reason=reason)
+    banned_note = f"  已拉黑 {banned}" if banned else ""
+    elapsed = f"  · {elapsed_label(t0)}" if t0 is not None else ""
+    logger.warning(
+        f"[邮箱] 地址被拒绝，将换新邮箱  {email}{elapsed}{banned_note}  {shown}"
+    )
+    _dump_page(page, "email-rejected")
+
+
 def _has_page_fatal_error(page: Any) -> bool:
     """是否出现 Something went wrong 类致命页错。"""
     try:
@@ -705,10 +772,10 @@ def _ensure_no_page_fatal(page: Any) -> None:
     """命中致命页错则抛 PageFatalError，由 _run_attempt 关浏览器复用账号重试。"""
     if _has_page_fatal_error(page):
         try:
-            shown = upstream_text(_page_text(page))
+            shown = compact_text(_page_text(page))
         except Exception:
             shown = ""
-        logger.warning(f"[注册] 检测到页面错误\n{shown}")
+        logger.warning(f"[注册] 检测到页面错误  {shown}")
         try:
             _dump_page(page, "page-fatal-error")
         except Exception:
@@ -735,13 +802,16 @@ def _submit_email(page: Any, email: str) -> tuple[str, bool]:
         return "email", False
     page.wait_for_timeout(1500)
     _ensure_no_page_fatal(page)
+    if _email_blocked(page):
+        _reject_current_email(page, log_email, t0)
+        return "reject", False
     if _has_risk_prompt(page):
         try:
-            shown = upstream_text(_page_text(page))
+            shown = compact_text(_page_text(page))
         except Exception:
             shown = ""
         logger.warning(
-            f"[邮箱] 提交后触发风控  {log_email}  · {elapsed_label(t0)}\n{shown}"
+            f"[邮箱] 提交后触发风控  {log_email}  · {elapsed_label(t0)}  {shown}"
         )
         return "email", False
     logger.success(f"[邮箱] 已填写并提交 {log_email}  · {elapsed_label(t0)}")
@@ -846,19 +916,28 @@ def _verify_email(page: Any, email: str, jwt: str) -> bool:
     log_email = email
     if _form_ready_skip(page, email, t0):
         return True
-    # 同时盯验证码页与资料表单，避免已到表单仍空等 OTP 文案
+    if _email_blocked(page):
+        _reject_current_email(page, log_email, t0)
+        raise EmailRejectedError(email)
+    # 同时盯验证码页、资料表单、邮箱拒绝：命中拒绝立即换号，禁止空等 OTP 文案
     if not wait_until(
         page,
         ["verify your email", "one-time code"],
         OTP_PAGE_WAIT_SECS,
         check_for_errors=True,
-        done_when=lambda: _on_form_page(page),
+        done_when=lambda: _on_form_page(page) or _email_blocked(page),
     ):
         if _form_ready_skip(page, email, t0):
             return True
+        if _email_blocked(page):
+            _reject_current_email(page, log_email, t0)
+            raise EmailRejectedError(email)
         logger.warning(f"[邮件] 验证码页未就绪  {log_email}  · {elapsed_label(t0)}")
         _dump_page(page, "otp-page-missing")
         return False
+    if _email_blocked(page):
+        _reject_current_email(page, log_email, t0)
+        raise EmailRejectedError(email)
     if _form_ready_skip(page, email, t0):
         return True
     code = poll_for_code(
@@ -1148,11 +1227,11 @@ def _wait_sso_ready(
         time.sleep(SSO_POLL_INTERVAL)
     who = email or ""
     try:
-        shown = upstream_text(_page_text(page))
+        shown = compact_text(_page_text(page))
     except Exception:
         shown = ""
     logger.error(
-        f"[SSO] {who} 等待超时（已等 {SSO_WAIT_TIMEOUT}s）  · {elapsed_label(t0)}\n{shown}"
+        f"[SSO] {who} 等待超时（已等 {SSO_WAIT_TIMEOUT}s）  · {elapsed_label(t0)}  {shown}"
     )
     return False
 
@@ -1175,8 +1254,11 @@ def _post_email_pipeline(
       调用方应关闭当前浏览器重启重试（复用邮箱与资料姓名）。
     - "sso" ：SSO 阶段，仅在当前浏览器内刷新页面重试。
     """
-    if not _verify_email(page, email, jwt):
-        return "otp"
+    try:
+        if not _verify_email(page, email, jwt):
+            return "otp"
+    except EmailRejectedError:
+        return "reject"
     if not _fill_signup_form(page, first_name, last_name, password):
         return "form"
     if not _wait_sso_ready(page, email=email, clock=sso_clock):
@@ -1296,6 +1378,8 @@ def _run_attempt(
                         if not ok:
                             return fail(email_stage)
                         email_submitted = True
+                        if _email_blocked(page):
+                            return fail("reject")
                         fail_stage = _post_email_pipeline(
                             page, email, jwt or "", first_name, last_name, password,
                             sso_clock=sso_clock,
@@ -1370,7 +1454,7 @@ def _run_attempt(
 
 
 # ---------------------------------------------------------------------------
-# 注册前预检：代理 / 关键站点连通性 / Cloudflare 人机验证
+# 注册前预检：代理 / 注册入口 / 邮箱 API
 # ---------------------------------------------------------------------------
 
 def _check_proxy() -> bool:
@@ -1435,146 +1519,21 @@ def _check_reachable(url: str, label: str) -> bool:
 
 def _mail_base_url() -> str:
     """当前邮箱服务 API 根地址。"""
-    if (config.MAIL_PROVIDER or "cf").strip().lower() == "yyds":
+    provider = (config.MAIL_PROVIDER or "cf").strip().lower()
+    if provider == "yyds":
         return (config.YYDS_API_BASE or "").strip().rstrip("/")
+    if provider == "tempmail":
+        return (config.TEMPMAIL_API_BASE or "").strip().rstrip("/")
     return (config.CF_API_BASE or "").strip().rstrip("/")
 
 
-def _preflight_signup_ready(page: Any) -> bool:
-    """预检通过人机后，注册入口是否已落地（邮箱框或社交注册页）。"""
-    return _has_input(page, "input[type='email']") or _is_signup_landing(page)
-
-
-def _wait_preflight_signup(page: Any, timeout: float | None = None) -> bool:
-    """Turnstile 跳过后页面可能还在渲染，短等落地页。"""
-    deadline = time.monotonic() + (PREFLIGHT_SIGNUP_WAIT if timeout is None else timeout)
-    while time.monotonic() < deadline:
-        if _is_closed(page) or is_cancelled():
-            return False
-        if _preflight_signup_ready(page):
-            return True
-        time.sleep(0.4)
-    return _preflight_signup_ready(page)
-
-
-def _probe_signup_cf(headless: bool) -> bool:
-    """用当前线程绑定的出口打开注册页，过 Cloudflare 全页拦截 / Turnstile。
-
-    落地页没有 widget 也算通过（节点能打开 accounts.x.ai）。
-    全页拦截卡住或 widget 校验失败则判定该出口过不了人机。
-    """
-    from core import proxypool
-
-    t0 = time.monotonic()
-    node = proxypool.redact(proxypool.current()) or "直连"
-    if is_cancelled():
-        return False
-    try:
-        with Camoufox(**_camoufox_kwargs(headless)) as browser:
-            _track_browser(browser)
-            try:
-                if is_cancelled():
-                    return False
-                page = _open_page(browser)
-                try:
-                    page.goto(
-                        config.SIGNUP_URL,
-                        wait_until="domcontentloaded",
-                        timeout=config.GOTO_TIMEOUT,
-                    )
-                except Exception as e:
-                    logger.warning(
-                        f"[预检] 注册页导航异常  {type(e).__name__}: {e}  · {elapsed_label(t0)}"
-                    )
-                    try:
-                        dead = page.query_selector("body") is None
-                    except Exception:
-                        dead = True
-                    if dead:
-                        logger.error(
-                            f"[预检] Cloudflare Turnstile 未通过  注册页打开失败  {node}  · {elapsed_label(t0)}"
-                        )
-                        return False
-                try_click_cookies(page)
-                if not handle_cf_challenge(page, max_wait=PREFLIGHT_CF_WAIT):
-                    logger.error(
-                        f"[预检] Cloudflare 全页拦截未通过  {node}  · {elapsed_label(t0)}"
-                    )
-                    _dump_page(page, "preflight-cf-failed")
-                    return False
-                result = handle_turnstile(page, max_wait=PREFLIGHT_TURNSTILE_WAIT)
-                if result not in ("passed", "skipped"):
-                    logger.error(
-                        f"[预检] Cloudflare Turnstile 未通过  {node}  {result}  · {elapsed_label(t0)}"
-                    )
-                    _dump_page(page, "preflight-turnstile-failed")
-                    return False
-                if not _wait_preflight_signup(page):
-                    logger.error(
-                        f"[预检] Cloudflare Turnstile 后未进入注册页  {node}  · {elapsed_label(t0)}"
-                    )
-                    _dump_page(page, "preflight-signup-missing")
-                    return False
-                label = "已通过" if result == "passed" else "未出现（页面可访问）"
-                logger.success(
-                    f"[预检] Cloudflare Turnstile {label}  {node}  · {elapsed_label(t0)}"
-                )
-                return True
-            finally:
-                _untrack_browser(browser)
-    except Exception as e:
-        logger.error(
-            f"[预检] Cloudflare Turnstile 探测异常  {node}  {type(e).__name__}: {e}  · {elapsed_label(t0)}"
-        )
-        return False
-
-
-def _check_turnstile(headless: bool = True) -> bool:
-    """按出口探测 Cloudflare Turnstile：任一条通过即预检通过。
-
-    未通过的远端出口写入冷却，避免注册线程再绑上去。
-    代理池超过 PREFLIGHT_TURNSTILE_MAX_NODES 条时只探前面几条，避免预检拖太久。
-    """
-    from core import proxypool
-
-    pool = proxypool.urls()
-    candidates = (pool or [""])[:PREFLIGHT_TURNSTILE_MAX_NODES]
-    if pool and len(pool) > len(candidates):
-        logger.warning(
-            f"[预检] 代理池 {len(pool)} 条，Cloudflare Turnstile 仅探测前 {len(candidates)} 条"
-        )
-    last_node = ""
-    for index, proxy in enumerate(candidates, start=1):
-        if is_cancelled():
-            logger.warning("[预检] 已取消，跳过 Cloudflare Turnstile 检测")
-            return False
-        last_node = proxypool.redact(proxy) if proxy else "直连"
-        logger.info(
-            f"[预检] Cloudflare Turnstile 出口 {index}/{len(candidates)}  {last_node}"
-        )
-        proxypool.bind(proxy or None)
-        try:
-            if _probe_signup_cf(headless):
-                return True
-        finally:
-            proxypool.unbind()
-        if proxy:
-            proxypool.mark_fail(proxy, PREFLIGHT_TURNSTILE_COOL)
-            logger.warning(
-                f"[预检] 出口未过 Cloudflare Turnstile，已冷却 {int(PREFLIGHT_TURNSTILE_COOL)}s  {last_node}"
-            )
-    logger.error(
-        f"[预检] Cloudflare Turnstile 未通过  {last_node or '全部出口'}"
-    )
-    return False
-
-
 def preflight_check(headless: bool = True) -> bool:
-    """注册前预检（主控线程调用）：代理、注册入口、邮箱 API、Cloudflare Turnstile。
+    """注册前预检（主控线程调用）：代理、注册入口、邮箱 API。
 
-    HTTP 连通通过后再开浏览器走一遍注册页人机：全页拦截或 Turnstile 过不了则中止，
-    避免坏节点把整轮注册任务烧掉。任一项不通过返回 False。
+    只做 HTTP 连通。注册页上的 Turnstile 留到正式注册时处理。
+    任一项不通过返回 False。headless 保留调用签名，预检不再开浏览器。
     """
+    del headless
     logger.debug(f"[预检] {human_describe()}")
     mail_base = _mail_base_url()
     results = {
@@ -1587,9 +1546,6 @@ def preflight_check(headless: bool = True) -> bool:
     failed = [name for name, ok in results.items() if not ok]
     if failed:
         logger.error(f"[预检] 未通过：{', '.join(failed)}，任务中止")
-        return False
-    if not _check_turnstile(headless=headless):
-        logger.error("[预检] 未通过：Cloudflare Turnstile，任务中止")
         return False
     return True
 
@@ -1647,7 +1603,18 @@ def _run_signup_bound(headless: bool = False) -> tuple[bool, str | None]:
                 f"放弃: {email}"
             )
             break
-        label = {"email": "邮箱", "otp": "验证码", "form": "资料"}.get(stage, stage)
+        if stage == "reject":
+            logger.warning(
+                f"[注册] 邮箱被拒绝或通道关闭，丢弃 {email}，换新地址重开会话"
+            )
+            email, jwt = None, None
+            first_name, last_name = None, None
+        label = {
+            "email": "邮箱",
+            "otp": "验证码",
+            "form": "资料",
+            "reject": "邮箱拒绝",
+        }.get(stage, stage)
         log_email = email
         logger.debug(
             f"[注册] {label}阶段失败，重启浏览器"

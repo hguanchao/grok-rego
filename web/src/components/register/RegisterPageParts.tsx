@@ -10,6 +10,7 @@ import {
   TooltipTrigger,
 } from "@/components/ui";
 import {
+  canonicalizeMailDomains,
   cn,
   groupStatus,
   logBody,
@@ -271,19 +272,26 @@ export function DomainListEditor({
   disabled,
   onChange,
   placeholder = "example.com",
+  emptyHint = "未指定域名时由邮箱服务端自动分配",
+  secondLevelOnly = false,
 }: {
   value: string[];
   disabled?: boolean;
   onChange: (next: string[]) => void;
   placeholder?: string;
+  emptyHint?: string;
+  /** 白名单 / 黑名单：添加时升到完整二级域名并去重 */
+  secondLevelOnly?: boolean;
 }) {
   const [draft, setDraft] = useState("");
 
   const addDomains = () => {
-    const incoming = parseDomainList(draft);
+    const incoming = secondLevelOnly
+      ? canonicalizeMailDomains(parseDomainList(draft))
+      : parseDomainList(draft);
     if (!incoming.length) return;
-    const seen = new Set(value);
-    const next = [...value];
+    const seen = new Set(secondLevelOnly ? canonicalizeMailDomains(value) : value);
+    const next = secondLevelOnly ? canonicalizeMailDomains(value) : [...value];
     for (const domain of incoming) {
       if (seen.has(domain)) continue;
       seen.add(domain);
@@ -321,9 +329,7 @@ export function DomainListEditor({
           ))}
         </div>
       ) : (
-        <p className="text-muted-foreground text-xs">
-          未指定域名时由邮箱服务端自动分配
-        </p>
+        <p className="text-muted-foreground text-xs">{emptyHint}</p>
       )}
       <div className="flex gap-2">
         <Input

@@ -8,11 +8,14 @@
 from __future__ import annotations
 
 import json
+import mimetypes
+import os
+import posixpath
 import socket
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 from api.pool_jobs import (
     auth_pool_state,
@@ -22,7 +25,7 @@ from api.pool_jobs import (
 )
 from api.push import push_manager
 from core import config
-from core.config import API_HOST, API_PORT
+from core.config import API_HOST, API_PORT, WEB_DIST_DIR
 from core.http_body import IncompleteRequestBodyError, RequestBodyTooLarge, read_request_body
 from core.logger import logger
 from db import (
@@ -45,6 +48,71 @@ from workflow.jobs import manager
 
 _CORS_ORIGIN = "*"
 _MAX_BODY = 1_000_000
+_API_PREFIXES = ("/api", "/zen", "/grok", "/health")
+_WEB_INDEX = "index.html"
+
+
+def _web_root() -> str | None:
+    """有 index.html 的前端目录才启用静态托管。"""
+    index = os.path.join(WEB_DIST_DIR, _WEB_INDEX)
+    if os.path.isfile(index):
+        return WEB_DIST_DIR
+    return None
+
+
+def _safe_web_file(root: str, url_path: str) -> str | None:
+    """把 URL 映射到 web-dist 内文件；越出根目录返回 None。"""
+    relative = unquote(url_path).lstrip("/")
+    if not relative or relative.endswith("/"):
+        relative = posixpath.join(relative, _WEB_INDEX)
+    candidate = os.path.normpath(os.path.join(root, relative))
+    root_real = os.path.realpath(root)
+    file_real = os.path.realpath(candidate)
+    if file_real == root_real or file_real.startswith(root_real + os.sep):
+        return file_real
+    return None
+
+
+def _send_file(handler: BaseHTTPRequestHandler, path: str) -> None:
+    ctype, _ = mimetypes.guess_type(path)
+    if not ctype:
+        ctype = "application/octet-stream"
+    if ctype.startswith("text/") or ctype in (
+        "application/javascript",
+        "application/json",
+        "image/svg+xml",
+    ):
+        ctype = f"{ctype}; charset=utf-8"
+    with open(path, "rb") as fh:
+        body = fh.read()
+    handler.send_response(200)
+    handler.send_header("Content-Type", ctype)
+    handler.send_header("Content-Length", str(len(body)))
+    handler.send_header("Cache-Control", "no-cache")
+    handler.end_headers()
+    if handler.command != "HEAD":
+        handler.wfile.write(body)
+        handler.wfile.flush()
+
+
+def try_serve_web(handler: BaseHTTPRequestHandler, method: str, path: str) -> bool:
+    """托管前端构建产物。目录存在时 GET/HEAD 走静态文件，SPA 回退 index.html。"""
+    if method not in ("GET", "HEAD"):
+        return False
+    if any(path == prefix or path.startswith(prefix + "/") for prefix in _API_PREFIXES):
+        return False
+    root = _web_root()
+    if root is None:
+        return False
+    target = _safe_web_file(root, path)
+    if target and os.path.isfile(target):
+        _send_file(handler, target)
+        return True
+    index = os.path.join(root, _WEB_INDEX)
+    if os.path.isfile(index):
+        _send_file(handler, index)
+        return True
+    return False
 
 
 def _after_log_id(query: dict[str, list[str]]) -> int:
@@ -598,6 +666,8 @@ class _ApiHandler(BaseHTTPRequestHandler):
                 return
             if _handle_api(method, path, query, self):
                 return
+            if try_serve_web(self, method, path):
+                return
         except RequestBodyTooLarge as e:
             _error_json(self, 413, str(e))
             return
@@ -660,15 +730,22 @@ class _BoundedThreadingHTTPServer(ThreadingHTTPServer):
 def serve(host: str | None = None, port: int | None = None) -> None:
     """启动管理 API 服务（阻塞）。"""
     init_db()
-    bind_host = host or API_HOST
+    bind_host = os.environ.get("GROK_REGO_HOST") or host or API_HOST
     bind_port = port or API_PORT
+    raw_port = os.environ.get("GROK_REGO_PORT")
+    if raw_port:
+        try:
+            bind_port = max(1, int(raw_port))
+        except ValueError:
+            pass
     server = _BoundedThreadingHTTPServer((bind_host, bind_port), _ApiHandler)
     server.daemon_threads = True
     start_limited_recheck_worker()
     logger.success(f"[API] 服务启动: http://{bind_host}:{bind_port}")
-    logger.info(
-        "[API] 路由: /api/* （注册 / 号池 / 网关运维）  /zen/v1/* （Zen）  /grok/v1/* （号池 Grok）"
-    )
+    routes = "/api/* （注册 / 号池 / 网关运维）  /zen/v1/* （Zen）  /grok/v1/* （号池 Grok）"
+    if _web_root():
+        routes += "  /* （Web UI）"
+    logger.info(f"[API] 路由: {routes}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

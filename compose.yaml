@@ -1,0 +1,51 @@
+# 默认：完整镜像（含 Camoufox，可注册）。
+# 只要 API / 号池 / 推送 / 网关：
+#   docker compose --profile api up --build
+#
+# 容器内 127.0.0.1:7890 指向容器自己。宿主机代理请改成：
+#   proxy: "http://host.docker.internal:7890"
+#   extra_hosts 已加上 host-gateway。
+
+services:
+  grok-rego:
+    profiles: ["full", ""]
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: grok-rego:full
+    ports:
+      - "8787:8787"
+    shm_size: 1gb
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./server/config.json:/app/server/config.json
+      - grok-rego-db:/app/server/db/data
+      - grok-rego-logs:/app/server/logs
+    environment:
+      GROK_REGO_HOST: "0.0.0.0"
+      GROK_REGO_PORT: "8787"
+    restart: unless-stopped
+
+  grok-rego-api:
+    profiles: ["api"]
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    image: grok-rego:api
+    ports:
+      - "8787:8787"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./server/config.json:/app/server/config.json
+      - grok-rego-db:/app/server/db/data
+      - grok-rego-logs:/app/server/logs
+    environment:
+      GROK_REGO_HOST: "0.0.0.0"
+      GROK_REGO_PORT: "8787"
+    restart: unless-stopped
+
+volumes:
+  grok-rego-db:
+  grok-rego-logs:

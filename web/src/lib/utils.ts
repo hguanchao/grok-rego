@@ -7,6 +7,65 @@ export function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
 }
 
+/** 与后端 `_MULTI_PART_PUBLIC_SUFFIXES` 对齐，白名单 / 黑名单升到 registrable domain。 */
+const MULTI_PART_PUBLIC_SUFFIXES = [
+  "co.uk",
+  "org.uk",
+  "ac.uk",
+  "gov.uk",
+  "com.au",
+  "net.au",
+  "org.au",
+  "co.jp",
+  "ne.jp",
+  "or.jp",
+  "com.br",
+  "com.cn",
+  "net.cn",
+  "org.cn",
+  "co.nz",
+  "co.kr",
+  "com.sg",
+  "com.hk",
+  "com.tw",
+] as const;
+
+/** 把主机或邮箱升到完整二级域名：`ss.imagesthere.com` → `imagesthere.com`。 */
+export function toSecondLevelDomain(raw: string): string {
+  let host = String(raw ?? "").trim().toLowerCase();
+  if (!host) return "";
+  if (host.includes("@")) host = host.split("@").pop() ?? "";
+  if (host.includes("://")) host = host.split("://")[1] ?? host;
+  host = host.split("/")[0]?.split("?")[0] ?? "";
+  if ((host.match(/:/g) ?? []).length === 1 && !host.endsWith("]")) {
+    const [name, port] = host.split(":");
+    if (/^\d+$/.test(port ?? "")) host = name ?? "";
+  }
+  host = host.replace(/^\.+|\.+$/g, "");
+  const labels = host.split(".").filter(Boolean);
+  if (labels.length <= 2) return host;
+  for (const pub of MULTI_PART_PUBLIC_SUFFIXES) {
+    if (host === pub || host.endsWith(`.${pub}`)) {
+      const need = pub.split(".").length + 1;
+      return labels.length >= need ? labels.slice(-need).join(".") : host;
+    }
+  }
+  return labels.slice(-2).join(".");
+}
+
+/** 去重保序，白名单 / 黑名单只记录完整二级域名。 */
+export function canonicalizeMailDomains(raw: string[]): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const item of raw ?? []) {
+    const host = toSecondLevelDomain(item);
+    if (!host || seen.has(host)) continue;
+    seen.add(host);
+    out.push(host);
+  }
+  return out;
+}
+
 // ──────────────────────────────────────────────────────────────
 // 账号时间：后端存储统一为北京时间（兼容历史裸串与 ISO 带时区两种格式），
 // 前端解析后按浏览器本地时区展示。
