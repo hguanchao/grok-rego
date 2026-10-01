@@ -153,6 +153,7 @@ MAX_ATTEMPTS = 3  # 邮箱/验证码/资料阶段失败允许重启浏览器的�
 POST_EMAIL_RETRIES = 2  # 仅 SSO 阶段失败：刷新页面重试的次数（不重启浏览器）
 EMAIL_PAGE_WAIT_SECS = 25  # 等待邮箱填写页出现的最长时间（秒）
 OTP_PAGE_WAIT_SECS = 30  # 等待验证码页出现的最长时间（秒）
+SUBMIT_OUTCOME_WAIT_SECS = 8  # 点 Sign up 后等待拒绝文案或验证码页的时间（秒）
 OTP_MAIL_TIMEOUT = 120  # 轮询邮件取验证码超时（秒）
 OTP_MAIL_INTERVAL = 3  # 轮询邮件间隔（秒）
 FORM_READY_TIMEOUT = 25  # 填码后等待资料表单就绪的最长时间（秒）
@@ -192,6 +193,10 @@ EMAIL_REJECTED_MARKERS = (
     "please use a different email",
     "use a different email address",
     "invalid email",
+    "sign-ups from this email domain aren’t allowed",
+    "sign-ups from this email domain aren't allowed",
+    "from this email domain aren’t allowed",
+    "from this email domain aren't allowed",
 )
 
 # 提交后仍停在邮箱页、通道被关（不是单地址 invalid）：同样换邮箱 + 新会话，禁止空等 OTP
@@ -276,15 +281,20 @@ def _frames(page: Any) -> list[Any]:
     return frames
 
 
-def _page_text(page: Any) -> str:
-    """汇总所有 frame 的正文文本（含 iframe 内表单内容），小写便于关键字匹配。"""
+def _page_text_raw(page: Any) -> str:
+    """汇总所有 frame 正文，保留原文大小写与换行。"""
     parts: list[str] = []
     for frame in _frames(page):
         try:
             parts.append(frame.inner_text("body"))
         except Exception:
             continue
-    return " ".join(parts).lower()
+    return "\n".join(parts)
+
+
+def _page_text(page: Any) -> str:
+    """汇总所有 frame 的正文文本（含 iframe 内表单内容），小写便于关键字匹配。"""
+    return " ".join(_page_text_raw(page).split()).lower()
 
 
 def _has_input(page: Any, selector: str) -> bool:
@@ -711,31 +721,28 @@ def _ensure_email(
     return email, jwt, first_name, last_name
 
 
-def _has_risk_prompt(page: Any) -> bool:
-    """提交邮箱后页面是否出现风控提示（限流/人机校验/阻断等）。"""
+def _body_has(page: Any, markers: tuple[str, ...]) -> bool:
+    """页面正文（小写）是否包含任一标记。读正文失败视为未命中。"""
     try:
         body = _page_text(page)
     except Exception:
         return False
-    return any(keyword in body for keyword in RISK_PROMPT_KEYWORDS)
+    return any(marker in body for marker in markers)
+
+
+def _has_risk_prompt(page: Any) -> bool:
+    """提交邮箱后页面是否出现风控提示（限流/人机校验/阻断等）。"""
+    return _body_has(page, RISK_PROMPT_KEYWORDS)
 
 
 def _email_rejected(page: Any) -> bool:
     """提交后是否仍停在邮箱页且地址被拒绝（换邮箱，不要空等验证码）。"""
-    try:
-        body = _page_text(page)
-    except Exception:
-        return False
-    return any(marker in body for marker in EMAIL_REJECTED_MARKERS)
+    return _body_has(page, EMAIL_REJECTED_MARKERS)
 
 
 def _email_unavailable(page: Any) -> bool:
     """提交后邮箱通道被关（isn't available / sign up another way）。"""
-    try:
-        body = _page_text(page)
-    except Exception:
-        return False
-    return any(marker in body for marker in EMAIL_UNAVAILABLE_MARKERS)
+    return _body_has(page, EMAIL_UNAVAILABLE_MARKERS)
 
 
 def _email_blocked(page: Any) -> bool:
@@ -743,26 +750,40 @@ def _email_blocked(page: Any) -> bool:
     return _email_rejected(page) or _email_unavailable(page)
 
 
-def _reject_current_email(page: Any, email: str, t0: float | None = None) -> None:
-    """地址被拒或通道关闭：打日志并换新邮箱。"""
+def _email_rejection_text(page: Any) -> str:
+    """取出页面上 Grok 拒绝文案的原文那一行；没有则返回空串。"""
     try:
-        shown = compact_text(_page_text(page))
+        raw = _page_text_raw(page)
     except Exception:
-        shown = ""
+        return ""
+    lowered = raw.lower()
+    markers = EMAIL_REJECTED_MARKERS + EMAIL_UNAVAILABLE_MARKERS
+    for marker in markers:
+        idx = lowered.find(marker)
+        if idx < 0:
+            continue
+        start = raw.rfind("\n", 0, idx) + 1
+        end = raw.find("\n", idx)
+        if end < 0:
+            end = len(raw)
+        line = " ".join(raw[start:end].split())
+        if line:
+            return line
+    return ""
+
+
+def _reject_current_email(page: Any, email: str, t0: float | None = None) -> None:
+    """提交后被拒：警告，并把页面上的拒绝原文追加到日志末尾。"""
+    quote = _email_rejection_text(page)
     elapsed = f"  · {elapsed_label(t0)}" if t0 is not None else ""
-    logger.warning(
-        f"[邮箱] 地址被拒绝，将换新邮箱  {email}{elapsed}  {shown}"
-    )
+    tail = f"  {quote}" if quote else ""
+    logger.warning(f"[邮箱] 已填写并提交 {email}{elapsed}{tail}")
     _dump_page(page, "email-rejected")
 
 
 def _has_page_fatal_error(page: Any) -> bool:
     """是否出现 Something went wrong 类致命页错。"""
-    try:
-        body = _page_text(page)
-    except Exception:
-        return False
-    return any(marker in body for marker in PAGE_FATAL_MARKERS)
+    return _body_has(page, PAGE_FATAL_MARKERS)
 
 
 def _ensure_no_page_fatal(page: Any) -> None:
@@ -797,20 +818,34 @@ def _submit_email(page: Any, email: str) -> tuple[str, bool]:
     if not click(page, "Sign up") and not click(page, "Continue"):
         logger.warning(f"[邮箱] 未找到 Sign up 按钮  {log_email}  · {elapsed_label(t0)}")
         return "email", False
-    page.wait_for_timeout(1500)
-    _ensure_no_page_fatal(page)
-    if _email_blocked(page):
-        _reject_current_email(page, log_email, t0)
-        return "reject", False
-    if _has_risk_prompt(page):
+    # 拒绝文案经常晚于点击出现。先等结果，再决定成功还是警告，避免先打成功再空等验证码页。
+    deadline = time.time() + SUBMIT_OUTCOME_WAIT_SECS
+    while True:
+        _ensure_no_page_fatal(page)
+        if _email_blocked(page):
+            _reject_current_email(page, log_email, t0)
+            return "reject", False
+        if _has_risk_prompt(page):
+            try:
+                shown = compact_text(_page_text(page))
+            except Exception:
+                shown = ""
+            logger.warning(
+                f"[邮箱] 提交后触发风控  {log_email}  · {elapsed_label(t0)}  {shown}"
+            )
+            return "email", False
         try:
-            shown = compact_text(_page_text(page))
+            text = _page_text(page)
         except Exception:
-            shown = ""
-        logger.warning(
-            f"[邮箱] 提交后触发风控  {log_email}  · {elapsed_label(t0)}  {shown}"
-        )
-        return "email", False
+            text = ""
+        if _on_form_page(page) or any(
+            hint in text for hint in ("verify your email", "one-time code")
+        ):
+            break
+        if time.time() >= deadline:
+            break
+        if wait_or_cancel(0.4):
+            return "email", False
     logger.success(f"[邮箱] 已填写并提交 {log_email}  · {elapsed_label(t0)}")
     return "post", True
 
@@ -955,7 +990,7 @@ def _verify_email(page: Any, email: str, jwt: str) -> bool:
         logger.error(f"[邮件] 未找到验证码框  {log_email}  · {elapsed_label(fill_t0)}")
         _dump_page(page, "otp-input-missing")
         return False
-    logger.success(f"[邮件] 已填入验证码  · {elapsed_label(fill_t0)}")
+    logger.success(f"[邮件] 已填入验证码 {code}  · {elapsed_label(fill_t0)}")
     _ensure_no_page_fatal(page)
     if not _wait_form_ready(page, timeout=FORM_READY_TIMEOUT):
         logger.warning(f"[资料] 填码后资料表单未就绪  {log_email}  · {elapsed_label(t0)}")
@@ -1521,6 +1556,8 @@ def _mail_base_url() -> str:
         return (config.YYDS_API_BASE or "").strip().rstrip("/")
     if provider == "tempmail":
         return (config.TEMPMAIL_API_BASE or "").strip().rstrip("/")
+    if provider == "tempyard":
+        return (config.TEMPYARD_API_BASE or "").strip().rstrip("/")
     return (config.CF_API_BASE or "").strip().rstrip("/")
 
 

@@ -52,6 +52,70 @@ def test_email_unavailable_matches_ascii_apostrophe():
     assert register_wf._email_blocked(page) is True
 
 
+def test_domain_not_allowed_is_rejected():
+    page = _BodyPage(
+        "Sign up with your email\n"
+        "Email\n"
+        "Sign-ups from this email domain aren’t allowed.\n"
+        "Sign up\nGo back\n"
+    )
+    assert register_wf._email_rejected(page) is True
+    assert register_wf._email_blocked(page) is True
+    assert (
+        register_wf._email_rejection_text(page)
+        == "Sign-ups from this email domain aren’t allowed."
+    )
+
+
+def test_rejection_text_keeps_original_line():
+    page = _BodyPage(
+        "Sign up with your email. Your email address is invalid. "
+        "Please use a different email address. Sign up Go back"
+    )
+    assert (
+        register_wf._email_rejection_text(page)
+        == "Sign up with your email. Your email address is invalid. "
+        "Please use a different email address. Sign up Go back"
+    )
+
+
+def test_submit_email_warns_with_rejection_quote(monkeypatch):
+    page = _BodyPage("Sign up with your email\nEmail\n")
+    warnings: list[str] = []
+    monkeypatch.setattr(
+        register_wf,
+        "fill",
+        lambda *a, **k: True,
+    )
+    monkeypatch.setattr(register_wf, "click", lambda *a, **k: True)
+    monkeypatch.setattr(register_wf, "human_before_submit", lambda *a, **k: None)
+    monkeypatch.setattr(register_wf, "_dump_page", lambda *a, **k: None)
+    monkeypatch.setattr(register_wf, "_on_form_page", lambda *a, **k: False)
+    monkeypatch.setattr(
+        register_wf.logger,
+        "warning",
+        lambda message: warnings.append(message),
+    )
+
+    def reveal(*_a, **_k):
+        page.body = (
+            "Sign up with your email\n"
+            "Email\n"
+            "Sign-ups from this email domain aren’t allowed.\n"
+            "Sign up\n"
+        )
+        page.frames = [SimpleNamespace(inner_text=lambda _sel: page.body)]
+        return False
+
+    monkeypatch.setattr(register_wf, "wait_or_cancel", reveal)
+
+    stage, ok = register_wf._submit_email(page, "yx@onebyte.indevs.in")
+    assert (stage, ok) == ("reject", False)
+    assert len(warnings) == 1
+    assert warnings[0].startswith("[邮箱] 已填写并提交 yx@onebyte.indevs.in  · ")
+    assert warnings[0].endswith("  Sign-ups from this email domain aren’t allowed.")
+
+
 def test_plain_signup_landing_is_not_blocked():
     page = _BodyPage(
         "create your account sign up with email sign up with google"

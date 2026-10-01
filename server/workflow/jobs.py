@@ -60,6 +60,10 @@ def validate_mail_ready() -> None:
         if not (config.TEMPMAIL_API_BASE or "").strip():
             raise ValueError("请先配置 TempMail.lol API 地址")
         return
+    if provider == "tempyard":
+        if not (config.TEMPYARD_API_BASE or "").strip():
+            raise ValueError("请先配置 Tempyard 邮箱 API 地址")
+        return
     if not (config.CF_API_BASE or "").strip():
         raise ValueError("请先配置 Cloudflare 邮箱 API 地址")
     if not config.CF_DOMAINS:

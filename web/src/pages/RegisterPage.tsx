@@ -126,7 +126,9 @@ function statusLabel(status: string): string {
 }
 
 function parseMailProvider(value: string | undefined | null): MailProvider {
-  if (value === "yyds" || value === "tempmail" || value === "cf") return value;
+  if (value === "yyds" || value === "tempmail" || value === "tempyard" || value === "cf") {
+    return value;
+  }
   return "cf";
 }
 
@@ -136,6 +138,8 @@ function mailProviderLabel(provider: string): string {
       return "YYDS";
     case "tempmail":
       return "TempMail.lol";
+    case "tempyard":
+      return "Tempyard";
     case "cf":
       return "Cloudflare";
     default:
@@ -178,6 +182,9 @@ export function RegisterPage() {
   const [tempmailApiBase, setTempmailApiBase] = useState("");
   const [tempmailApiKey, setTempmailApiKey] = useState("");
   const [tempmailDomain, setTempmailDomain] = useState("");
+  const [tempyardApiBase, setTempyardApiBase] = useState("");
+  const [tempyardDomains, setTempyardDomains] = useState<string[]>([]);
+  const [tempyardDomainMode, setTempyardDomainMode] = useState<DomainMode>("random");
 
   // 高级设置（浏览器 / 授权 / 仿真人 / 推送目标）
   const [pushDialogOpen, setPushDialogOpen] = useState(false);
@@ -288,6 +295,9 @@ export function RegisterPage() {
     setTempmailApiBase(data.tempmail_api_base || "https://api.tempmail.lol/v2");
     setTempmailApiKey(data.tempmail_api_key || "");
     setTempmailDomain(data.tempmail_domain || "");
+    setTempyardApiBase(data.tempyard_api_base || "https://mail.aibyte.de5.net");
+    setTempyardDomains(Array.isArray(data.tempyard_domains) ? data.tempyard_domains : []);
+    setTempyardDomainMode(data.tempyard_domain_mode === "poll" ? "poll" : "random");
     setG2aBaseUrl(data.g2a_base_url || "");
     setG2aUsername(data.g2a_username || "");
     setG2aPassword(data.g2a_password || "");
@@ -311,6 +321,9 @@ export function RegisterPage() {
       tempmail_api_base: tempmailApiBase.trim(),
       tempmail_api_key: tempmailApiKey,
       tempmail_domain: tempmailDomain.trim(),
+      tempyard_api_base: tempyardApiBase.trim(),
+      tempyard_domains: tempyardDomains,
+      tempyard_domain_mode: tempyardDomainMode,
       g2a_base_url: g2aBaseUrl.trim(),
       g2a_username: g2aUsername.trim(),
       g2a_password: g2aPassword,
@@ -332,6 +345,9 @@ export function RegisterPage() {
     tempmailApiBase,
     tempmailApiKey,
     tempmailDomain,
+    tempyardApiBase,
+    tempyardDomains,
+    tempyardDomainMode,
     g2aBaseUrl,
     g2aUsername,
     g2aPassword,
@@ -518,6 +534,11 @@ export function RegisterPage() {
       setMailDialogOpen(true);
       return;
     }
+    if (mailProvider === "tempyard" && !tempyardApiBase.trim()) {
+      toast.error("请先配置Tempyard邮箱 API 地址");
+      setMailDialogOpen(true);
+      return;
+    }
     setStarting(true);
     try {
       const status = await startRegister({
@@ -615,6 +636,7 @@ export function RegisterPage() {
                       <SelectItem value="yyds">YYDS Mail</SelectItem>
                       <SelectItem value="cf">Cloudflare</SelectItem>
                       <SelectItem value="tempmail">TempMail.lol</SelectItem>
+                      <SelectItem value="tempyard">Tempyard</SelectItem>
                     </SelectContent>
                   </Select>
                 </div>
@@ -975,6 +997,52 @@ export function RegisterPage() {
                     disabled={formDisabled}
                     onChange={setCfDomains}
                     placeholder="mail.example.com"
+                  />
+                </Field>
+              </div>
+            ) : mailProvider === "tempyard" ? (
+              <div className="provider-block">
+                <Field
+                  label="API 地址"
+                  hint="Tempyard邮箱 Worker 根地址，不含末尾斜杠"
+                >
+                  <Input
+                    value={tempyardApiBase}
+                    disabled={formDisabled}
+                    onChange={(event) => setTempyardApiBase(event.target.value)}
+                    placeholder="https://mail.aibyte.de5.net"
+                    autoComplete="off"
+                  />
+                </Field>
+                <Field
+                  label="域名模式"
+                  hint="填写多个域名时：顺序轮询，或随机选取"
+                >
+                  <Select
+                    value={tempyardDomainMode}
+                    onValueChange={(value) =>
+                      setTempyardDomainMode(value === "poll" ? "poll" : "random")
+                    }
+                    disabled={formDisabled}
+                  >
+                    <SelectTrigger>
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="poll">轮询</SelectItem>
+                      <SelectItem value="random">随机</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </Field>
+                <Field
+                  label="邮箱域名"
+                  hint="留空则向服务端拉取可用域名；填写后直接用作完整收信域，不再套随机子域"
+                >
+                  <DomainListEditor
+                    value={tempyardDomains}
+                    disabled={formDisabled}
+                    onChange={setTempyardDomains}
+                    placeholder="aibyte.kdns.fr"
                   />
                 </Field>
               </div>

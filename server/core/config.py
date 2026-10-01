@@ -27,14 +27,18 @@ PROXY: str = "http://127.0.0.1:7890"
 # 出口代理池；空则直连。默认与 PROXY 同条，读盘后以 proxies 或拆开的 proxy 为准。
 PROXIES: list[str] = ["http://127.0.0.1:7890"]
 
-# === 临时邮箱服务商（cf / yyds / tempmail）===
-MAIL_PROVIDERS: tuple[str, ...] = ("cf", "yyds", "tempmail")
+# === 临时邮箱服务商（cf / yyds / tempmail / tempyard）===
+MAIL_PROVIDERS: tuple[str, ...] = ("cf", "yyds", "tempmail", "tempyard")
 MAIL_PROVIDER: str = "cf"
 YYDS_API_BASE: str = "https://maliapi.215.im/v1"
 YYDS_API_KEY: str = ""
 TEMPMAIL_API_BASE: str = "https://api.tempmail.lol/v2"
 TEMPMAIL_API_KEY: str = ""
 TEMPMAIL_DOMAIN: str = ""
+# Tempyard（tempyard.com）公开邮箱 Worker，协议同 cloudflare_temp_email，域名不套随机子域
+TEMPYARD_API_BASE: str = "https://mail.aibyte.de5.net"
+TEMPYARD_DOMAINS: list[str] = []
+TEMPYARD_DOMAIN_MODE: str = "random"
 
 # === 推送目标配置（G2A / CPA）===
 G2A_BASE_URL: str = ""
@@ -95,6 +99,9 @@ _PUBLIC_CONFIG_KEYS = (
     "tempmail_api_base",
     "tempmail_api_key",
     "tempmail_domain",
+    "tempyard_api_base",
+    "tempyard_domains",
+    "tempyard_domain_mode",
     "proxy",
     "proxies",
     "auth_enabled",
@@ -127,6 +134,15 @@ def _normalize_domain(raw: str) -> str:
         if maybe_port.isdigit():
             value = host
     return value.strip(".")
+
+
+def _domain_mode(raw: Any, key: str) -> str:
+    """域名选取模式。非法值回退 random，并在启动日志里说明。"""
+    mode = str(raw or "").strip().lower()
+    if mode in ("poll", "random"):
+        return mode
+    print(f"[config] 无效 {key}={raw!r}，仅支持 poll/random，已回退 random")
+    return "random"
 
 
 def _parse_cf_domains(raw: Any) -> list[str]:
@@ -167,6 +183,7 @@ def _apply_config_data(data: dict[str, Any]) -> None:
     global CF_API_BASE, CF_DOMAINS, CF_API_KEY, CF_DOMAIN_MODE, PROXY, PROXIES, IS_AUTH
     global MAIL_PROVIDER, YYDS_API_BASE, YYDS_API_KEY
     global TEMPMAIL_API_BASE, TEMPMAIL_API_KEY, TEMPMAIL_DOMAIN
+    global TEMPYARD_API_BASE, TEMPYARD_DOMAINS, TEMPYARD_DOMAIN_MODE
     global G2A_BASE_URL, G2A_USERNAME, G2A_PASSWORD, CPA_BASE_URL, CPA_MANAGEMENT_KEY
     global GATEWAY_API_KEY, GROK_VERSION
     global HUMAN_SIM, HUMAN_LEVEL
@@ -178,15 +195,7 @@ def _apply_config_data(data: dict[str, Any]) -> None:
     if data.get("cf_api_key") is not None:
         CF_API_KEY = str(data["cf_api_key"])
     if data.get("cf_domain_mode") is not None:
-        domain_mode = str(data["cf_domain_mode"]).strip().lower()
-        if domain_mode in ("poll", "random"):
-            CF_DOMAIN_MODE = domain_mode
-        else:
-            print(
-                f"[config] 无效 cf_domain_mode={data['cf_domain_mode']!r}，"
-                f"仅支持 poll/random，已回退 random"
-            )
-            CF_DOMAIN_MODE = "random"
+        CF_DOMAIN_MODE = _domain_mode(data.get("cf_domain_mode"), "cf_domain_mode")
     if "proxies" in data:
         from core.proxypool import parse_proxy_list
 
@@ -210,6 +219,14 @@ def _apply_config_data(data: dict[str, Any]) -> None:
         TEMPMAIL_API_KEY = str(data["tempmail_api_key"])
     if "tempmail_domain" in data:
         TEMPMAIL_DOMAIN = _normalize_domain(str(data.get("tempmail_domain") or ""))
+    if data.get("tempyard_api_base") is not None:
+        TEMPYARD_API_BASE = str(data["tempyard_api_base"]).strip().rstrip("/")
+    if "tempyard_domains" in data:
+        TEMPYARD_DOMAINS = _parse_cf_domains(data.get("tempyard_domains"))
+    if data.get("tempyard_domain_mode") is not None:
+        TEMPYARD_DOMAIN_MODE = _domain_mode(
+            data.get("tempyard_domain_mode"), "tempyard_domain_mode"
+        )
     if "auth_enabled" in data:
         IS_AUTH = bool(data["auth_enabled"])
     if data.get("g2a_base_url") is not None:
@@ -285,6 +302,9 @@ def get_public_config() -> dict[str, Any]:
         "tempmail_api_base": TEMPMAIL_API_BASE,
         "tempmail_api_key": TEMPMAIL_API_KEY,
         "tempmail_domain": TEMPMAIL_DOMAIN,
+        "tempyard_api_base": TEMPYARD_API_BASE,
+        "tempyard_domains": list(TEMPYARD_DOMAINS),
+        "tempyard_domain_mode": TEMPYARD_DOMAIN_MODE,
         "proxy": PROXY,
         "proxies": list(PROXIES),
         "auth_enabled": IS_AUTH,
@@ -322,10 +342,17 @@ def update_public_config(patch: dict[str, Any]) -> dict[str, Any]:
         elif key == "mail_provider":
             provider = str(value or "").strip().lower()
             if provider not in MAIL_PROVIDERS:
-                raise ValueError("mail_provider 仅支持 cf / yyds / tempmail")
+                raise ValueError("mail_provider 仅支持 cf / yyds / tempmail / tempyard")
             current[key] = provider
         elif key == "tempmail_domain":
             current[key] = _normalize_domain(str(value or ""))
+        elif key == "tempyard_domains":
+            current[key] = ",".join(_parse_cf_domains(value))
+        elif key == "tempyard_domain_mode":
+            mode = str(value or "").strip().lower()
+            if mode not in ("poll", "random"):
+                raise ValueError("tempyard_domain_mode 仅支持 poll / random")
+            current[key] = mode
         elif key == "auth_enabled":
             current[key] = bool(value)
         elif key == "grok_version":
@@ -358,6 +385,7 @@ def update_public_config(patch: dict[str, Any]) -> dict[str, Any]:
             "cf_api_base",
             "yyds_api_base",
             "tempmail_api_base",
+            "tempyard_api_base",
             "g2a_base_url",
             "cpa_base_url",
         ):

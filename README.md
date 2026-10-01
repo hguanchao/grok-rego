@@ -93,9 +93,10 @@ uv run python main.py --serve       # 启动管理 API（默认 8787）
 | --- | --- |
 | `cf_api_base` / `cf_domains` / `cf_api_key` | Cloudflare 邮箱域名服务配置 |
 | `cf_domain_mode` | 域名分配模式（`random` 等） |
-| `mail_provider` | 邮箱服务商：`cf`（Cloudflare）/ `yyds` / `tempmail`（TempMail.lol） |
+| `mail_provider` | 邮箱服务商：`cf`（Cloudflare）/ `yyds` / `tempmail`（TempMail.lol）/ `tempyard`（Tempyard） |
 | `yyds_api_base` / `yyds_api_key` | Yyds 邮箱服务配置 |
 | `tempmail_api_base` / `tempmail_api_key` / `tempmail_domain` | TempMail.lol 配置（密钥可选，免费档可留空；域名可选自定义域） |
+| `tempyard_api_base` / `tempyard_domains` / `tempyard_domain_mode` | Tempyard 邮箱（https://www.tempyard.com/mail/）。地址默认 `https://mail.aibyte.de5.net`；域名留空则向服务端拉取，填写后按 `random` / `poll` 选用，不再套随机子域 |
 | `proxy` | 代理地址（默认 `http://127.0.0.1:7890`） |
 | `auth_enabled` | 注册完成后是否自动执行 SSO 授权与 grok.com 风控体检 |
 | `g2a_base_url` / `g2a_username` / `g2a_password` | G2A 管理端配置（登录后推送 Web 池） |
