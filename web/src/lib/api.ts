@@ -2,6 +2,8 @@
  * 管理 API 客户端（开发态经 Vite 代理到 :8787）。
  */
 
+import { taskRequestBody } from "./task-selection";
+
 export type MailProvider = "cf" | "yyds" | "tempmail" | "tempyard";
 export type DomainMode = "poll" | "random";
 /** 全局仿真人强度：light 快 / normal 平衡 / heavy 最像人 */
@@ -216,6 +218,8 @@ export interface PoolStats {
   active: number;
   pending_action: number;
   abnormal: number;
+  /** 回收站账号数 */
+  deleted?: number;
   /** 各任务全量模式的候选账号数（服务端全库统计） */
   task_counts: {
     push: number;
@@ -232,6 +236,8 @@ export interface PoolQuery {
   keyword?: string;
   authed?: string;
   expiry?: string;
+  /** true 时只看回收站 */
+  deleted?: boolean;
 }
 
 export async function fetchPoolStats(): Promise<PoolStats> {
@@ -246,6 +252,7 @@ export async function fetchPoolAccounts(q: PoolQuery = {}): Promise<PoolQueryRes
   if (q.keyword) params.set("keyword", q.keyword);
   if (q.authed && q.authed !== "all") params.set("authed", q.authed);
   if (q.expiry && q.expiry !== "all") params.set("expiry", q.expiry);
+  if (q.deleted) params.set("deleted", "1");
   const qs = params.toString();
   return request<PoolQueryResult>(`/api/pool/accounts${qs ? `?${qs}` : ""}`);
 }
@@ -253,6 +260,13 @@ export async function fetchPoolAccounts(q: PoolQuery = {}): Promise<PoolQueryRes
 export async function deletePoolAccounts(ids: number[]): Promise<{ deleted: number }> {
   return request<{ deleted: number }>("/api/pool/accounts", {
     method: "DELETE",
+    body: JSON.stringify({ ids }),
+  });
+}
+
+export async function restorePoolAccounts(ids: number[]): Promise<{ restored: number }> {
+  return request<{ restored: number }>("/api/pool/accounts/restore", {
+    method: "POST",
     body: JSON.stringify({ ids }),
   });
 }
@@ -291,7 +305,7 @@ export async function inspectPoolAccounts(
 ): Promise<PoolOpTask> {
   return request<PoolOpTask>("/api/pool/inspect", {
     method: "POST",
-    body: JSON.stringify({ ids, concurrency }),
+    body: JSON.stringify(taskRequestBody("inspect", ids ?? [], { concurrency })),
   });
 }
 
@@ -314,7 +328,7 @@ export async function reauthPoolAccounts(
 ): Promise<PoolOpTask> {
   return request<PoolOpTask>("/api/pool/reauth", {
     method: "POST",
-    body: JSON.stringify({ ids, concurrency }),
+    body: JSON.stringify(taskRequestBody("reauth", ids ?? [], { concurrency })),
   });
 }
 
@@ -323,6 +337,10 @@ export interface AuthPoolStatus {
   queue_size: number;
   logs: PoolPushLog[];
   last_log_id: number;
+}
+
+export async function cancelAuthPool(): Promise<AuthPoolStatus> {
+  return request<AuthPoolStatus>("/api/pool/auth/cancel", { method: "POST" });
 }
 
 export async function fetchAuthPoolStatus(afterLogId = 0): Promise<AuthPoolStatus> {
@@ -353,7 +371,7 @@ export async function authPoolAccounts(
 ): Promise<{ results: PoolAuthResultItem[] }> {
   return request<{ results: PoolAuthResultItem[] }>("/api/pool/auth", {
     method: "POST",
-    body: JSON.stringify({ ids }),
+    body: JSON.stringify(taskRequestBody("auth", ids ?? [])),
   });
 }
 
@@ -412,7 +430,7 @@ export async function pushPoolAccounts(
 ): Promise<PoolPushTask> {
   return request<PoolPushTask>("/api/pool/push", {
     method: "POST",
-    body: JSON.stringify({ targets, ids, concurrency }),
+    body: JSON.stringify(taskRequestBody("push", ids ?? [], { targets, concurrency })),
   });
 }
 
@@ -621,10 +639,12 @@ export async function fetchUsageSummary(days = 1): Promise<UsageSummaryData> {
 export async function fetchUsageRecent(
   offset = 0,
   limit = 20,
+  days = 1,
 ): Promise<UsageRecentData> {
   const params = new URLSearchParams({
     offset: String(Math.max(0, offset)),
     limit: String(Math.max(1, Math.min(limit, 100))),
+    days: String(Math.max(1, days)),
   });
   return request<UsageRecentData>(`/api/usage/recent?${params.toString()}`);
 }
@@ -633,12 +653,14 @@ export async function fetchUsageGrouped(
   dimension: UsageGroupDim,
   offset = 0,
   limit = 0,
+  days = 1,
 ): Promise<UsageGroupedData> {
   // limit = 0 → 后端不分页，返回全量
   const params = new URLSearchParams({
     dim: dimension,
     offset: String(Math.max(0, offset)),
     limit: String(Math.max(0, limit)),
+    days: String(Math.max(1, days)),
   });
   return request<UsageGroupedData>(`/api/usage/grouped?${params.toString()}`);
 }

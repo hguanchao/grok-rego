@@ -19,6 +19,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 from api.pool_jobs import (
     auth_pool_state,
+    cancel_auth_pool,
     kick_auth_pool,
     pool_job_manager,
     start_limited_recheck_worker,
@@ -37,6 +38,7 @@ from db import (
     query_usage_grouped,
     query_usage_recent,
     query_usage_summary,
+    restore_accounts,
     soft_delete_accounts,
     update_account_status_by_ids,
 )
@@ -207,8 +209,18 @@ def _handle_register_api(
         if not isinstance(body, dict):
             _error_json(handler, 400, "请求体必须是 JSON 对象")
             return True
-        count = int(body.get("count") or 1)
-        threads = int(body.get("threads") or 1)
+        try:
+            count = int(body.get("count") or 1)
+            threads = int(body.get("threads") or 1)
+        except (TypeError, ValueError):
+            _error_json(handler, 400, "count 与 threads 必须是整数")
+            return True
+        if count < 1 or count > 100:
+            _error_json(handler, 400, "count 必须在 1 到 100 之间")
+            return True
+        if threads < 1 or threads > 20:
+            _error_json(handler, 400, "threads 必须在 1 到 20 之间")
+            return True
         headless = body.get("headless")
         if headless is None:
             headless = True
@@ -236,12 +248,19 @@ def _handle_pool_accounts_api(
         _send_json(handler, 200, {"ok": True, "data": get_pool_stats()})
         return True
     if method == "GET" and path == "/api/pool/accounts":
-        page = int(query.get("page", ["1"])[0] or "1")
-        page_size = int(query.get("page_size", ["20"])[0] or "20")
+        try:
+            page = int(query.get("page", ["1"])[0] or "1")
+        except (TypeError, ValueError):
+            page = 1
+        try:
+            page_size = int(query.get("page_size", ["20"])[0] or "20")
+        except (TypeError, ValueError):
+            page_size = 20
         status = query.get("status", [None])[0]
         keyword = query.get("keyword", [None])[0]
         authed = query.get("authed", [None])[0]
         expiry = query.get("expiry", [None])[0]
+        deleted_raw = (query.get("deleted", ["0"])[0] or "0").strip().lower()
         statuses = None
         if status and status != "all":
             parts = [int(s) for s in str(status).split(",") if s.strip().isdigit()]
@@ -254,6 +273,7 @@ def _handle_pool_accounts_api(
             keyword=keyword or None,
             authed=authed if authed in ("authed", "unauthed") else None,
             expiry=expiry if expiry in ("soon", "expired", "valid") else None,
+            deleted=deleted_raw in ("1", "true", "yes"),
         )
         _send_json(handler, 200, {"ok": True, "data": data})
         return True
@@ -343,6 +363,15 @@ def _handle_pool_accounts_api(
         deleted = soft_delete_accounts([int(i) for i in ids])
         _send_json(handler, 200, {"ok": True, "data": {"deleted": deleted}})
         return True
+    if method == "POST" and path == "/api/pool/accounts/restore":
+        body = _json_body(handler)
+        ids = body.get("ids") if isinstance(body, dict) else None
+        if not isinstance(ids, list) or not ids:
+            _error_json(handler, 400, "ids 必须是非空数组")
+            return True
+        restored = restore_accounts([int(i) for i in ids])
+        _send_json(handler, 200, {"ok": True, "data": {"restored": restored}})
+        return True
     return False
 
 
@@ -355,7 +384,7 @@ def _handle_pool_operations_api(
             _error_json(handler, 400, "请求体必须是 JSON 对象")
             return True
         ids = body.get("ids")
-        # 空数组/缺省 = 全量模式：服务端筛选全部可巡检账号（已认证且非需重登）
+        # 空数组/缺省 = 全量模式：服务端筛选全部可巡检账号（已认证、非需重登、非禁用，含限额）
         if ids is not None and not _is_digit_id_list(ids, allow_empty=True):
             _error_json(handler, 400, "ids 必须是数组")
             return True
@@ -499,6 +528,9 @@ def _handle_pool_maintenance_api(
             handler, 200, {"ok": True, "data": auth_pool_state(after_log_id=after)}
         )
         return True
+    if method == "POST" and path == "/api/pool/auth/cancel":
+        _send_json(handler, 200, {"ok": True, "data": cancel_auth_pool()})
+        return True
     return False
 
 
@@ -528,13 +560,20 @@ def _handle_usage_api(
         except (TypeError, ValueError):
             limit = 0
         try:
+            days = int(query.get("days", ["1"])[0] or "1")
+        except (TypeError, ValueError):
+            days = 1
+        try:
             _send_json(
                 handler,
                 200,
                 {
                     "ok": True,
                     "data": query_usage_grouped(
-                        dimension=dimension, offset=offset, limit=limit
+                        dimension=dimension,
+                        offset=offset,
+                        limit=limit,
+                        days=days,
                     ),
                 },
             )
@@ -550,10 +589,17 @@ def _handle_usage_api(
             limit = int(query.get("limit", ["20"])[0] or "20")
         except (TypeError, ValueError):
             limit = 20
+        try:
+            days = int(query.get("days", ["1"])[0] or "1")
+        except (TypeError, ValueError):
+            days = 1
         _send_json(
             handler,
             200,
-            {"ok": True, "data": query_usage_recent(offset=offset, limit=limit)},
+            {
+                "ok": True,
+                "data": query_usage_recent(offset=offset, limit=limit, days=days),
+            },
         )
         return True
     return False

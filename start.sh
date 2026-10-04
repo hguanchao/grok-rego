@@ -153,6 +153,8 @@ echo
 
 mkdir -p server/logs
 SERVER_LOG="server/logs/server.log"
+# 业务日志由 loguru 写入 server.log。stdout/stderr 另存，避免同一条日志写两遍。
+STDIO_LOG="server/logs/stdio.log"
 
 # 可移植端口探测：优先 nc，其次 curl，最后 python3
 port_open() {
@@ -199,14 +201,14 @@ wait_port() {
   return 1
 }
 
-# 1) 先启动后端（stdout/stderr 写入 server.log，不在控制台打印）
+# 1) 先启动后端。loguru 写 server.log；进程输出写 stdio.log，不混进业务日志。
 (
   cd server || exit 1
   exec uv run python main.py --serve 8787
-) >>"$SERVER_LOG" 2>&1 &
+) >>"$STDIO_LOG" 2>&1 &
 server_pid=$!
 if ! wait_port 127.0.0.1 8787 "$server_pid" 30; then
-  echo "[FAIL] 后端未在 30s 内就绪 (http://127.0.0.1:8787)，详见 server/logs/server.log"
+  echo "[FAIL] 后端未在 30s 内就绪 (http://127.0.0.1:8787)，详见 server/logs/server.log 与 server/logs/stdio.log"
   exit 1
 fi
 echo "[OK]   后端服务  http://127.0.0.1:8787  (pid ${server_pid})"

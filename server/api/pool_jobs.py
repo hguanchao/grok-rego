@@ -196,6 +196,7 @@ import threading
 
 _auth_pool_lock = threading.Lock()
 _auth_pool_running = False
+_auth_pool_cancel = threading.Event()
 _auth_pool_logs: list[dict[str, Any]] = []
 _auth_pool_last_log_id = 0
 _AUTH_LOG_LIMIT = 200
@@ -223,38 +224,72 @@ def kick_auth_pool() -> None:
         if _auth_pool_running:
             logger.debug("[认证池] 已有消化线程运行，跳过本轮触发")
             return
-    # 先占全局互斥再置位：互斥失败不产生“已标记运行却未启动”的脏状态
+    # 先占全局互斥再置位：互斥失败不产生“已标记运行却未启动”的脏状态。
+    # 本轮没把线程拉起来就放开互斥；已有消化线程时不能清掉它的运行标记。
     mutex_acquire("认证")
-    with _auth_pool_lock:
-        if _auth_pool_running:  # 并发触发防御
+    started = False
+    owned = False
+    try:
+        with _auth_pool_lock:
+            if _auth_pool_running:  # 并发触发防御
+                return
+            _auth_pool_cancel.clear()
+            _auth_pool_running = True
+            owned = True
+            # 新一轮仅保留本轮日志，游标继续单调递增，避免前端 after 游标回退。
+            _auth_pool_logs.clear()
+        logger.info("[认证池] 消化线程启动")
+
+        def worker() -> None:
+            global _auth_pool_running
+            try:
+                # 局部导入：register 模块带 Camoufox 重依赖，避免启动时加载
+                from workflow.register import run_auth_pool
+
+                def on_result(email: str, ok: bool, reason: str) -> None:
+                    level = "SUCCESS" if ok else "ERROR"
+                    action = "认证成功，Token 已入库" if ok else f"认证失败：{reason}"
+                    _append_auth_pool_log(level, f"{email}·{action}")
+
+                count = run_auth_pool(
+                    on_result=on_result,
+                    stop_when=_auth_pool_cancel.is_set,
+                )
+                if _auth_pool_cancel.is_set():
+                    _append_auth_pool_log("WARNING", "认证已停止")
+                    logger.warning(f"[认证池] 已停止: 成功 {count} 个")
+                else:
+                    logger.info(f"[认证池] 消化完成: 成功 {count} 个")
+            except Exception as exc:
+                logger.error(f"[认证池] 后台消化异常: {type(exc).__name__}: {exc}")
+            finally:
+                with _auth_pool_lock:
+                    _auth_pool_running = False
+                mutex_release("认证")
+
+        threading.Thread(target=worker, daemon=True, name="认证池消化").start()
+        started = True
+    finally:
+        if not started:
+            if owned:
+                with _auth_pool_lock:
+                    _auth_pool_running = False
             mutex_release("认证")
-            return
-        _auth_pool_running = True
-        # 新一轮仅保留本轮日志，游标继续单调递增，避免前端 after 游标回退。
-        _auth_pool_logs.clear()
-    logger.info("[认证池] 消化线程启动")
 
-    def worker() -> None:
-        global _auth_pool_running
-        try:
-            # 局部导入：register 模块带 Camoufox 重依赖，避免启动时加载
-            from workflow.register import run_auth_pool
 
-            def on_result(email: str, ok: bool, reason: str) -> None:
-                level = "SUCCESS" if ok else "ERROR"
-                action = "认证成功，Token 已入库" if ok else f"认证失败：{reason}"
-                _append_auth_pool_log(level, f"{email}·{action}")
+def cancel_auth_pool() -> dict[str, Any]:
+    """请求停止认证池消化。当前账号跑完后退出，并放开全局互斥。
 
-            count = run_auth_pool(on_result=on_result)
-            logger.info(f"[认证池] 消化完成: 成功 {count} 个")
-        except Exception as exc:
-            logger.error(f"[认证池] 后台消化异常: {type(exc).__name__}: {exc}")
-        finally:
-            with _auth_pool_lock:
-                _auth_pool_running = False
-            mutex_release("认证")
-
-    threading.Thread(target=worker, daemon=True, name="认证池消化").start()
+    队列里还没开始的账号留着，下次点认证会继续。只停前端轮询不会放开互斥，
+    其它任务会一直被挡着。
+    """
+    _auth_pool_cancel.set()
+    _append_auth_pool_log(
+        "WARNING",
+        "已请求停止，当前账号完成后结束；其余账号留在队列",
+    )
+    logger.warning("[认证池] 已请求停止")
+    return auth_pool_state(0)
 
 
 def auth_pool_state(after_log_id: int = 0) -> dict[str, Any]:
@@ -282,7 +317,9 @@ def auth_pool_state(after_log_id: int = 0) -> dict[str, Any]:
 - 探活 / 刷新均为真实上游请求，账号间随机间隔防风控
 - 协作式取消：cancel 事件贯穿预筛 / 探活 / 刷新 / 重登降级各阶段
 
-kind=inspect  GET /billing 探活验证 token：2xx 恢复 ACTIVE，临期（≤10min）自动续期 /
+kind=inspect  GET /billing 探活验证 token：限额账号也可巡检；
+              2xx 且非限额冻结期内恢复 ACTIVE，临期（≤10min）自动续期 /
+              限额未满 24h 时 2xx 只记探活、保持限额（/billing 对额度耗尽仍返回 2xx）/
               401·403 恢复链（刷新后再探，仍失效标 REAUTH）/
               402·429 限流配额 / 网络与 5xx 不改状态只记原因
               续期失败不判死（探活已通过，旧 token 仍可用，下轮重试）；
@@ -294,7 +331,7 @@ kind=reauth   重登闭环：有 refresh_token 先 OIDC 刷新；被拒或无刷
 import threading
 import uuid
 
-# 并发上限（与前端并发输入框 1-20 对齐；实际按 20 线程、每线程间隔 1s 跑号）
+# 并发上限与前端输入框对齐。任务实际线程数用 job.concurrency，不再写死 20。
 MAX_CONCURRENCY = ACCOUNT_WORKERS
 # 任务日志内存环形保留条数
 _LOG_LIMIT = 500
@@ -453,25 +490,37 @@ class PoolJobManager:
             raise RuntimeError(f"未知任务类型: {kind}")
         concurrency = _clamp_concurrency(concurrency)
         ids = [int(i) for i in account_ids] if account_ids else []
-        # 全局互斥：其它重任务（推送/认证/注册）进行中则拒绝
+        # 全局互斥：其它重任务（推送/认证/注册）进行中则拒绝。
+        # 线程没真正拉起就失败时必须放开，否则按钮会一直显示忙碌。
         mutex_acquire("号池")
-
-        with self._lock:
-            job = self._job
-            if job is not None and job.status in ("pending", "running"):
-                raise RuntimeError("已有号池任务进行中，请等待完成或取消")
-            job = PoolJob(
-                task_id=uuid.uuid4().hex[:12],
-                kind=kind,
-                account_ids=ids,
-                concurrency=concurrency,
-            )
-            self._job = job
-            self._worker = threading.Thread(
-                target=self._run_job, args=(job,), name=f"号池任务-{kind}", daemon=True
-            )
-            self._worker.start()
-        return self.status()
+        started = False
+        try:
+            with self._lock:
+                job = self._job
+                if job is not None and job.status in ("pending", "running"):
+                    raise RuntimeError("已有号池任务进行中，请等待完成或取消")
+                job = PoolJob(
+                    task_id=uuid.uuid4().hex[:12],
+                    kind=kind,
+                    account_ids=ids,
+                    concurrency=concurrency,
+                )
+                self._job = job
+                self._worker = threading.Thread(
+                    target=self._run_job, args=(job,), name=f"号池任务-{kind}", daemon=True
+                )
+                try:
+                    self._worker.start()
+                except Exception:
+                    # 线程没起来就不能留下 pending 任务，否则下次启动永远被挡住。
+                    self._job = None
+                    self._worker = None
+                    raise
+                started = True
+            return self.status()
+        finally:
+            if not started:
+                mutex_release("号池")
 
     def cancel(self) -> dict[str, Any]:
         """请求取消当前任务（协作式，由 worker 在检查点退出）。"""
@@ -523,7 +572,7 @@ class PoolJobManager:
 
         未认证账号（无 access_token）一律排除：仅可走认证（/api/pool/auth），
         巡检 / 重登均不处理（满足“未认证账号只能执行认证”约束）。
-        require_token=True（巡检）：状态为需重登(2) 亦跳过；
+        require_token=True（巡检）：状态为需重登(2) 亦跳过；限额(3) 可巡检。
         require_token=False（重登）：指定 ids 时按 id 处理（需重登账号），
         重登全量模式（未传 ids）仅处理需重登(2)状态的账号。
         跳过明细只记入 skipped_list 与文件日志，任务日志聚合为一条摘要，
@@ -555,14 +604,6 @@ class PoolJobManager:
             elif require_token and int(acc.get("status") or 1) == 2:
                 # 巡检排除需重登状态（探活无意义，待重登闭环处理）
                 skip_reason = "需重登"
-            elif (
-                require_token
-                and int(acc.get("status") or 1) == STATUS_LIMITED
-                and not _limited_hold_expired(acc)
-            ):
-                # 限额账号 24h 冻结期内不探活：/billing 对额度耗尽仍返回 2xx，
-                # 提前捞回会让死号立刻回池再吃 429；冻满 24h 后正常探活恢复
-                skip_reason = "限额冻结中（未到 24h）"
             elif (
                 reauth_all_only_pending
                 and int(acc.get("status") or 1) != 2
@@ -597,11 +638,11 @@ class PoolJobManager:
         candidates = self._screen(job, require_token=True)
         job.append_log(
             "INFO",
-            f"[任务] 巡检开始 {job.count} 个 / {ACCOUNT_WORKERS} 线程 "
+            f"[任务] 巡检开始 {job.count} 个 / {job.concurrency} 线程 "
             f"每线程间隔 {ACCOUNT_WORKER_GAP_SEC:.0f}s",
         )
         logger.info(
-            f"[号池任务] 巡检启动 候选 {job.count} 个 / {ACCOUNT_WORKERS} 线程 "
+            f"[号池任务] 巡检启动 候选 {job.count} 个 / {job.concurrency} 线程 "
             f"每线程间隔 {ACCOUNT_WORKER_GAP_SEC:.0f}s / 任务 {job.id}"
         )
         if not candidates:
@@ -621,9 +662,26 @@ class PoolJobManager:
             detail = str(result.get("error") or "").strip()
             quota_reason = str(result.get("quota_reason") or "").strip()
 
-            # 通过：恢复 ACTIVE，刷新探活时间，并对临期 token 续期
-            # （降智判定已移交网关被动审计，续期已从自动续期 daemon 并入巡检）
+            # 通过：非限额冻结期恢复 ACTIVE，刷新探活时间，并对临期 token 续期。
+            # /billing 对额度耗尽仍返回 2xx，未满 24h 不能据此解禁。
             if _HTTP_OK_MIN <= status <= _HTTP_OK_MAX:
+                held_limited = (
+                    int(acc.get("status") or 1) == STATUS_LIMITED
+                    and not _limited_hold_expired(acc)
+                )
+                if held_limited:
+                    touch_inspected(aid)
+                    update_account_status_by_ids(
+                        [aid],
+                        None,
+                        "限额冻结中：/billing 探活通过，未满 24h 保持限额",
+                    )
+                    return {
+                        "aid": aid,
+                        "ok": True,
+                        "message": "探活通过，限额未满 24h，保持限额",
+                        "cost": elapsed_label(t0),
+                    }
                 update_account_status_by_ids([aid], STATUS_ACTIVE, "")
                 touch_inspected(aid)
                 # 临期续期：剩余寿命 ≤ _RENEW_LEAD_SEC 且有刷新凭据时续期；
@@ -671,6 +729,23 @@ class PoolJobManager:
             if status in _HTTP_TOKEN_INVALID:
                 refreshed = self._refresh_and_reprobe(job, acc)
                 if refreshed:
+                    if (
+                        int(acc.get("status") or 1) == STATUS_LIMITED
+                        and not _limited_hold_expired(acc)
+                    ):
+                        # 刷新会改写 reason；未满 24h 只回写原因，不把 status 设回限额
+                        # （设回限额会把 limited_at 重置为现在）。
+                        update_account_status_by_ids(
+                            [aid],
+                            None,
+                            "限额冻结中：刷新后探活通过，未满 24h 保持限额",
+                        )
+                        return {
+                            "aid": aid,
+                            "ok": True,
+                            "message": f"{status} 刷新后探活通过，限额未满 24h，保持限额",
+                            "cost": elapsed_label(t0),
+                        }
                     update_account_status_by_ids([aid], STATUS_ACTIVE, "")
                     return {
                         "aid": aid,
@@ -766,11 +841,11 @@ class PoolJobManager:
         candidates = self._screen(job, require_token=False)
         job.append_log(
             "INFO",
-            f"[任务] 重登开始 {job.count} 个 / {ACCOUNT_WORKERS} 线程 "
+            f"[任务] 重登开始 {job.count} 个 / {job.concurrency} 线程 "
             f"每线程间隔 {ACCOUNT_WORKER_GAP_SEC:.0f}s",
         )
         logger.info(
-            f"[号池任务] 重登启动 候选 {job.count} 个 / {ACCOUNT_WORKERS} 线程 "
+            f"[号池任务] 重登启动 候选 {job.count} 个 / {job.concurrency} 线程 "
             f"每线程间隔 {ACCOUNT_WORKER_GAP_SEC:.0f}s / 任务 {job.id}"
         )
         if not candidates:
@@ -858,8 +933,9 @@ class PoolJobManager:
     # ─── 公共：并发执行与结果汇总 ─────────────────────────
 
     def _run_concurrent(self, job: PoolJob, candidates, work) -> None:
-        """20 个 worker 并发执行 work(acc)，每个 worker 做完一个号再隔 1 秒接下一个。"""
+        """按任务并发数执行 work(acc)，每个 worker 做完一个号再隔 1 秒接下一个。"""
         label = "巡检" if job.kind == "inspect" else "重登"
+        workers = max(1, min(int(job.concurrency or 1), MAX_CONCURRENCY))
 
         def on_complete(_index: int, acc: dict[str, Any], result: Any) -> None:
             level = "ERROR"
@@ -892,7 +968,7 @@ class PoolJobManager:
         run_account_workers(
             candidates,
             work,
-            workers=ACCOUNT_WORKERS,
+            workers=workers,
             thread_name_prefix="号池",
             should_stop=job.cancel_event.is_set,
             on_complete=on_complete,

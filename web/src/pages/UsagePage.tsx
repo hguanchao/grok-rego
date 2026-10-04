@@ -92,7 +92,7 @@ export function UsagePage() {
       const dim = dimRef.current;
       if (dim === "requests") return;
       try {
-        const next = await fetchUsageGrouped(dim, (page - 1) * size, size);
+        const next = await fetchUsageGrouped(dim, (page - 1) * size, size, Number(days));
         if (seq !== groupSeq.current) return;
         setGrouped((prev) => ({ ...prev, [dim]: next.items }));
         setGroupTotal(next.total);
@@ -108,7 +108,7 @@ export function UsagePage() {
         }
       }
     },
-    [setGroupPage],
+    [days, setGroupPage],
   );
 
   const load = useCallback(
@@ -143,7 +143,7 @@ export function UsagePage() {
   const loadDetail = useCallback(async (page: number, size: number, silent = false) => {
     const seq = ++detailSeq.current;
     try {
-      const next = await fetchUsageRecent((page - 1) * size, size);
+      const next = await fetchUsageRecent((page - 1) * size, size, Number(days));
       if (seq !== detailSeq.current) return;
       const totalPages = Math.max(1, Math.ceil(next.total / Math.max(1, size)));
       if (page > totalPages) {
@@ -158,7 +158,7 @@ export function UsagePage() {
         toast.error(err instanceof ApiError ? err.message : "加载用量明细失败");
       }
     }
-  }, [setDetailPage]);
+  }, [days, setDetailPage]);
 
   useEffect(() => {
     void load();
@@ -224,7 +224,14 @@ export function UsagePage() {
               <em>//</em> Telemetry
             </span>
             <h1 className="usage-title">用量统计</h1>
-            <p className="usage-subtitle">网关请求 · Token · 模型 · 明细</p>
+            <p className="usage-subtitle">
+              网关请求 · Token · 模型 · 明细
+              {data ? (
+                <span className="gw-uptime">
+                  {data.from === data.to ? data.from : `${data.from} – ${data.to}`}
+                </span>
+              ) : null}
+            </p>
           </div>
 
           <div className="usage-toolbar-actions">
@@ -475,7 +482,7 @@ export function UsagePage() {
 
         <div className="usage-foot">
           <span className="font-mono text-[11px] text-muted-foreground">
-            本机落库网关统计 · auto 30s
+            明细与顶部统计同一时间窗 · 每 30 秒刷新
           </span>
         </div>
       </div>

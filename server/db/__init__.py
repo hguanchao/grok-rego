@@ -80,8 +80,8 @@ STATUS_REAUTH = 2
 STATUS_LIMITED = 3
 STATUS_DISABLED = 6
 
-# 限额（额度耗尽）账号的最短冻结时长：上游额度按日重置（24h），
-# 期间巡检不得凭 /billing 2xx 提前捞回（该接口对额度耗尽仍返回 2xx）
+# 限额（额度耗尽）账号的最短冻结时长：上游额度按日重置（24h）。
+# 限额账号可以巡检；/billing 对额度耗尽仍返回 2xx，未满 24h 不得据此解禁。
 LIMITED_HOLD_SECONDS = 24 * 3600
 
 
@@ -445,14 +445,17 @@ def query_accounts(
     keyword: str | None = None,
     authed: str | None = None,
     expiry: str | None = None,
+    deleted: bool = False,
 ) -> dict[str, Any]:
-    """分页查询账号列表（排除已软删），返回 {items, total, page, page_size}。
+    """分页查询账号列表，返回 {items, total, page, page_size}。
+
+    deleted 为真时只看回收站，否则排除已软删。
 
     - statuses: 状态值列表（逗号拆分传入，如 [4,5,6] 表示全部异常态）
     - expiry: 基于 JWT exp 与当前时间比较（到期 1h 内 / 已到期 / 未到期）；
       注意不能用上限返回的 expires_in 列——那是注册时的静态有效期秒数，与剩余时间无关。
     """
-    where = ["COALESCE(is_deleted, 0) = 0"]
+    where = ["COALESCE(is_deleted, 0) = 1" if deleted else "COALESCE(is_deleted, 0) = 0"]
     params: list[Any] = []
 
     if statuses:
@@ -554,11 +557,15 @@ def get_pool_stats() -> dict[str, int]:
             FROM accounts WHERE COALESCE(is_deleted, 0) = 0
             """
         ).fetchone()
+        deleted = conn.execute(
+            "SELECT COUNT(*) FROM accounts WHERE COALESCE(is_deleted, 0) = 1"
+        ).fetchone()[0]
     return {
         "total": row["total"] or 0,
         "active": row["active"] or 0,
         "pending_action": row["pending_action"] or 0,
         "abnormal": row["abnormal"] or 0,
+        "deleted": deleted or 0,
         "task_counts": {
             "push": row["push_count"] or 0,
             "auth": row["auth_count"] or 0,
@@ -577,6 +584,22 @@ def soft_delete_accounts(account_ids: list[int]) -> int:
         cursor = conn.cursor()
         cursor.execute(
             f"UPDATE accounts SET is_deleted = 1, updated_at=? WHERE id IN ({placeholders})",
+            [now_iso_tz(), *account_ids],
+        )
+        conn.commit()
+        return cursor.rowcount
+
+
+def restore_accounts(account_ids: list[int]) -> int:
+    """从回收站恢复账号（is_deleted = 0），返回受影响行数。"""
+    if not account_ids:
+        return 0
+    placeholders = ",".join("?" * len(account_ids))
+    with connect() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            f"UPDATE accounts SET is_deleted = 0, updated_at=? "
+            f"WHERE COALESCE(is_deleted, 0) = 1 AND id IN ({placeholders})",
             [now_iso_tz(), *account_ids],
         )
         conn.commit()
@@ -1056,16 +1079,22 @@ def query_usage_summary(days: int = 1) -> dict[str, Any]:
     }
 
 
-def query_usage_recent(*, offset: int = 0, limit: int = 20) -> dict[str, Any]:
-    """最近用量明细分页，与统计窗口无关。"""
+def query_usage_recent(
+    *, offset: int = 0, limit: int = 20, days: int = 1
+) -> dict[str, Any]:
+    """用量明细分页，时间窗与顶部 KPI 相同（北京日历日）。"""
     offset = max(0, int(offset))
     limit = max(1, min(int(limit), 100))
+    _days, date_from, date_to = _usage_window(days)
+    where, params = _usage_date_where(date_from, date_to)
     with connect() as conn:
         conn.row_factory = sqlite3.Row
-        total = conn.execute("SELECT COUNT(*) FROM usages").fetchone()[0]
+        total = conn.execute(
+            f"SELECT COUNT(*) FROM usages WHERE {where}", params
+        ).fetchone()[0]
         items = conn.execute(
-            "SELECT * FROM usages ORDER BY id DESC LIMIT ? OFFSET ?",
-            (limit, offset),
+            f"SELECT * FROM usages WHERE {where} ORDER BY id DESC LIMIT ? OFFSET ?",
+            [*params, limit, offset],
         ).fetchall()
     decoded_items = []
     for row in items:
@@ -1091,10 +1120,11 @@ _GROUPED_KEY = {
 
 
 def query_usage_grouped(
-    *, dimension: str, offset: int = 0, limit: int = 0
+    *, dimension: str, offset: int = 0, limit: int = 0, days: int = 1
 ) -> dict[str, Any]:
     """按维度聚合用量：account（账号）/ model（模型），支持分页。
 
+    时间窗与顶部 KPI 相同（北京日历日）。
     返回每个维度的请求数、成功/失败、token 汇总与最近一次时间。
     limit <= 0 表示不分页（返回全量，兼容老调用）；limit > 0 时按 offset 分页，
     同时返回分组总数 total 供前端算总页数。
@@ -1105,6 +1135,8 @@ def query_usage_grouped(
     key_expr = _GROUPED_KEY[dimension]
     offset = max(0, int(offset))
     limit = max(0, int(limit))
+    _days, date_from, date_to = _usage_window(days)
+    where, params = _usage_date_where(date_from, date_to)
     # 聚合作为子查询：总数 COUNT 与分页取页共用同一段 SQL，避免两处逻辑漂移
     grouped = f"""
             SELECT {key_expr} AS key,
@@ -1118,17 +1150,20 @@ def query_usage_grouped(
                    SUM(CASE WHEN stream = 1 THEN 1 ELSE 0 END) AS stream_count,
                    MAX(created_at) AS last_at
             FROM usages
+            WHERE {where}
             GROUP BY key
     """
     with connect() as conn:
         conn.row_factory = sqlite3.Row
-        total = conn.execute(f"SELECT COUNT(*) FROM ({grouped})").fetchone()[0]
+        total = conn.execute(
+            f"SELECT COUNT(*) FROM ({grouped})", params
+        ).fetchone()[0]
         sql = f"SELECT * FROM ({grouped}) ORDER BY requests DESC, key"
-        params: list[Any] = []
+        page_params = list(params)
         if limit > 0:
             sql += " LIMIT ? OFFSET ?"
-            params = [limit, offset]
-        rows = conn.execute(sql, params).fetchall()
+            page_params.extend([limit, offset])
+        rows = conn.execute(sql, page_params).fetchall()
     items: list[dict[str, Any]] = []
     for row in rows:
         p = _usages_int(row, "prompt_tokens")

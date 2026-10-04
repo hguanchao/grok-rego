@@ -1,10 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { usePageCache } from "@/lib/page-cache";
+import { taskAccountIds } from "@/lib/task-selection";
 import {
   Eye,
   EyeOff,
   LogIn,
   Play,
+  ArchiveRestore,
   RefreshCw,
   ScrollText,
   Search,
@@ -62,6 +64,8 @@ import {
   fetchPoolAccounts,
   fetchPoolStats,
   deletePoolAccounts,
+  restorePoolAccounts,
+  cancelAuthPool,
   inspectPoolAccounts,
   authPoolAccounts,
   pushPoolAccounts,
@@ -128,8 +132,10 @@ export function PoolPage() {
     active: 0,
     pending_action: 0,
     abnormal: 0,
+    deleted: 0,
     task_counts: { push: 0, auth: 0, reauth: 0, inspect: 0 },
   }));
+  const [trashView, setTrashView] = usePageCache("pool.trashView", () => false);
   const [accounts, setAccounts] = usePageCache<PoolAccount[]>("pool.accounts", () => []);
   const [total, setTotal] = usePageCache("pool.total", () => 0);
   const [loading, setLoading] = useState(false);
@@ -153,6 +159,7 @@ export function PoolPage() {
     kind: "auth" | "reauth" | "inspect" | "push";
     scope: string;
     detail: string;
+    ids: number[];
   } | null>(null);
   const [detailAccount, setDetailAccount] = useState<PoolAccount | null>(null);
   // 详情弹窗独立的密码可见性，避免与列表 visiblePasswords 共享导致联动
@@ -276,6 +283,7 @@ export function PoolPage() {
           keyword: keyword || undefined,
           authed: authedFilter,
           expiry: expiryFilter,
+          deleted: trashView,
         }),
         fetchPoolStats(),
       ]);
@@ -292,7 +300,7 @@ export function PoolPage() {
       if (seq !== reqSeqRef.current) return;
       if (!silent) setLoading(false);
     }
-  }, [page, pageSize, statusFilter, keyword, authedFilter, expiryFilter]);
+  }, [page, pageSize, statusFilter, keyword, authedFilter, expiryFilter, trashView]);
 
   /** 手动刷新：静默加载（表格不闪骨架屏），按钮旋转至少 MIN_SPIN_MS */
   const handleRefresh = useCallback(async () => {
@@ -589,6 +597,30 @@ export function PoolPage() {
     [appendLogs, appendPoolTaskLogs, load, settleTask, stopPoolPolling],
   );
 
+  /** 停止认证：通知后端结束消化，并停掉本页轮询。 */
+  const stopAuthWork = useCallback(async () => {
+    stopAuthPolling();
+    setInspecting(false);
+    try {
+      await cancelAuthPool();
+      appendLogs([
+        {
+          type: "auth",
+          level: "WARNING",
+          message: "[认证] 已请求停止，当前账号完成后结束",
+        },
+      ]);
+    } catch (error) {
+      appendLogs([
+        {
+          type: "auth",
+          level: "ERROR",
+          message: `[认证] 停止失败：${error instanceof Error ? error.message : String(error)}`,
+        },
+      ]);
+    }
+  }, [appendLogs, stopAuthPolling]);
+
   /** 取消巡检/重登任务 */
   const handleCancelPoolTask = useCallback(async () => {
     const kind = poolTask?.kind ?? "inspect";
@@ -789,6 +821,20 @@ export function PoolPage() {
     setPage(1);
   };
 
+  const offPageSelected = Math.max(0, selected.size - accounts.filter((a) => selected.has(a.id)).length);
+
+  const enterTrash = () => {
+    setTrashView(true);
+    setSelected(new Set());
+    setPage(1);
+  };
+
+  const leaveTrash = () => {
+    setTrashView(false);
+    setSelected(new Set());
+    setPage(1);
+  };
+
   const toggleSelect = (id: number) => {
     setSelected((prev) => {
       const next = new Set(prev);
@@ -921,7 +967,7 @@ export function PoolPage() {
       const res = await deletePoolAccounts(ids);
       setSelected(new Set());
       setDeleteOpen(false);
-      toast.success(`已删除 ${res.deleted} 个账号`);
+      toast.success(`已移入回收站 ${res.deleted} 个账号`);
       void load(true);
     } catch (e) {
       toast.error("删除失败", {
@@ -930,11 +976,27 @@ export function PoolPage() {
     }
   };
 
-  const handleInspect = async () => {
+  const handleRestore = async () => {
+    const ids = [...selected];
+    if (!ids.length) return;
+    try {
+      const res = await restorePoolAccounts(ids);
+      setSelected(new Set());
+      toast.success(`已恢复 ${res.restored} 个账号`);
+      void load(true);
+    } catch (e) {
+      toast.error("恢复失败", {
+        description: e instanceof Error ? e.message : String(e),
+      });
+    }
+  };
+
+  const handleInspect = async (pickedIds?: number[]) => {
     if (runningTask) return;
     setInspecting(true);
-    // 勾选→仅选中账号（未认证/需重登由服务端跳过）；未勾选→服务端全量筛选
-    const ids = selected.size > 0 ? [...selected] : undefined;
+    // 勾选→仅选中账号（未认证/需重登由服务端跳过）；未勾选→服务端全量筛选。
+    // 确认弹窗关闭时会先清空 confirmTask，调用方必须把当时的 id 传进来。
+    const ids = taskAccountIds(pickedIds ?? [...selected]);
 
     openLogDrawer();
     try {
@@ -962,11 +1024,11 @@ export function PoolPage() {
     }
   };
 
-  const handleBatchReauth = async () => {
+  const handleBatchReauth = async (pickedIds?: number[]) => {
     if (runningTask) return;
     setInspecting(true);
     // 勾选→仅选中账号；未勾选→服务端全量筛选需重登(2)账号
-    const ids = selected.size > 0 ? [...selected] : undefined;
+    const ids = taskAccountIds(pickedIds ?? [...selected]);
     openLogDrawer();
     try {
       const task = await reauthPoolAccounts(
@@ -993,19 +1055,15 @@ export function PoolPage() {
     }
   };
 
-  const handleBatchAuth = async () => {
+  const handleBatchAuth = async (pickedIds?: number[]) => {
     if (runningTask === "auth") {
-      stopAuthPolling();
-      setInspecting(false);
-      appendLogs([
-        { type: "auth", level: "WARNING", message: "[认证] 已停止等待" },
-      ]);
+      void stopAuthWork();
       return;
     }
     if (runningTask) return;
     setInspecting(true);
     // 勾选→仅选中账号（已认证由服务端跳过）；未勾选→服务端全量筛选未认证账号
-    const ids = selected.size > 0 ? [...selected] : undefined;
+    const ids = taskAccountIds(pickedIds ?? [...selected]);
     openLogDrawer();
     let authPollingStarted = false;
     try {
@@ -1071,19 +1129,15 @@ export function PoolPage() {
         void handleCancelPoolTask();
         break;
       case "auth":
-        stopAuthPolling();
-        setInspecting(false);
-        appendLogs([
-          { type: "auth", level: "WARNING", message: "[认证] 已停止等待" },
-        ]);
+        void stopAuthWork();
         break;
     }
-  }, [runningTask, handleCancelPush, handleCancelPoolTask, stopAuthPolling, appendLogs]);
+  }, [runningTask, handleCancelPush, handleCancelPoolTask, stopAuthWork]);
 
   /** 发起推送：异步任务 + 增量日志轮询；服务端预筛未认证/状态非正常账号 */
-  const handleStartPush = async () => {
+  const handleStartPush = async (pickedIds?: number[]) => {
     // 勾选→仅推送选中；未勾选→服务端全量筛选已认证且状态正常账号
-    const ids = selected.size > 0 ? [...selected] : undefined;
+    const ids = taskAccountIds(pickedIds ?? [...selected]);
     const targets: Array<"g2a" | "cpa"> = [];
     if (g2aConfigured) targets.push("g2a");
     if (cpaConfigured) targets.push("cpa");
@@ -1135,10 +1189,11 @@ export function PoolPage() {
    * （数量取 /api/pool/stats 的 task_counts 全库统计，避免受当前分页影响）。
    */
   const openTaskConfirm = (kind: "auth" | "reauth" | "inspect" | "push") => {
-    const picked = selected.size > 0;
+    const pickedIds = taskAccountIds([...selected]);
+    const picked = pickedIds !== undefined;
     let scope: string;
     if (picked) {
-      scope = `选中的 ${selected.size} 个账号`;
+      scope = `选中的 ${pickedIds.length} 个账号`;
     } else if (stats.task_counts) {
       // 全量模式：数量取服务端全库统计（避免受当前分页影响）
       const count = stats.task_counts[kind] ?? 0;
@@ -1160,7 +1215,8 @@ export function PoolPage() {
     const detail: Record<typeof kind, string> = {
       auth: "将对账号发起 SSO 认证并交换 Token，未认证账号才会被处理。",
       reauth: "将刷新账号登录态；无刷新凭据或刷新被拒时，任务内直接发起 SSO 重新认证。",
-      inspect: "将逐个 GET /billing 探活并临期续期 token，产生真实上游请求。",
+      inspect:
+        "将逐个 GET /billing 探活并临期续期 token，产生真实上游请求。限额账号也可巡检；未满 24 小时不会因探活通过而解禁。",
       push: `将把账号同步到 ${[
         g2aConfigured ? "G2A" : null,
         cpaConfigured ? "CPA" : null,
@@ -1168,17 +1224,28 @@ export function PoolPage() {
         .filter(Boolean)
         .join(" / ")}，外部系统将创建对应记录。`,
     };
-    setConfirmTask({ kind, scope, detail: detail[kind] });
+    setConfirmTask({
+      kind,
+      scope,
+      detail: detail[kind],
+      ids: pickedIds ?? [],
+    });
   };
 
-  /** 确认后分发到对应任务 handler（弹窗先关，避免叠层） */
+  /**
+   * 确认后分发到对应任务 handler。
+   * 先取出任务类型和当时的勾选 id，再关弹窗：关弹窗会清空 confirmTask，
+   * 而 AlertDialogAction 关闭时还会把焦点送回触发按钮并重渲染，
+   * 若在关弹窗之后再读 selected，读到的是空集合，任务会按全库执行。
+   */
   const runConfirmedTask = () => {
     const kind = confirmTask?.kind;
+    const pickedIds = confirmTask?.ids ?? [];
     setConfirmTask(null);
-    if (kind === "auth") void handleBatchAuth();
-    else if (kind === "reauth") void handleBatchReauth();
-    else if (kind === "inspect") void handleInspect();
-    else if (kind === "push") void handleStartPush();
+    if (kind === "auth") void handleBatchAuth(pickedIds);
+    else if (kind === "reauth") void handleBatchReauth(pickedIds);
+    else if (kind === "inspect") void handleInspect(pickedIds);
+    else if (kind === "push") void handleStartPush(pickedIds);
   };
 
   return (
@@ -1302,7 +1369,7 @@ export function PoolPage() {
                 type="button"
                 size="sm"
                 variant="outline"
-                title="立即刷新（另有 10s 自动刷新）"
+                title="立即刷新列表"
                 className="pool-refresh-btn"
                 onClick={() => void handleRefresh()}
                 disabled={refreshing}
@@ -1337,9 +1404,11 @@ export function PoolPage() {
               <Button
                 size="sm"
                 variant="outline"
-                disabled={anyBusy}
+                disabled={anyBusy || trashView}
                 title={
-                  runningTask
+                  trashView
+                    ? "回收站中的账号不能推送"
+                    : runningTask
                     ? "任务执行中，请先停止"
                     : selected.size > 0
                       ? "推送选中账号（仅已认证且状态正常，其余跳过）"
@@ -1352,13 +1421,34 @@ export function PoolPage() {
               </Button>
               <Button
                 size="sm"
-                variant="destructive"
-                disabled={selected.size === 0}
-                onClick={() => setDeleteOpen(true)}
+                variant={trashView ? "default" : "outline"}
+                title={trashView ? "返回号池" : "查看已删除账号，可恢复"}
+                onClick={() => (trashView ? leaveTrash() : enterTrash())}
               >
-                <Trash2 className="size-3.5" />
-                删除
+                <ArchiveRestore className="size-3.5" />
+                回收站{stats.deleted ? ` ${stats.deleted}` : ""}
               </Button>
+              {trashView ? (
+                <Button
+                  size="sm"
+                  variant="secondary"
+                  disabled={selected.size === 0}
+                  onClick={() => void handleRestore()}
+                >
+                  <ArchiveRestore className="size-3.5" />
+                  恢复
+                </Button>
+              ) : (
+                <Button
+                  size="sm"
+                  variant="destructive"
+                  disabled={selected.size === 0}
+                  onClick={() => setDeleteOpen(true)}
+                >
+                  <Trash2 className="size-3.5" />
+                  删除
+                </Button>
+              )}
             </div>
             <span className="command-bar-sep" aria-hidden />
             <div
@@ -1380,9 +1470,11 @@ export function PoolPage() {
               <Button
                 size="sm"
                 variant="secondary"
-                disabled={anyBusy}
+                disabled={anyBusy || trashView}
                 title={
-                  runningTask
+                  trashView
+                    ? "请先恢复账号再认证"
+                    : runningTask
                     ? "任务执行中，请先停止"
                     : selected.size > 0
                       ? "对选中账号执行认证（已认证自动跳过）"
@@ -1396,9 +1488,11 @@ export function PoolPage() {
               <Button
                 size="sm"
                 variant="secondary"
-                disabled={anyBusy}
+                disabled={anyBusy || trashView}
                 title={
-                  runningTask
+                  trashView
+                    ? "请先恢复账号再重登"
+                    : runningTask
                     ? "任务执行中，请先停止"
                     : selected.size > 0
                       ? "对选中账号刷新登录"
@@ -1412,9 +1506,11 @@ export function PoolPage() {
               <Button
                 size="sm"
                 variant={runningTask ? "destructive" : "default"}
-                disabled={!runningTask && globalTaskBusy}
+                disabled={trashView || (!runningTask && globalTaskBusy)}
                 title={
-                  runningTask
+                  trashView
+                    ? "回收站中的账号不参与巡检"
+                    : runningTask
                     ? `停止${
                         runningTask === "push"
                           ? "推送"
@@ -1426,7 +1522,7 @@ export function PoolPage() {
                       }任务`
                     : selected.size > 0
                       ? "巡检探活选中账号（未认证自动跳过）"
-                      : "未勾选：巡检全部可探活账号（排除需重登）"
+                      : "未勾选：巡检全部可探活账号（排除需重登，含限额）"
                 }
                 onClick={
                   runningTask
@@ -1473,6 +1569,20 @@ export function PoolPage() {
                 </div>
               </div>
             )}
+            {selected.size > 0 ? (
+              <div className="pool-selection-bar" role="status">
+                已选 {selected.size} 个
+                {offPageSelected > 0 ? `，其中 ${offPageSelected} 个不在当前页` : ""}
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="ghost"
+                  onClick={() => setSelected(new Set())}
+                >
+                  清除选择
+                </Button>
+              </div>
+            ) : null}
             <PoolAccountsTable
               accounts={accounts}
               selected={selected}
@@ -1674,7 +1784,7 @@ export function PoolPage() {
           <AlertDialogHeader>
             <AlertDialogTitle>删除账号</AlertDialogTitle>
             <AlertDialogDescription>
-              确定删除选中的 {selected.size} 个账号？此操作为逻辑删除，可恢复。
+              确定把选中的 {selected.size} 个账号移入回收站？之后可以在回收站恢复。
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>

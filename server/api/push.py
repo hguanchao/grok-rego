@@ -501,7 +501,7 @@ from core.util import (
 )
 from db import STATUS_ACTIVE, get_all_accounts
 
-# 并发上限（与前端并发输入框 1-20 对齐；实际 20 线程、每线程间隔 1s）
+# 并发上限与前端输入框对齐。G2A 实际线程数用 job.concurrency。
 MAX_CONCURRENCY = ACCOUNT_WORKERS
 # 任务日志内存环形保留条数
 _LOG_LIMIT = 500
@@ -647,29 +647,40 @@ class PushManager:
             raise RuntimeError(
                 "推送目标配置缺失："
                 + "；".join(self._target_label(t) for t in wanted)
-                + "，请先在「注册页 → 推送目标设置」中配置"
+                + "，请先在「号池管理 → 推送」里补全地址和凭据"
             )
         concurrency = _clamp_concurrency(concurrency)
         ids = [int(i) for i in account_ids] if account_ids else []
-        # 全局互斥：其它重任务（号池任务/认证/注册）进行中则拒绝
+        # 全局互斥：其它重任务（号池任务/认证/注册）进行中则拒绝。
+        # 线程没真正拉起就失败时必须放开，否则按钮会一直显示忙碌。
         mutex_acquire("推送")
-
-        with self._lock:
-            job = self._job
-            if job is not None and job.status in ("pending", "running"):
-                raise RuntimeError("已有推送任务进行中，请等待完成或取消")
-            job = PushJob(
-                task_id=uuid.uuid4().hex[:12],
-                targets=wanted,
-                account_ids=ids,
-                concurrency=concurrency,
-            )
-            self._job = job
-            self._worker = threading.Thread(
-                target=self._run_job, args=(job,), name="推送任务", daemon=True
-            )
-            self._worker.start()
-        return self.status()
+        started = False
+        try:
+            with self._lock:
+                job = self._job
+                if job is not None and job.status in ("pending", "running"):
+                    raise RuntimeError("已有推送任务进行中，请等待完成或取消")
+                job = PushJob(
+                    task_id=uuid.uuid4().hex[:12],
+                    targets=wanted,
+                    account_ids=ids,
+                    concurrency=concurrency,
+                )
+                self._job = job
+                self._worker = threading.Thread(
+                    target=self._run_job, args=(job,), name="推送任务", daemon=True
+                )
+                try:
+                    self._worker.start()
+                except Exception:
+                    self._job = None
+                    self._worker = None
+                    raise
+                started = True
+            return self.status()
+        finally:
+            if not started:
+                mutex_release("推送")
 
     def cancel(self) -> dict[str, Any]:
         """请求取消当前任务（协作式，由 worker 在检查点退出）。"""
@@ -691,7 +702,7 @@ class PushManager:
         """返回配置缺失的目标列表（g2a 需地址+账号+密码，cpa 需地址+密钥）。
 
         运行时动态读取 config 模块属性：配置可能在进程启动后经
-        「注册页 → 推送目标设置」更新，模块级导入是值拷贝会拿到旧值。
+        「号池管理 → 推送」更新，模块级导入是值拷贝会拿到旧值。
         """
         missing: list[str] = []
         if "g2a" in targets and not (
@@ -724,13 +735,14 @@ class PushManager:
         job.status = "running"
         label = "+".join(self._target_label(t) for t in job.targets)
         candidates = self._screen(job)
+        account_n = job.count
         job.append_log(
             "INFO",
-            f"[任务] 推送开始 目标 {label} / {job.count} 个 / {ACCOUNT_WORKERS} 线程 "
+            f"[任务] 推送开始 目标 {label} / {account_n} 个账号 / {job.concurrency} 线程 "
             f"每线程间隔 {ACCOUNT_WORKER_GAP_SEC:.0f}s",
         )
         logger.info(
-            f"[推送] 任务启动 目标 {label} / 候选 {job.count} 个 / {ACCOUNT_WORKERS} 线程 "
+            f"[推送] 任务启动 目标 {label} / 候选 {account_n} 个 / {job.concurrency} 线程 "
             f"每线程间隔 {ACCOUNT_WORKER_GAP_SEC:.0f}s / 任务 {job.id}"
         )
         if not candidates:
@@ -748,15 +760,21 @@ class PushManager:
             if not usable:
                 return
 
+        # 进度按账号计。两个目标都推时，CPA 先出结果，账号完成数等 G2A 结束再加，
+        # 避免进度变成 40/20。
+        both = "cpa" in usable and "g2a" in usable
+        cpa_ok: bool | None = None
+
         # 4. CPA 全量合批（单请求，先于 G2A 逐账号，便于尽早反馈结果）
         if "cpa" in usable:
-            self._push_cpa_batch(job, candidates)
+            cpa_result = self._push_cpa_batch(job, candidates, record_accounts=not both)
+            cpa_ok = bool(cpa_result.get("ok")) if both else None
             if job.cancel_event.is_set():
                 return
 
         # 5. G2A 逐账号并发导入
         if "g2a" in usable:
-            self._push_g2a_concurrent(job, candidates, g2a_token)
+            self._push_g2a_concurrent(job, candidates, g2a_token, cpa_ok=cpa_ok)
 
     def _screen(self, job: PushJob) -> list[dict[str, Any]]:
         """资格预筛：返回候选账号行，跳过账号写入 skipped_list。
@@ -848,35 +866,53 @@ class PushManager:
         logger.success("[推送] G2A 预登录成功，token 已获取")
         return usable, token
 
-    def _push_cpa_batch(self, job: PushJob, candidates: list[dict[str, Any]]) -> None:
-        """CPA 全量合批上传；结果按账号摊分进度与成败。"""
+    def _push_cpa_batch(
+        self,
+        job: PushJob,
+        candidates: list[dict[str, Any]],
+        *,
+        record_accounts: bool,
+    ) -> dict[str, Any]:
+        """CPA 全量合批上传。
+
+        record_accounts 为假时只记日志：双目标任务要等 G2A 结束再按账号计进度，
+        否则 done 会把同一批账号算两遍。
+        """
         total = len(candidates)
         t0 = time.monotonic()
         logger.info(f"[推送] CPA 合批上传开始: {total} 个账号")
         result = push_batch_cpa(
             candidates, base_url=config.CPA_BASE_URL, management_key=config.CPA_MANAGEMENT_KEY
         )
-        uploaded = int(result.get("uploaded") or 0)
-        failed = int(result.get("failed") or 0)
-        if result.get("ok"):
-            job.pushed += total
-        else:
-            # 批量无账号明细：按 uploaded/failed 计数摊分
-            job.pushed += max(0, min(uploaded, total))
-            job.failed += max(0, min(failed, total))
-            if job.failed == 0:
-                job.failed = total
-        job.done += total
+        if record_accounts:
+            uploaded = int(result.get("uploaded") or 0)
+            failed = int(result.get("failed") or 0)
+            if result.get("ok"):
+                job.pushed += total
+            else:
+                # 批量无账号明细：按 uploaded/failed 计数摊分
+                job.pushed += max(0, min(uploaded, total))
+                job.failed += max(0, min(failed, total))
+                if job.failed == 0:
+                    job.failed = total
+            job.done += total
         msg = str(result.get("message") or "CPA 推送失败")
         job.append_log(
             "SUCCESS" if result.get("ok") else "ERROR",
             f"[推送] CPA {msg} · {elapsed_label(t0)}",
         )
+        return result
 
     def _push_g2a_concurrent(
-        self, job: PushJob, candidates: list[dict[str, Any]], g2a_token: str
+        self,
+        job: PushJob,
+        candidates: list[dict[str, Any]],
+        g2a_token: str,
+        *,
+        cpa_ok: bool | None = None,
     ) -> None:
-        """G2A：20 个 worker 并发导入，每个 worker 做完一个号再隔 1 秒接下一个。"""
+        """G2A 按任务并发数导入。cpa_ok 非空时，账号成功必须两个目标都成功。"""
+        workers = max(1, min(int(job.concurrency or 1), MAX_CONCURRENCY))
 
         def work(acc: dict[str, Any]) -> dict[str, Any] | None:
             """单账号导入；取消信号下不发送请求。"""
@@ -898,13 +934,25 @@ class PushManager:
                     job.done += 1
                     label = _who(acc)
                     body = str(result.get("message") or "")
-                    if result.get("ok"):
+                    g2a_ok = bool(result.get("ok"))
+                    if cpa_ok is None:
+                        ok = g2a_ok
+                        text = "推送成功" if g2a_ok else body
+                    elif g2a_ok and cpa_ok:
+                        ok = True
+                        text = "G2A 与 CPA 均成功"
+                    elif g2a_ok:
+                        ok = False
+                        text = "G2A 成功，CPA 批量未全部成功"
+                    else:
+                        ok = False
+                        text = f"G2A 失败：{body}"
+                    if ok:
                         job.pushed += 1
                         level = "SUCCESS"
-                        message = f"{label}·推送成功"
                     else:
                         job.failed += 1
-                        message = f"{label}·{body}"
+                    message = f"{label}·{text}"
             job.append_log(level, message)
             if isinstance(result, Exception):
                 logger.error(
@@ -914,7 +962,7 @@ class PushManager:
         run_account_workers(
             candidates,
             work,
-            workers=ACCOUNT_WORKERS,
+            workers=workers,
             thread_name_prefix="推送",
             should_stop=job.cancel_event.is_set,
             on_complete=on_complete,

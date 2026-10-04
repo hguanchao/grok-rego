@@ -181,34 +181,46 @@ class JobManager:
         count = max(1, min(int(count), 100))
         threads = max(1, min(int(threads), 20))
         validate_mail_ready()
-        # 全局互斥：其它重任务（推送/号池任务/认证）进行中则拒绝
+        # 全局互斥：其它重任务（推送/号池任务/认证）进行中则拒绝。
+        # 线程没真正拉起就失败时必须放开，否则按钮会一直显示忙碌。
         mutex_acquire("注册")
+        started = False
+        try:
+            with self._lock:
+                if self._job is not None and self._job.status in ("pending", "running", "stopping"):
+                    raise RuntimeError("已有注册任务进行中，请先停止或等待完成")
+                from core import config
 
-        with self._lock:
-            if self._job is not None and self._job.status in ("pending", "running", "stopping"):
-                raise RuntimeError("已有注册任务进行中，请先停止或等待完成")
-            from core import config
-
-            job = RegisterJob(
-                id=uuid.uuid4().hex[:12],
-                status="pending",
-                count=count,
-                threads=threads,
-                headless=bool(headless),
-                mail_provider=config.MAIL_PROVIDER,
-            )
-            self._job = job
-            register_wf.clear_cancel()
-            self._attach_log_sink(job)
-            worker = threading.Thread(
-                target=self._run_job,
-                args=(job,),
-                name="主控",
-                daemon=True,
-            )
-            self._worker = worker
-            worker.start()
-        return self.get_status()
+                job = RegisterJob(
+                    id=uuid.uuid4().hex[:12],
+                    status="pending",
+                    count=count,
+                    threads=threads,
+                    headless=bool(headless),
+                    mail_provider=config.MAIL_PROVIDER,
+                )
+                self._job = job
+                register_wf.clear_cancel()
+                self._attach_log_sink(job)
+                worker = threading.Thread(
+                    target=self._run_job,
+                    args=(job,),
+                    name="主控",
+                    daemon=True,
+                )
+                self._worker = worker
+                try:
+                    worker.start()
+                except Exception:
+                    self._job = None
+                    self._worker = None
+                    self._detach_log_sink()
+                    raise
+                started = True
+            return self.get_status()
+        finally:
+            if not started:
+                mutex_release("注册")
 
     def stop(self) -> dict[str, Any]:
         """请求停止当前任务。"""

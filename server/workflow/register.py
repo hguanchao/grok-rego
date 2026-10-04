@@ -1613,6 +1613,7 @@ def _run_signup_bound(headless: bool = False) -> tuple[bool, str | None]:
     email, jwt = None, None
 
     account_id: int | None = None
+    stage = ""
     for attempt in range(1, MAX_ATTEMPTS + 1):
         if is_cancelled():
             logger.warning("[注册] 已取消，中止当前账号")
@@ -1661,8 +1662,25 @@ def _run_signup_bound(headless: bool = False) -> tuple[bool, str | None]:
 
     if is_cancelled():
         return False, email
-    logger.error(f"[注册] 全部尝试失败，放弃: {email}")
+    logger.error(signup_give_up_message(email, stage))
     return False, email
+
+
+def signup_give_up_message(email: str | None, stage: str | None) -> str:
+    """注册最终失败日志。邮箱还没创建时不要打出 None。"""
+    label = {
+        "email": "邮箱",
+        "otp": "验证码",
+        "form": "资料",
+        "reject": "邮箱拒绝",
+        "post": "SSO",
+    }.get(stage or "", (stage or "").strip() or "未知阶段")
+    who = (email or "").strip()
+    if not who and stage == "reject":
+        who = "被拒邮箱已丢弃"
+    elif not who:
+        who = "尚未创建邮箱"
+    return f"[注册] 全部尝试失败，放弃 {who}（停在{label}）"
 
 
 def run_signups(

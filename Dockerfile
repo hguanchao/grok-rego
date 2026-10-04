@@ -1,6 +1,6 @@
-# 完整镜像：精简能力 + Camoufox 无头浏览器，可跑批量注册。
-# 仅 linux/amd64。构建时优先用仓库根目录的 camoufox-*-lin.x86_64.zip 离线装内核。
-#   docker compose --profile full up --build
+# grok-rego：管理 API + Web UI + Camoufox，可跑批量注册。
+# 仅 linux/amd64。构建时在线安装 Camoufox 内核。
+#   docker compose up --build
 FROM node:22-bookworm-slim AS web
 WORKDIR /src/web
 COPY web/package.json web/package-lock.json ./
@@ -40,25 +40,14 @@ COPY server/pyproject.toml server/uv.lock ./
 RUN uv sync --frozen --no-dev --no-install-project
 COPY server/ ./
 COPY --from=web /src/web/dist ./web-dist
-COPY docker-entrypoint.sh /app/docker-entrypoint.sh
 
-# 可选离线内核：不存在时 COPY 出空目录，启动脚本再决定 fetch 还是 local。
-COPY camoufox-*-lin.x86_64.zip* /tmp/camoufox/
-RUN chmod +x /app/docker-entrypoint.sh \
-    && mkdir -p /app/server/db/data /app/server/logs \
-    && KERNEL="$(find /tmp/camoufox -maxdepth 1 -type f -name 'camoufox-*-lin.x86_64.zip' | head -n 1 || true)" \
-    && if [ -n "$KERNEL" ]; then \
-         echo "[docker] 离线安装 Camoufox: $KERNEL"; \
-         uv run python fetch_camoufox_local.py "$KERNEL"; \
-       else \
-         echo "[docker] 未找到离线 zip，构建时在线 fetch Camoufox 内核"; \
-         uv run camoufox fetch; \
-       fi \
-    && rm -rf /tmp/camoufox
+RUN mkdir -p /app/server/db/data /app/server/logs \
+    && uv run camoufox fetch
 
 ENV GROK_REGO_HOST=0.0.0.0 \
     GROK_REGO_PORT=8787 \
     PYTHONUNBUFFERED=1 \
     UV_LINK_MODE=copy
 EXPOSE 8787
-ENTRYPOINT ["/app/docker-entrypoint.sh"]
+
+CMD ["sh", "-c", "mkdir -p /app/server/db/data /app/server/logs && exec uv run python main.py --serve"]
